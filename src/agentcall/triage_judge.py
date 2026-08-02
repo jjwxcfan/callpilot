@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, cast
 
-from .prompt_gen import call_text_model, select_text_model
+from .prompt_gen import call_text_model, select_text_model, text_backend_for_agent
 
 TriageCategory = Literal["marketing", "personal", "service", "unknown"]
 TriageAction = Literal["clarify", "continue_ai", "reject", "transfer"]
@@ -391,10 +391,15 @@ class InboundTriageJudge:
 def _default_model_call(
     messages: list[dict[str, str]], timeout: float
 ) -> tuple[str | None, str | None]:
+    # 后端跟随 AGENT_PROVIDER（与 dtmf_judge / summarizer 一致）。曾硬编码
+    # "openai"，导致 qwen-only 部署下判官每次都因缺 OPENAI_API_KEY 失败，
+    # 而 _triage_pending 只在 continue_ai/reject 裁决时清除 → 整通来电被
+    # 锁死在分诊限制话术里。
+    provider = text_backend_for_agent()
     return call_text_model(
         messages,
-        provider="openai",
-        model=select_text_model("openai", ""),
+        provider=provider,
+        model=select_text_model(provider, ""),
         timeout=timeout,
         max_tokens=180,
         hard_timeout=False,
