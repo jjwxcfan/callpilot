@@ -366,7 +366,8 @@ def test_management_crud_persists_ids_and_disabled_profiles_do_not_match(tmp_pat
         ({"number": "not a number", "scenario": "策略"}, "号码格式"),
         ({"number": "10000", "scenario": ""}, "scenario"),
         ({"number": "10000", "scenario": "策" * 1201}, "1200"),
-        ({"number": "10000", "scenario": "策略", "opening": "开" * 41}, "40"),
+        # 开场白按显示宽度计（CJK=2）：51 个汉字 = 102 宽度，超过 100 上限。
+        ({"number": "10000", "scenario": "策略", "opening": "开" * 51}, "显示宽度"),
         (
             {"number": "10000", "match_mode": "exact", "task": "", "scenario": "策略"},
             "task",

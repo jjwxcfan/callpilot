@@ -492,6 +492,7 @@
   .profile-language legend { color: var(--blue); font-size: 11px; font-weight: 800; letter-spacing: .12em; margin-bottom: 10px; }
   .profile-language .profile-field { margin-bottom: 12px; }
   .profile-count { align-self: flex-end; color: var(--dim); font-family: var(--mono); font-size: 10px; }
+  .profile-count.over { color: var(--bad); font-weight: 600; }
   .profile-actions { display: flex; align-items: center; gap: 9px; padding-top: 14px; border-top: 1px solid var(--border); }
   .profile-actions .spacer { flex: 1; }
   .profile-toast { min-height: 18px; margin: 10px 0 0; }
@@ -976,7 +977,7 @@
                     </div>
                     <div class="profile-field">
                       <label for="profileOpeningZh" data-i18n="profile_opening"></label>
-                      <input id="profileOpeningZh" type="text" maxlength="40" />
+                      <input id="profileOpeningZh" type="text" maxlength="200" />
                       <span class="profile-count" id="profileOpeningZhCount"></span>
                     </div>
                   </fieldset>
@@ -997,7 +998,7 @@
                     </div>
                     <div class="profile-field">
                       <label for="profileOpeningEn" data-i18n="profile_opening"></label>
-                      <input id="profileOpeningEn" type="text" maxlength="40" />
+                      <input id="profileOpeningEn" type="text" maxlength="200" />
                       <span class="profile-count" id="profileOpeningEnCount"></span>
                     </div>
                   </fieldset>
@@ -1239,6 +1240,7 @@ const I18N = {
     profile_save: "Save", profile_cancel: "Cancel", profile_duplicate: "Duplicate", profile_delete: "Delete",
     profile_saving: "Saving…", profile_saved: "Preset saved", profile_deleted: "Preset deleted",
     profile_need_number: "Enter a dialable phone number.", profile_need_scenario: "Add a scenario strategy in at least one language.",
+    profile_opening_too_long: "Opening is too long (Chinese ~50 chars, English ~100).",
     profile_need_task: "Exact matching needs a task in at least one language.", profile_save_fail: "Could not save: ",
     profile_delete_title: "Delete this preset?", profile_delete_msg: "It will disappear from the dialer immediately.",
     profile_delete_ok: "Delete", profile_delete_fail: "Could not delete: ", profile_copy_suffix: " (copy)",
@@ -1409,6 +1411,7 @@ const I18N = {
     profile_save: "保存", profile_cancel: "取消", profile_duplicate: "复制", profile_delete: "删除",
     profile_saving: "保存中…", profile_saved: "预设已保存", profile_deleted: "预设已删除",
     profile_need_number: "请输入可以拨打的电话号码。", profile_need_scenario: "请至少填写一种语言的场景策略。",
+    profile_opening_too_long: "开场白过长（中文约 50 字，英文约 100 个字符）。",
     profile_need_task: "号码+任务匹配至少需要填写一种语言的任务。", profile_save_fail: "保存失败：",
     profile_delete_title: "删除这条预设？", profile_delete_msg: "删除后会立即从拨号下拉中消失。",
     profile_delete_ok: "删除", profile_delete_fail: "删除失败：", profile_copy_suffix: "（副本）",
@@ -1925,12 +1928,35 @@ function renderProfileList() {
   }
 }
 
+// 开场白与后端一致按「显示宽度」计：CJK 记 2、拉丁记 1（后端 prompt_gen.display_width）。
+const MAX_OPENING_WIDTH = 100;  // 与后端 prompt_gen.MAX_OPENING_WIDTH 一致
+function displayWidth(text) {
+  let w = 0;
+  for (const ch of text) {
+    const c = ch.codePointAt(0);
+    // 常见东亚全角区段（CJK/假名/谚文/全角标点），与 Python east_asian_width W/F 近似。
+    const wide = (c >= 0x1100 && c <= 0x115f) || (c >= 0x2e80 && c <= 0xa4cf)
+      || (c >= 0xac00 && c <= 0xd7a3) || (c >= 0xf900 && c <= 0xfaff)
+      || (c >= 0xfe30 && c <= 0xfe6f) || (c >= 0xff00 && c <= 0xff60)
+      || (c >= 0xffe0 && c <= 0xffe6) || (c >= 0x20000 && c <= 0x3fffd)
+      || (c >= 0x1f300 && c <= 0x1faff);  // emoji 面：Python east_asian_width 记 W
+    if (c === 0x303f) { w += 1; continue; }  // 标准 wcwidth 例外：U+303F 记 1
+    w += wide ? 2 : 1;
+  }
+  return w;
+}
+
 function refreshProfileCounts() {
   for (const [id, max] of [
     ["profileScenarioZh", 1200], ["profileScenarioEn", 1200],
-    ["profileOpeningZh", 40], ["profileOpeningEn", 40],
   ]) {
     $(id + "Count").textContent = `${$(id).value.length}/${max}`;
+  }
+  for (const id of ["profileOpeningZh", "profileOpeningEn"]) {
+    const w = displayWidth($(id).value);
+    const el = $(id + "Count");
+    el.textContent = `${w}/${MAX_OPENING_WIDTH}`;
+    el.classList.toggle("over", w > MAX_OPENING_WIDTH);
   }
 }
 
@@ -2036,6 +2062,9 @@ function validateProfileForm(profile) {
   if (!/^\+?[0-9*#]{1,32}$/.test(profile.number)) return t("profile_need_number");
   if (!profile.scenario.zh && !profile.scenario.en) return t("profile_need_scenario");
   if (profile.match_mode === "exact" && !profile.task.zh && !profile.task.en) return t("profile_need_task");
+  for (const v of [profile.opening.zh, profile.opening.en]) {
+    if (displayWidth(v || "") > MAX_OPENING_WIDTH) return t("profile_opening_too_long");
+  }
   return "";
 }
 
