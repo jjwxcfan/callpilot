@@ -201,6 +201,9 @@ class CallSession:
         self._prompt_gen_dtmf_spoken_followup = False
         self._result_verification_mode = "none"
         self._dtmf_lock = threading.RLock()
+        # 上行媒体互斥：drain 的「取空队列再写桥」与 DTMF 的「清队列再入双音」
+        # 必须原子，否则清队列会清了个空、语音仍抢在双音前面写进桥。
+        self._media_lock = threading.Lock()
         self._recent_dtmf_sent: dict[str, tuple[float, str]] = {}
         self._pending_dtmf_followups: dict[
             int,
@@ -237,6 +240,8 @@ class CallSession:
         self._triage_terminal = False
         self._triage_reject_deadline: float | None = None
         self._triage_clarification_spoken = False
+        # 按键护窗截止时刻（monotonic）：DTMF 期间丢弃 Agent 下行。
+        self._dtmf_guard_until = 0.0
 
     def _publish(self, event: dict) -> None:
         if self.hub:
@@ -558,6 +563,11 @@ class CallSession:
 
         def on_agent_audio(pcm_agent: bytes) -> None:
             if not self._agent_effect_allowed(generation):
+                return
+            # 按键护窗：DTMF 期间丢弃 Agent 下行，别让语音和双音挤在同一段上行。
+            # 真机 2026-08-03 拨 10086：模型一边说「这边先按一下对应的键」一边按，
+            # 4 次本机 success、IVR 菜单一次没推进（见 #45 评论）。
+            if time.monotonic() < self._dtmf_guard_until:
                 return
             if pcm_agent and on_first_audio is not None:
                 on_first_audio()
@@ -1690,6 +1700,9 @@ class CallSession:
             self._cancel_spoken_dtmf_followups_locked()
             if clear_recent:
                 self._recent_dtmf_sent.clear()
+                # 护窗是 monotonic 时刻：背靠背通话可能落在上一通的护窗内，
+                # 那会让新通话开场白被静音，必须随每通重置。
+                self._dtmf_guard_until = 0.0
 
     def _cancel_spoken_dtmf_followups_locked(self) -> None:
         pending = list(self._pending_dtmf_followups.values())
@@ -1773,8 +1786,21 @@ class CallSession:
                     self._cancel_pending_dtmf_locked(digits)
                 return True, mode
 
+            # 按键护窗（#45 候选方向 2「信号层」）：真机 2026-08-03 拨 10086，
+            # 模型一边说「这边先按一下对应的键」一边按，4 次本机 success、IVR
+            # 菜单一次没推进。双音与 Agent 语音共用 _outgoing_audio 这条上行，
+            # 混叠后对端两者都识别不出。护窗期间丢弃 Agent 下行，让双音独占上行。
+            #
+            # 护窗必须**先装再动手**：qvts 的 send_dtmf 是阻塞 AT 往返，inband 的
+            # 入队到实际送出也隔着一次 drain——若等发完才装，realtime 在这段空档
+            # 产出的语音会正好落进按键窗口。
+            guard_seconds = max(0.0, config.get_int("DTMF_GUARD_MS") / 1000.0)
+            previous_guard = self._dtmf_guard_until
+            self._dtmf_guard_until = time.monotonic() + guard_seconds
+
             ok = True
             sent = False
+            tone_seconds = 0.0
             if mode in {"inband", "both"}:
                 tone = dtmf_tone(
                     digits,
@@ -1783,21 +1809,43 @@ class CallSession:
                     amplitude=config.get_float("DTMF_TONE_AMPLITUDE"),
                 )
                 if not tone:
+                    self._dtmf_guard_until = previous_guard
                     return False, mode
-                # 与 Agent 语音共用 _outgoing_audio，后续由 _drain_agent_audio
-                # 按既有下行链路送入桥；半双工 pending 判定也会自然把它当成正在说话。
-                if self._record is not None:
-                    self._record.write_downlink(tone)
-                self._outgoing_audio.put(tone)
+                # 清空 + 入队要与 _drain_agent_audio 的「取空再写桥」互斥：drain
+                # 已把语音取进本地 chunks 时，单清队列是空操作，那段语音照样写进
+                # 桥、排在双音前面。
+                with self._media_lock:
+                    self._clear_outgoing_audio()
+                    # 与 Agent 语音共用 _outgoing_audio，后续由 _drain_agent_audio
+                    # 按既有下行链路送入桥；半双工 pending 判定也会自然把它当成正在说话。
+                    if self._record is not None:
+                        self._record.write_downlink(tone)
+                    self._outgoing_audio.put(tone)
+                # 双音本身的时长要计入护窗，否则语音会紧跟在双音尾巴上。
+                tone_seconds = len(tone) / 2 / MODEM_RATE
                 sent = True
             if mode in {"qvts", "both"}:
+                # qvts 走 AT 带外，双音不进上行队列；但 AI 在按键瞬间继续说话，
+                # 同样会占住 IVR 的按键识别窗口——两种 mode 都要护窗。
+                if mode == "qvts":
+                    with self._media_lock:
+                        self._clear_outgoing_audio()
                 ok = self.modem.send_dtmf(digits)
                 sent = sent or ok
             if sent:
+                # 发完再从「此刻」重算：AT 往返耗时不该吃掉护窗。只延不缩，
+                # 免得连按时后一次把前一次的护窗改短。
+                self._dtmf_guard_until = max(
+                    self._dtmf_guard_until,
+                    time.monotonic() + tone_seconds + guard_seconds,
+                )
                 self._recent_dtmf_sent[digits] = (time.monotonic(), source)
                 self._record_dtmf_action(digits, source)
                 if source != "spoken_followup":
                     self._cancel_pending_dtmf_locked(digits)
+            else:
+                # 没发出去就不该白白哑掉 Agent：预装的护窗要还原。
+                self._dtmf_guard_until = previous_guard
             return ok, mode
 
     def _record_dtmf_action(self, digits: str, source: str) -> None:
@@ -2214,14 +2262,15 @@ class CallSession:
         )
 
     def _drain_agent_audio(self, bridge: AudioBridge) -> None:
-        chunks: list[bytes] = []
-        while True:
-            try:
-                chunks.append(self._outgoing_audio.get_nowait())
-            except Empty:
-                break
-        if chunks:
-            bridge.write_modem_chunks(chunks)
+        with self._media_lock:
+            chunks: list[bytes] = []
+            while True:
+                try:
+                    chunks.append(self._outgoing_audio.get_nowait())
+                except Empty:
+                    break
+            if chunks:
+                bridge.write_modem_chunks(chunks)
 
     def _clear_outgoing_audio(self) -> None:
         while True:
