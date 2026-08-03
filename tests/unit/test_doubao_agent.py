@@ -95,10 +95,19 @@ def test_recv_loop_after_stop_keeps_fatal_false():
 # ---------------------------------------------------------------------------
 
 
-def test_factory_warns_doubao_say_unsupported(monkeypatch, caplog):
+def test_factory_warns_doubao_capability_gaps(monkeypatch, caplog):
+    """工厂必须如实列出豆包的能力缺口，不能只提 say()。
+
+    原断言只查「say 未实现」。#69 指出那严重低估了缺口：无 function calling
+    （按键/挂断/发短信全静默失效）、无转写（摘要/判官/分诊输入恒空）。
+    只说少一句开场白，会让人以为它基本可用。断言改为覆盖三条缺口。
+    """
     monkeypatch.setenv("DOUBAO_APP_ID", "app")
     monkeypatch.setenv("DOUBAO_ACCESS_KEY", "key")
     with caplog.at_level(logging.WARNING, logger="agentcall.agents.factory"):
         agent = factory.create_agent("doubao")
     assert isinstance(agent, DoubaoVoiceAgent)
-    assert any("say 未实现" in record.message for record in caplog.records)
+    warned = " ".join(record.getMessage() for record in caplog.records)
+    assert "say()" in warned, "仍需说明外呼开场白不可用"
+    assert "function calling" in warned, "必须说明工具（按键/挂断/发短信）不生效"
+    assert "转写" in warned, "必须说明转写缺失导致摘要/判官/分诊失效"
