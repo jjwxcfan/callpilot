@@ -63,6 +63,7 @@ from .result_verification import (
     apply_carrier_sms_verification,
     carrier_sms_evidence,
     is_carrier_service_call,
+    select_task_relevant_evidence,
 )
 from .sim_identity import SimIdentity
 from .sms_email_forwarder import SmsEmailForwarder
@@ -1047,6 +1048,19 @@ class CallSession:
                         service_number=service_number,
                         started_at=record.started_at,
                         ended_at=time.time(),
+                    )
+                    # 时间窗+发件人不足以判定相关：运营商在通话期间也推营销短信。
+                    # 挑出真正回答本次任务的那条，判定不可用则 fail-closed 到未核实。
+                    evidence = select_task_relevant_evidence(
+                        evidence,
+                        # 相关性判定的任务口径：预设 hint 优先（声明
+                        # result_verification 的正是那条预设），其次本通显式主题。
+                        # 两者皆空则 select_task_relevant_evidence 会 fail-closed。
+                        task=(
+                            self._preset_hint
+                            or self._outbound_task(agent_language())
+                        ),
+                        lang=agent_language(),
                     )
                 else:
                     evidence = []
