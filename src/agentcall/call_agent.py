@@ -2672,6 +2672,12 @@ class CallAgentService:
     def remote_dialer_status(self) -> dict:
         """Return non-secret readiness/session state for the local dashboard."""
 
+        def _livekit_media_host() -> str:
+            # 局部导入：web 层依赖 call_agent，模块级导入会成环。
+            from .web.remote_gateway import livekit_media_host
+
+            return livekit_media_host(config.get_str("LIVEKIT_URL"))
+
         enabled = config.get_bool("REMOTE_WEB_DIALER_ENABLED")
         cloud_enabled = config.get_bool("REMOTE_CLOUD_ENABLED")
         required = (
@@ -2693,6 +2699,9 @@ class CallAgentService:
             "missing": missing,
             "active": bool(worker and worker.is_running),
             "modem_online": self.modem_connected,
+            # PWA 用它做 fragment 邀请的 exact-host 白名单（#41）。非机密：
+            # 同一个 host 本来就写在 CSP connect-src 里。空串 = 不接受任何 fragment。
+            "media_host": _livekit_media_host(),
         }
         if worker is not None:
             payload.update(worker.coordinator.status())

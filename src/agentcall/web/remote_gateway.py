@@ -23,19 +23,63 @@ from ..remote_pairing import (
 STATIC_DIR = Path(__file__).parent / "static"
 DEVICE_COOKIE = "__Host-callpilot-device"
 _COOKIE_MAX_AGE = 180 * 24 * 60 * 60
-_SECURITY_HEADERS = {
-    "Cache-Control": "no-store",
-    "Referrer-Policy": "no-referrer",
-    "X-Content-Type-Options": "nosniff",
-    "X-Frame-Options": "DENY",
-    "Permissions-Policy": "microphone=(self), camera=(), geolocation=()",
-    "Content-Security-Policy": (
-        "default-src 'none'; script-src 'self' https://cdn.jsdelivr.net; "
-        "style-src 'self'; connect-src 'self' wss:; media-src blob:; worker-src 'self' blob:; "
-        "manifest-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'; "
-        "frame-ancestors 'none'"
-    ),
-}
+def livekit_media_host(value: str) -> str:
+    """从配置的 LiveKit 地址取出 host[:port]；任何不合法输入一律返回空串。
+
+    与云侧 `cloud/src/csp.ts` 的 `liveKitConnectSources()` 同语义。**只认整段
+    netloc**：只钉 hostname 会连带放行同主机的其它端口。
+
+    「不合法就返回空串」是硬契约——调用方（CSP 与 PWA 白名单）都靠空串
+    fail-closed。所以这里把畸形输入全部吃掉，绝不让异常漏出去变成 500，
+    也绝不让 `@host` / `:badport` 这类残缺串流进 CSP。
+    """
+    try:
+        parsed = urlsplit((value or "").strip())
+        if parsed.scheme != "wss" or not parsed.hostname:
+            return ""
+        # username/password 为空串时是 falsey，不能只用 `or` 判断——
+        # `wss://@host` 会漏过去（Codex 评审）。直接看 netloc 里有没有 userinfo。
+        if "@" in parsed.netloc:
+            return ""
+        parsed.port  # 端口非法时抛 ValueError（如 wss://h:bad）
+    except ValueError:
+        # 畸形 IPv6（wss://[::1）与非法端口都走这里。
+        return ""
+    return parsed.netloc
+
+
+def livekit_connect_sources(value: str) -> str:
+    """把配置的 LiveKit 地址收敛成 CSP connect-src 片段（无效配置返回空串）。
+
+    空串意味着 connect-src 只剩 'self'——宁可让远程拨号连不上（可见故障），
+    也不要退回 `wss:` 通配（静默放行任意媒体端点）。
+    """
+    host = livekit_media_host(value)
+    return f" https://{host} wss://{host}" if host else ""
+
+
+def security_headers() -> dict[str, str]:
+    """PWA 页面的安全响应头。
+
+    connect-src 必须钉死到配置的 LiveKit host：曾经写的是 `wss:` 通配，配合
+    legacy fragment 直连入口，真域名上一个恶意 fragment 就能把媒体连到任意
+    WSS 端点（#41 / G-04）。fragment 入口已移除，这里是浏览器强制的第二道。
+    """
+    return {
+        "Cache-Control": "no-store",
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Permissions-Policy": "microphone=(self), camera=(), geolocation=()",
+        "Content-Security-Policy": (
+            "default-src 'none'; script-src 'self' https://cdn.jsdelivr.net; "
+            "style-src 'self'; connect-src 'self'"
+            f"{livekit_connect_sources(config.get_str('LIVEKIT_URL'))}; "
+            "media-src blob:; worker-src 'self' blob:; "
+            "manifest-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'; "
+            "frame-ancestors 'none'"
+        ),
+    }
 
 
 class _AttemptLimiter:
@@ -103,7 +147,7 @@ def build_remote_gateway(
 
 
 async def _page(_request: web.Request) -> web.StreamResponse:
-    return web.FileResponse(STATIC_DIR / "remote_dialer.html", headers=_SECURITY_HEADERS)
+    return web.FileResponse(STATIC_DIR / "remote_dialer.html", headers=security_headers())
 
 
 async def _asset(request: web.Request) -> web.StreamResponse:
@@ -138,6 +182,10 @@ async def _device(request: web.Request) -> web.Response:
                 "edge": {
                     "enabled": bool(status.get("enabled")),
                     "configured": bool(status.get("configured")),
+                    # 未配对也要给 media_host：临时链接（fragment 邀请）的使用者
+                    # 按定义就是未配对的，拿不到白名单就会 fail-closed，把这个
+                    # 在售功能整个堵死。它非机密——同一个 host 就写在 CSP 里。
+                    "media_host": str(status.get("media_host") or ""),
                 },
             }
         )
