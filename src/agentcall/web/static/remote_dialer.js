@@ -156,6 +156,22 @@
     return fragment.length <= 8192 ? fragment : "";
   }
 
+  // 本机允许的媒体 host（来自 /api/device）。null = 还没取到 → 一律不接受
+  // fragment 邀请。宁可临时链接连不上（可见故障），也不放行任意端点。
+  let allowedMediaHost = null;
+
+  async function loadAllowedMediaHost() {
+    try {
+      const response = await fetch("/api/device", { cache: "no-store" });
+      if (!response.ok) return;
+      const payload = await response.json();
+      const host = payload && payload.edge && payload.edge.media_host;
+      if (typeof host === "string" && host) allowedMediaHost = host;
+    } catch (_error) {
+      // 取不到就维持 null —— fail-closed。
+    }
+  }
+
   function parseInviteFragment(fragment) {
     if (!fragment || fragment.startsWith("pair=")) return null;
     try {
@@ -166,6 +182,16 @@
       if (
         payload.v !== 1 ||
         url.protocol !== "wss:" ||
+        // 端点必须是干净的 host：内嵌凭证 / 空 host 都不接受，与云侧
+        // csp.ts 的 liveKitConnectSources() 同口径。
+        !url.hostname ||
+        url.username ||
+        url.password ||
+        // exact-host 白名单：端点只能是本机配置的那一个 LiveKit host。
+        // 这是 #41 的正解 —— fragment 由攻击者可控，光校验协议挡不住把
+        // 媒体导到别人服务器。CSP connect-src 是浏览器强制的第二道。
+        !allowedMediaHost ||
+        url.host !== allowedMediaHost ||
         typeof payload.token !== "string" ||
         payload.token.length < 40 ||
         typeof payload.sessionId !== "string" ||
@@ -411,12 +437,19 @@
   async function initialize() {
     deviceName.value = t("default_device_name");
     const fragment = takeFragment();
-    invite = parseInviteFragment(fragment);
-    if (invite) {
-      terminal = false;
-      showDialer(null);
-      setStatus("idle", t("ready"));
-      return;
+    // 临时链接（fragment 邀请）仍是在售功能：面板「临时链接」按钮 +
+    // remote_dialer.py 仍在签发 URL#<payload>。所以不能删入口，改为按
+    // exact-host 白名单校验（#41 / G-04 给的两条路里的第二条）。
+    // 白名单必须先从本机取回来，取不到就不接受 fragment —— fail-closed。
+    await loadAllowedMediaHost();
+    if (fragment && !fragment.startsWith("pair=")) {
+      invite = parseInviteFragment(fragment);
+      if (invite) {
+        terminal = false;
+        showDialer(null);
+        setStatus("idle", t("ready"));
+        return;
+      }
     }
     if (fragment.startsWith("pair=")) pairingCode.value = fragment.slice(5).toUpperCase();
     if (await refreshDevice()) return;
