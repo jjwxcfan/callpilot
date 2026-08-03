@@ -960,7 +960,7 @@ def test_number_profile_management_api_crud_and_validation(tmp_path, monkeypatch
         assert managed[0]["enabled"] is False
 
         response = await client.post(
-            "/api/number_profiles", json={**payload, "opening": {"zh": "开" * 41, "en": ""}}
+            "/api/number_profiles", json={**payload, "opening": {"zh": "开" * 51, "en": ""}}
         )
         assert response.status == 400
 

@@ -147,6 +147,24 @@ class MultiChunkGreetingAgent(FakeAgent):
 
 # ---- P0-2 通话记录：events.jsonl 全生命周期 + 录音落盘 ----
 
+
+def _stub_relevance_judge(monkeypatch, index=0):
+    """短信相关性判定桩：只替换模型调用，真实选择/校验逻辑照常执行。
+
+    生产路径新增了「该短信是否回答了本次任务」的判定（防止营销短信冒充
+    已核实结果）。单测环境没有可用文本后端，判定会 fail-closed 成未核实，
+    因此这里注入一个确定性回答。
+    """
+    import json
+
+    from agentcall import result_verification
+
+    monkeypatch.setattr(
+        result_verification,
+        "_default_relevance_call",
+        lambda messages: (json.dumps({"index": index, "reason_code": "test"}), None),
+    )
+
 def test_inbound_call_writes_events_and_recordings(tmp_path, monkeypatch):
     monkeypatch.setenv("RECORDING_ENABLED", "true")
     base = tmp_path / "rec"
@@ -569,6 +587,8 @@ def test_carrier_sms_profile_replaces_misheard_summary_with_official_result(
     tmp_path, monkeypatch
 ):
     monkeypatch.setenv("SUMMARY_ENABLED", "true")
+    _stub_relevance_judge(monkeypatch)
+    monkeypatch.setenv("AGENT_OUTBOUND_TASK", "查询上月话费")
     monkeypatch.setenv("SMS_VERIFICATION_WAIT_SECONDS", "0.05")
     monkeypatch.setattr(
         "agentcall.call_agent.summarize_call",
@@ -612,6 +632,8 @@ def test_carrier_sms_profile_replaces_misheard_summary_with_official_result(
 
 def test_carrier_sms_profile_summarizes_without_transcript_speech(tmp_path, monkeypatch):
     monkeypatch.setenv("SUMMARY_ENABLED", "true")
+    _stub_relevance_judge(monkeypatch)
+    monkeypatch.setenv("AGENT_OUTBOUND_TASK", "查询上月话费")
     monkeypatch.setenv("SMS_VERIFICATION_WAIT_SECONDS", "0.05")
     monkeypatch.setattr(
         "agentcall.call_agent.summarize_call",

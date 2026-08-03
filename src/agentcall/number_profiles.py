@@ -40,8 +40,9 @@ from typing import Any
 
 from . import config
 from .prompt_gen import (
-    MAX_OPENING_CHARS,
+    MAX_OPENING_WIDTH,
     _normalize_opening,
+    display_width,
 )
 
 logger = logging.getLogger(__name__)
@@ -472,7 +473,7 @@ def _validate_profile_payload(payload: Any) -> dict[str, Any]:
         required=True,
     )
     opening = _validate_localized(
-        payload.get("opening"), "opening", max_chars=MAX_OPENING_CHARS
+        payload.get("opening"), "opening", max_width=MAX_OPENING_WIDTH
     )
     match_mode = _norm(payload.get("match_mode"))
     if not match_mode:
@@ -517,6 +518,7 @@ def _validate_localized(
     field: str,
     *,
     max_chars: int | None = None,
+    max_width: int | None = None,
     required: bool = False,
 ) -> str | dict[str, str]:
     if value is None:
@@ -539,6 +541,11 @@ def _validate_localized(
         raise ProfileValidationError(f"{field} 不能为空")
     if max_chars is not None and any(len(item) > max_chars for item in values):
         raise ProfileValidationError(f"{field} 不能超过 {max_chars} 个字符")
+    if max_width is not None and any(display_width(item) > max_width for item in values):
+        # 宽度口径：中文按 2、拉丁按 1，两种文字用同一阈值才公平。
+        raise ProfileValidationError(
+            f"{field} 不能超过 {max_width} 显示宽度（中文约 {max_width // 2} 字）"
+        )
     return cleaned
 
 

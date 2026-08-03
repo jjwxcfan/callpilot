@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import threading
+import unicodedata
 import urllib.error
 import urllib.request
 from collections import OrderedDict
@@ -22,8 +23,17 @@ from .prompts import agent_persona, normalize_lang, owner_name
 logger = logging.getLogger(__name__)
 
 MAX_SCENARIO_CHARS = 200
-# 系统提示要求 opening 不超过30字；这里多留10字冗余，模型偶尔略超可接受，超40才丢弃回退模板。
-MAX_OPENING_CHARS = 40
+# 开场白上限按「显示宽度」计，不按裸字符数：CJK 记 2、拉丁记 1。
+# 裸字符数对两种文字不等价——40 字符对中文是一整句话，对英文只有约 7 个词，
+# 连内置示例 data/number_profiles.example.json 的英文 opening（43 字符）都超限，
+# 导致首启种子预设一打开编辑就存不回去。100 宽度 ≈ 50 个汉字 ≈ 100 个拉丁字符，
+# 两种文字都能写出一句自然的开场白。
+MAX_OPENING_WIDTH = 100
+
+
+def display_width(text: str) -> int:
+    """东亚全角字符记 2 宽度，其余记 1（近似终端/朗读长度，语言无关）。"""
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
 _CACHE_LIMIT = 64
 _CACHE: "OrderedDict[tuple[str, str, str], tuple[str, str]]" = OrderedDict()
 _CACHE_LOCK = threading.Lock()
@@ -37,7 +47,7 @@ _TEXT_BACKENDS = frozenset(_DEFAULT_MODEL_BY_PROVIDER)
 _SYSTEM_PROMPT = {
     "zh": (
         "你是电话外呼策略助手。请只输出严格合法的JSON对象："
-        '{"scenario":"不超过200字的场景与策略","opening":"不超过30字的第一句"}。'
+        '{"scenario":"不超过200字的场景与策略","opening":"一句自然的开场白，中文不超过约40字"}。'
         "用第二人称写给正在代机主打电话的语音助手。根据号码、事项和语言，"
         "自己判断对方可能是什么对象或热线，以及第一句怎么开场、是否需要自我介绍、"
         "遇到语音菜单该说短词还是对真人说整句、沟通要点是什么。"
@@ -48,8 +58,8 @@ _SYSTEM_PROMPT = {
     ),
     "en": (
         "You are an outbound phone-call strategy assistant. Output only a strictly "
-        'valid JSON object: {"scenario":"strategy, <=200 chars","opening":"first '
-        'sentence, <=30 chars"}. Write scenario in second person for a voice '
+        'valid JSON object: {"scenario":"strategy, <=200 chars","opening":"one '
+        'natural opening sentence, <=90 chars"}. Write scenario in second person for a voice '
         "assistant calling on the owner's behalf. From the phone number, task, and "
         "language, infer what the other side may be and advise the first line, "
         "whether to introduce yourself, whether to use short menu phrases or full "
@@ -383,7 +393,7 @@ def _normalize_scenario(text: str) -> str:
 def _normalize_opening(text: str) -> str:
     """规范化生成的开场白；超限直接放弃（回退模板开场），绝不硬切成半句让 AI 念断句。"""
     collapsed = " ".join((text or "").strip().split())
-    if len(collapsed) > MAX_OPENING_CHARS:
+    if display_width(collapsed) > MAX_OPENING_WIDTH:
         return ""
     return collapsed
 
