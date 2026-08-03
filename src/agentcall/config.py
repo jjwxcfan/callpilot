@@ -267,6 +267,14 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # ---- 通话行为 ----
     ConfigSpec("HALF_DUPLEX_HANGOVER_SECONDS", "半双工挂尾时长（秒）", "float", "0.5"),
     ConfigSpec("HANGUP_TOOL_DELAY_SECONDS", "挂断工具延迟（秒）", "float", "4.5"),
+    # 默认维持 inband —— 2026-08-03 真机对照定档（#74 / WIL-82）：
+    # 白天拨 10086 各 5 通，只统计「在按键菜单上按的键」，判据为对端是否真的
+    # 推进到下一级（本机 result=success 已证实是假阳，不作数）。
+    # 一级菜单「转回广东10086请按1」是两臂唯一完全可比的事件：
+    #     inband 4/4 推进，qvts 5/5 推进 —— 无可测差异。
+    # 更早认为「inband 被运营商 IVR 忽略」的结论，是在 DTMF_GUARD_MS 护窗
+    # （#45）之前得到的；真因是语音与双音混叠，不是 mode。护窗上线后不再复现。
+    # 差距不明显就不动生产默认值。
     ConfigSpec("DTMF_MODE", "DTMF 发送模式", "select", "inband",
                choices=("inband", "qvts", "both")),
     # 带内双音候选标定(#80-D):200ms/0.50 为候选基线（约 -6dBFS）;待 G2 真机验证。
