@@ -7,12 +7,17 @@ import hashlib
 import json
 import math
 import re
+import threading
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal, cast
 
 from .call_log import CallLogger
 from .events import EventHub
+
+# 缓存的通话产物条数上限（含完整 timeline，故不宜太大）。
+_MAX_CACHED_ARTIFACTS = 256
 
 ContentResource = Literal[
     "messages.list",
@@ -45,6 +50,17 @@ class ContentSyncRepository:
     def __init__(self, hub: EventHub, call_logger: CallLogger) -> None:
         self._hub = hub
         self._call_logger = call_logger
+        # 按目录缓存已解析的通话产物，用 mtime 签名失效（#73）。
+        # 原实现每次请求都重读所有通话目录的 meta.json + summary.json +
+        # events.jsonl，无索引无缓存；而云侧 relay 只有 5s deadline，且 WSS
+        # 读循环同时兼管心跳。历史一长，内容同步就从「慢」退化成「超时失败」，
+        # 还会连带拖慢心跳。
+        self._artifact_cache: OrderedDict[str, tuple[tuple, _CallArtifact]] = (
+            OrderedDict()
+        )
+        # callId(公开 id) → 目录名。_find_call 曾经也是全量扫描。
+        self._call_id_index: dict[str, str] = {}
+        self._cache_lock = threading.Lock()
 
     def read(self, resource: str, params: dict[str, Any]) -> dict[str, Any]:
         if resource == "messages.list":
@@ -154,15 +170,77 @@ class ContentSyncRepository:
         base_dir = self._call_logger.base_dir
         if not base_dir.is_dir():
             return artifacts
-        for path in base_dir.iterdir():
+        seen: set[str] = set()
+        for path in sorted(base_dir.iterdir()):
             if not path.is_dir():
                 continue
-            artifact = _read_call_artifact(path)
+            seen.add(path.name)
+            artifact = self._cached_artifact(path)
             if artifact is not None:
                 artifacts.append(artifact)
+        self._evict_missing(seen)
         return artifacts
 
+    def _cached_artifact(self, path: Path) -> "_CallArtifact | None":
+        # 命中路径只 stat 不读文件——这是本次优化的全部意义所在。
+        signature = _artifact_signature(path)
+        with self._cache_lock:
+            cached = self._artifact_cache.get(path.name)
+            if cached is not None and cached[0] == signature:
+                self._artifact_cache.move_to_end(path.name)
+                return cached[1]
+        # 未命中才回填 public_id。解析过程本身会写 meta.json（首次补 public_id），
+        # 若等解析完再取签名，就分不清「文件被别人改了」和「我们自己写的」。把这
+        # 唯一一次写提前（它是幂等的），此后签名才稳定。
+        meta = _backfill_public_id(path)
+        signature = _artifact_signature(path)
+        # 解析放在锁外：读文件可能较慢，不该挡住其它请求。
+        artifact = _read_call_artifact(path, meta=meta)
+        if artifact is None:
+            return None
+        if _artifact_signature(path) != signature:
+            # 解析途中文件被改（通话进行中在追加 events.jsonl 是常态）。
+            # 这份结果可能是新旧混合，**不入缓存** —— 否则会以一个「看起来很新」
+            # 的签名把陈旧数据永久钉住，只能靠进程重启自愈（Codex 评审 P1）。
+            return artifact
+        with self._cache_lock:
+            self._artifact_cache[path.name] = (signature, artifact)
+            self._artifact_cache.move_to_end(path.name)
+            self._call_id_index[str(artifact.record["callId"])] = path.name
+            self._trim_cache_locked()
+        return artifact
+
+    def _trim_cache_locked(self) -> None:
+        """有界 LRU：把「扫描慢」换成「内存无限涨」不算修好（Codex 评审 P2）。
+
+        索引（callId→目录名）很小，保留全部；被淘汰的只是解析结果，
+        下次命中它时重新解析即可。
+        """
+        while len(self._artifact_cache) > _MAX_CACHED_ARTIFACTS:
+            self._artifact_cache.popitem(last=False)
+
+    def _evict_missing(self, present: set[str]) -> None:
+        """目录被删（如历史清理）后，缓存与索引不能继续留着它。"""
+        with self._cache_lock:
+            for name in [n for n in self._artifact_cache if n not in present]:
+                self._artifact_cache.pop(name, None)
+            self._call_id_index = {
+                call_id: name
+                for call_id, name in self._call_id_index.items()
+                if name in present
+            }
+
     def _find_call(self, call_id: str) -> _CallArtifact:
+        # 先走索引直接定位目录，避免为了一个 id 扫全部历史。
+        with self._cache_lock:
+            directory = self._call_id_index.get(call_id)
+        if directory:
+            path = self._call_logger.base_dir / directory
+            if path.is_dir():
+                artifact = self._cached_artifact(path)
+                if artifact is not None and artifact.record["callId"] == call_id:
+                    return artifact
+        # 索引未命中（进程刚起 / 新通话）才回退到全量扫描，同时把索引建起来。
         for artifact in self._call_artifacts():
             if artifact.record["callId"] == call_id:
                 return artifact
@@ -181,9 +259,40 @@ class _CallArtifact:
         self.timeline = timeline
 
 
-def _read_call_artifact(path: Path) -> _CallArtifact | None:
-    meta_path = path / "meta.json"
-    meta = _read_json_object(meta_path)
+def _backfill_public_id(path: Path) -> dict[str, Any] | None:
+    """幂等地把 public_id 补进 meta.json（已有则不写），并返回读到的 meta。
+
+    返回值交给随后的解析复用，免得冷路径把 meta.json 读两遍。
+    """
+    meta = _read_json_object(path / "meta.json")
+    if meta is not None:
+        _ensure_public_call_metadata(path, meta)
+    return meta
+
+
+def _artifact_signature(path: Path) -> tuple:
+    """目录内容的失效签名：三个来源文件的 (mtime_ns, size)。
+
+    只看目录 mtime 不够——写 summary.json 不一定更新父目录 mtime。
+    文件缺失记为 None，从「没有」变成「有」同样要触发重解析。
+    """
+    parts: list[Any] = []
+    for name in ("meta.json", "summary.json", "events.jsonl"):
+        try:
+            stat = (path / name).stat()
+        except OSError:
+            parts.append(None)
+        else:
+            parts.append((stat.st_mtime_ns, stat.st_size))
+    return tuple(parts)
+
+
+def _read_call_artifact(
+    path: Path, *, meta: dict[str, Any] | None = None
+) -> _CallArtifact | None:
+    # meta 可由调用方传入（已在回填时读过），避免冷路径重复读同一个文件。
+    if meta is None:
+        meta = _read_json_object(path / "meta.json")
     if meta is None:
         return None
     public_id = _ensure_public_call_metadata(path, meta)
