@@ -144,6 +144,9 @@ def test_transfer_precommit_failure_reopens_policy_lane(monkeypatch) -> None:
 def test_owner_preference_is_reserved_for_judge_not_realtime(monkeypatch) -> None:
     service = _service()
     service.session._triage_mode = "enforce"
+    # 限制话术自 #76 起跟随 _triage_pending 而不是 mode（放行裁决要能解除它）。
+    # 生产里两者由 _initialize_triage_context 一起写，这里补齐等价初始状态。
+    service.session._triage_pending = True
     monkeypatch.setenv("INBOUND_TAKEOVER_ENABLED", "true")
     monkeypatch.setenv(
         "INBOUND_TAKEOVER_PREFERENCE",

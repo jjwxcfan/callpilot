@@ -1304,7 +1304,11 @@ class CallSession:
             if result.outcome in {"ignored", "observe"}:
                 continue
             if result.outcome == "continue_ai":
+                # 放行：先清标志，再把重建后的提示词真正下发给 provider。
+                # 只清标志是没用的——会话建立时那份 instructions 已经发出去了，
+                # 不中途 session.update，AI 会被限制话术锁住整通电话（#76）。
                 self._triage_pending = False
+                await self._push_triage_release_instructions(agent)
                 continue
             if result.outcome == "clarify":
                 if self._triage_clarification_spoken:
@@ -1351,6 +1355,28 @@ class CallSession:
                 terminal_action = "reject"
         return terminal_action
 
+    async def _push_triage_release_instructions(self, agent: VoiceAgent) -> None:
+        """分诊放行后下发解除限制的提示词。
+
+        provider 不支持中途 session.update 时如实告警——那种部署下 AI 会一直
+        停在限制话术，是可观测的降级，而不是静默失效。
+        """
+        try:
+            pushed = await agent.update_session_instructions(
+                self._build_agent_instructions("inbound")
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "分诊放行后更新提示词失败: error_type=%s", type(exc).__name__
+            )
+            return
+        if pushed:
+            logger.info("分诊放行: 已解除限制话术")
+        else:
+            logger.warning(
+                "分诊放行: provider 不支持中途更新提示词，AI 仍受限于分诊话术"
+            )
+
     def _log_triage_consumption(self, result: TriageConsumption) -> None:
         record = self._record
         if record is not None:
@@ -1395,7 +1421,10 @@ class CallSession:
             lang,
             scenario=scenario,
             takeover_preference=takeover_preference,
-            triage_pending=triage_mode == "enforce",
+            # 读标志而不是 mode：裁决 continue_ai 后要能真的解除限制话术。
+            # 曾写成 triage_mode == "enforce"，于是 _triage_pending 成了只写
+            # 标志（4 处写、0 处读），放行裁决完全落空（#76）。
+            triage_pending=self._triage_pending if direction == "inbound" else False,
         )
 
     def _opening_instructions(self, direction: str) -> str:

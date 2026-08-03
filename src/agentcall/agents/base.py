@@ -34,8 +34,26 @@ class VoiceAgent(ABC):
         self._tools = registry
 
     def set_session_instructions(self, instructions: str | None) -> None:
-        """设置本通电话的系统提示词。"""
+        """设置本通电话的系统提示词。
+
+        只在 ``start()`` 建立会话前有效——各实现在 start 时把它读进自己的
+        ``_instructions`` 并随首次 session.update 发出。会话建立后再调用它
+        **不会**改变 provider 侧的提示词，要中途改用
+        ``update_session_instructions()``。
+        """
         self._session_instructions = instructions
+
+    async def update_session_instructions(self, instructions: str) -> bool:
+        """通话中改写系统提示词；返回是否真的下发到了 provider。
+
+        默认实现只更新本地字段，对**已建立**的会话没有任何作用——provider
+        那边仍在用连接时的那份。支持中途 session.update 的实现必须覆写。
+
+        返回值不能省：WIL-80 的形态正是「标志翻转了、提示词没换」，调用方
+        必须能区分「已下发」与「本 provider 不支持」，否则又是一次静默失效。
+        """
+        self._session_instructions = instructions
+        return False
 
     def set_repeat_stuck_handler(
         self, handler: "Callable[[str], None] | None"
