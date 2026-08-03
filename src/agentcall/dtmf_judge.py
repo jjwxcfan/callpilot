@@ -56,8 +56,17 @@ _EXPECTED_FIELDS = frozenset(
 )
 _MAX_TRANSCRIPTS = 8
 _MAX_RECENT_ACTIONS = 3
-_MODEL_SINGLE_FLIGHT_LOCK = threading.Lock()
-_MODEL_SINGLE_FLIGHT_THREAD: threading.Thread | None = None
+# 全局在飞模型调用上限。它防的是**SDK 挂死**：dashscope 的调用可能几十秒不返回，
+# 而判官每个转写片段都会想判一次，线程会无上限堆积。
+#
+# 但这个上限不能是 1。曾经用「模块级 single-flight」实现，等价于全局并发=1，
+# 于是两通并发通话里第二通每次都拿到伪 "timeout" —— 它根本没调用模型却被记成
+# 超时，污染了 shadow 采集数据，而那正是 #45 按键统计的来源（#72）。
+#
+# 现在分两层：每个判官实例内部仍是 single-flight（一通电话不堆积），全局再加一个
+# 有界信号量（挂死时不无限增长）。并发通话各自拿得到槽位。
+_MAX_CONCURRENT_MODEL_CALLS = 4
+_MODEL_CALL_SLOTS = threading.BoundedSemaphore(_MAX_CONCURRENT_MODEL_CALLS)
 
 _SYSTEM_PROMPT = (
     "你是电话按键决策器。只输出一个严格合法的 JSON 对象，不要 Markdown 或额外文字。"
@@ -271,6 +280,11 @@ class DtmfJudge:
         self._thread: threading.Thread | None = None
         self._private_lock = threading.Lock()
         self._private_lines: list[str] = []
+        # single-flight 必须按实例隔离：曾是模块全局，两通并发通话时第二通的
+        # 判官会在每次重叠判定上拿到伪 "timeout"，污染 shadow 采集数据——而那
+        # 正是 #45 按键统计的来源（#72）。每通电话一个 DtmfJudge 实例。
+        self._single_flight_lock = threading.Lock()
+        self._single_flight_thread: threading.Thread | None = None
 
     def start(self) -> None:
         with self._condition:
@@ -369,12 +383,9 @@ class DtmfJudge:
         self, messages: list[dict[str, str]]
     ) -> tuple[str | None, str | None]:
         """Enforce the judge timeout even if an SDK call ignores its timeout hint."""
-        global _MODEL_SINGLE_FLIGHT_THREAD
-
         box: dict[str, object] = {}
 
         def call() -> None:
-            global _MODEL_SINGLE_FLIGHT_THREAD
             try:
                 box["result"] = self._model_call(
                     messages, self._model, self._timeout_seconds
@@ -382,24 +393,32 @@ class DtmfJudge:
             except Exception as exc:  # noqa: BLE001
                 box["error_type"] = type(exc).__name__
             finally:
-                with _MODEL_SINGLE_FLIGHT_LOCK:
-                    if _MODEL_SINGLE_FLIGHT_THREAD is threading.current_thread():
-                        _MODEL_SINGLE_FLIGHT_THREAD = None
+                _MODEL_CALL_SLOTS.release()
+                with self._single_flight_lock:
+                    if self._single_flight_thread is threading.current_thread():
+                        self._single_flight_thread = None
 
         thread = threading.Thread(
             target=call,
             name="dtmf-judge-model-call",
             daemon=True,
         )
-        with _MODEL_SINGLE_FLIGHT_LOCK:
-            previous = _MODEL_SINGLE_FLIGHT_THREAD
+        with self._single_flight_lock:
+            previous = self._single_flight_thread
             if previous is not None and previous.is_alive():
                 return None, "timeout"
-            _MODEL_SINGLE_FLIGHT_THREAD = thread
+            # 全局槽位：拿不到说明已有 _MAX_CONCURRENT_MODEL_CALLS 个调用在飞
+            # （通常意味着 SDK 挂死）。此时用**专门的** model_saturated 上报，
+            # 绝不复用 timeout —— 复用就等于把「准入被拒」记成「模型太慢」，
+            # 那正是 #72 的数据污染，只是换了个更高的阈值（Codex 评审 P1）。
+            if not _MODEL_CALL_SLOTS.acquire(blocking=False):
+                return None, "model_saturated"
+            self._single_flight_thread = thread
             try:
                 thread.start()
             except Exception:  # noqa: BLE001
-                _MODEL_SINGLE_FLIGHT_THREAD = None
+                _MODEL_CALL_SLOTS.release()
+                self._single_flight_thread = None
                 return None, "model_error"
         thread.join(self._timeout_seconds)
         if thread.is_alive():
@@ -521,6 +540,9 @@ def _default_model_call(
 def _sanitize_error_code(code: str) -> str:
     allowed = {
         "timeout",
+        # 准入控制拒绝（并发槽位耗尽），不是模型慢。分开记，才能把它从
+        # IVR 质量的 timeout 统计里排除出去。
+        "model_saturated",
         "model_error",
         "invalid_json",
         "invalid_schema",
