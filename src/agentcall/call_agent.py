@@ -242,6 +242,13 @@ class CallSession:
         self._triage_clarification_spoken = False
         # 按键护窗截止时刻（monotonic）：DTMF 期间丢弃 Agent 下行。
         self._dtmf_guard_until = 0.0
+        # 本轮护窗内被丢弃的 Agent 下行字节数，窗口结束时汇总成一条事件（#81）。
+        self._dtmf_guard_dropped_bytes = 0
+        # 单独一把小锁：绝不能复用 _dtmf_lock —— 那把锁在 _send_dtmf_raw 里
+        # 跨越阻塞的 AT 往返，音频回调等在上面会直接把下行卡住。
+        self._guard_drop_lock = threading.Lock()
+        # 最近一次 Agent 音频采样率，供收尾兜底计算丢弃时长。
+        self._agent_output_rate = 24000
 
     def _publish(self, event: dict) -> None:
         if self.hub:
@@ -555,6 +562,7 @@ class CallSession:
     ) -> Callable[[bytes], None]:
         """Agent 下行音频回调：浏览器实时旁听、本机监听旁路、重采样到 8k、录音、入发送队列。"""
 
+        self._agent_output_rate = agent.output_rate
         # 实时旁听按 Agent 输出采样率播放（qwen/openai 均 24k）。
         if self.hub is not None:
             self.hub.set_audio_rate(agent.output_rate)
@@ -568,7 +576,12 @@ class CallSession:
             # 真机 2026-08-03 拨 10086：模型一边说「这边先按一下对应的键」一边按，
             # 4 次本机 success、IVR 菜单一次没推进（见 #45 评论）。
             if time.monotonic() < self._dtmf_guard_until:
+                # 按窗累计而不是逐块记事件：这里是热路径（约每 20ms 一块），
+                # 逐块写会把 events.jsonl 冲垮。窗口结束后统一落一条。
+                with self._guard_drop_lock:
+                    self._dtmf_guard_dropped_bytes += len(pcm_agent)
                 return
+            self._flush_dtmf_guard_drop(record, agent.output_rate)
             if pcm_agent and on_first_audio is not None:
                 on_first_audio()
             # 浏览器实时旁听下行 AI（Web Audio）：无监听端时零成本返回。kind=0=下行。
@@ -964,6 +977,10 @@ class CallSession:
         """收尾：落盘通话记录，并按需在后台线程生成通话摘要。"""
         if record is None:
             return
+        # 兜底汇总最后一个护窗：常见形态正是「模型说完『我按一下』→ 按键 →
+        # 随后安静等 IVR」，那样就永远等不到下一块非护窗音频来触发汇总，
+        # 这条事件会整个丢掉——而它恰恰是用来解释这一段的（Codex 评审 P1）。
+        self._flush_dtmf_guard_drop(record, self._agent_output_rate)
         try:
             record.finish(status)
         except Exception as exc:  # noqa: BLE001
@@ -1703,6 +1720,7 @@ class CallSession:
                 # 护窗是 monotonic 时刻：背靠背通话可能落在上一通的护窗内，
                 # 那会让新通话开场白被静音，必须随每通重置。
                 self._dtmf_guard_until = 0.0
+                self._dtmf_guard_dropped_bytes = 0
 
     def _cancel_spoken_dtmf_followups_locked(self) -> None:
         pending = list(self._pending_dtmf_followups.values())
@@ -1847,6 +1865,31 @@ class CallSession:
                 # 没发出去就不该白白哑掉 Agent：预装的护窗要还原。
                 self._dtmf_guard_until = previous_guard
             return ok, mode
+
+    def _flush_dtmf_guard_drop(self, record: CallRecord | None, rate: int) -> None:
+        """护窗结束后落一条「丢了多少 Agent 语音」的事件。
+
+        录音只记实际发出的内容（刻意如此），但**文字 transcript 不受护窗影响**：
+        模型「说」的那句话仍会完整进 transcript，哪怕它一个字节都没发出去。
+        事后复盘会看到转写与录音对不上，误判成丢包或录音坏了——这条事件让这个
+        差异在记录里自解释（#81）。
+        """
+        with self._guard_drop_lock:
+            dropped = self._dtmf_guard_dropped_bytes
+            self._dtmf_guard_dropped_bytes = 0
+        if dropped <= 0 or record is None:
+            return
+        try:
+            record.log_event(
+                "agent_audio_dropped",
+                reason="dtmf_guard",
+                bytes=dropped,
+                duration_ms=round(dropped / 2 / max(1, rate) * 1000),
+            )
+        except Exception as exc:  # noqa: BLE001 - 记账失败不该影响通话
+            logger.warning(
+                "记录护窗丢弃事件失败: error_type=%s", type(exc).__name__
+            )
 
     def _record_dtmf_action(self, digits: str, source: str) -> None:
         public_source = {
