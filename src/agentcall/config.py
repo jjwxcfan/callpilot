@@ -271,6 +271,10 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                choices=("inband", "qvts", "both")),
     # 带内双音候选标定(#80-D):200ms/0.50 为候选基线（约 -6dBFS）;待 G2 真机验证。
     ConfigSpec("DTMF_TONE_MS", "带内按键音时长（毫秒）", "int", "200"),
+    # 按键护窗（#45 信号层）：DTMF 前后这段时间丢弃 Agent 下行语音，让按键
+    # 前后的上行只有双音。真机实测模型会「边说边按」，语音与双音混叠后对端
+    # 两者都听不清。0 = 关闭护窗（回到旧行为）。
+    ConfigSpec("DTMF_GUARD_MS", "按键前后静音护窗（毫秒）", "int", "400"),
     ConfigSpec("DTMF_TONE_AMPLITUDE", "带内按键音幅度 (0, 1]，默认 0.5（约 -6dBFS）", "float", "0.5"),
     ConfigSpec("REPEAT_SUPPRESS_SIMILARITY", "复读抑制相似度阈值", "float", "0.9"),
     # 外呼硬时限（秒）：LLM 收尾裁判失灵/漏判时的最后防线，到点自动道别挂断；
