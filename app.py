@@ -281,6 +281,9 @@ def main() -> None:
             remote_pairing_store,
             public_url=config.get_str("REMOTE_CONTROL_URL"),
         )
+        # access_log=None 保持关闭：aiohttp 默认格式会记完整请求行、完整来源
+        # 地址与 User-Agent，对公网可达的配对网关过于宽松。网关自己在
+        # remote_gateway._access_log 里记一条脱敏的（#98 / WIL-84）。
         remote_runner = web.AppRunner(remote_app, access_log=None)
         try:
             loop.run_until_complete(remote_runner.setup())
