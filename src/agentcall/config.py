@@ -187,6 +187,13 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("AGENT_MODEL_NAME_OPENAI", "OpenAI 模型显示名", "str",
                "OpenAI Realtime", editable=False, hidden=True,
                requires_restart=True),
+    # 留空 = 按 SIM 的 IMSI 自动识别（默认）。识别不到或携号转网导致识别有误时，
+    # 填这里覆盖。它同时喂给 dial_guard 的误拨保护——识别不到时那道保护会失效，
+    # 而跨运营商客服号是按普通通话计费的（#72）。
+    # requires_restart：覆盖只在 refresh_sim_identity（连接/重连时）施加，改完不重启
+    # 的话 dial_guard / 结果校验 / /api/meta 仍拿旧值，面板却显示已生效（Codex 评审 P1）。
+    ConfigSpec("CARRIER_HOTLINE", "运营商免费客服号（留空=按 SIM 自动识别）", "str", "",
+               requires_restart=True),
     ConfigSpec("OWNER_NAME", "机主姓名", "str", ""),
     ConfigSpec(
         "INBOUND_TAKEOVER_ENABLED",
