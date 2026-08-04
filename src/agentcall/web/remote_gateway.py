@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import logging
 import secrets
 import time
 from collections import OrderedDict, deque
@@ -19,6 +20,8 @@ from ..remote_pairing import (
     PairingCapacityError,
     RemotePairingStore,
 )
+
+logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
 DEVICE_COOKIE = "__Host-callpilot-device"
@@ -82,6 +85,71 @@ def security_headers() -> dict[str, str]:
     }
 
 
+def _route_label(request: web.Request) -> str:
+    """请求的**路由模板**，不是原始路径。
+
+    原始路径是调用方完全可控的文本：`/api/pair/<把配对码贴进来>` 会在返回 404
+    之前被原样记进日志。本模块的不变量是「凭证绝不进日志」，所以只记路由模板，
+    未匹配的一律记成 <unmatched>（Codex 评审 P1）。
+    """
+    route = getattr(request.match_info, "route", None)
+    resource = getattr(route, "resource", None)
+    canonical = getattr(resource, "canonical", None)
+    return canonical if isinstance(canonical, str) and canonical else "<unmatched>"
+
+
+def _client_prefix(request: web.Request) -> str:
+    """客户端地址前缀。只保留网段，不记完整 IP。
+
+    足以把同一来源的请求串起来做排障与滥用调查，又不把完整地址落盘。
+    """
+    raw = _client_key(request)
+    try:
+        address = ipaddress.ip_address(raw)
+    except ValueError:
+        return "unknown"
+    if address.version == 4:
+        return ".".join(address.exploded.split(".")[:3]) + ".x"
+    # 必须用 exploded 而不是原串：压缩写法下按 ":" 切会切出畸形结果，
+    # 且可能把整个地址留在里面——"::1" 会变成 "::1::x"（Codex 评审 P2）。
+    return ":".join(address.exploded.split(":")[:3]) + "::x"
+
+
+@web.middleware
+async def _access_log(request: web.Request, handler):
+    """网关访问日志：只记方法 / 路径 / 状态码 / 耗时 / 客户端网段。
+
+    原实现用 `AppRunner(..., access_log=None)` 整个关掉（app.py:284，无注释说明
+    原因）。关掉是有道理的——aiohttp 默认格式会记完整请求行、完整来源地址与
+    User-Agent，而这是个公网可达、处理配对凭证的网关。
+
+    但代价是**手机侧发生了什么，Edge 完全看不见**：#98 实测一次成功的配对+拨号+
+    双向通话，日志里一条请求都没有。这条路径本就隔着一层（用户在手机上、日志在
+    电脑上），没有请求日志就只剩「用户描述现象」这一个信息源。
+
+    折中：自己记一条**脱敏**的。刻意不记 —— 请求体（含配对码）、Cookie（含设备
+    凭证）、User-Agent、完整 IP、query string。
+    """
+    started = time.monotonic()
+    status = 500
+    try:
+        response = await handler(request)
+        status = response.status
+        return response
+    except web.HTTPException as exc:
+        status = exc.status
+        raise
+    finally:
+        logger.info(
+            "网关 %s %s -> %d %.0fms client=%s",
+            request.method,
+            _route_label(request),  # 路由模板，不是可控的原始路径
+            status,
+            (time.monotonic() - started) * 1000.0,
+            _client_prefix(request),
+        )
+
+
 class _AttemptLimiter:
     def __init__(self, limit: int, window_seconds: float = 300.0) -> None:
         self.limit = max(1, limit)
@@ -123,7 +191,7 @@ def build_remote_gateway(
     ):
         raise ValueError("REMOTE_CONTROL_URL 必须是 HTTPS URL")
     public_origin = f"{parsed.scheme}://{parsed.netloc}"
-    app = web.Application(client_max_size=16 * 1024)
+    app = web.Application(client_max_size=16 * 1024, middlewares=[_access_log])
     app["service"] = service
     app["pairing_store"] = pairing_store
     app["public_origin"] = public_origin
