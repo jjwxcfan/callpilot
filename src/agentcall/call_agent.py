@@ -90,6 +90,12 @@ from .triage_judge import (
 
 logger = logging.getLogger(__name__)
 
+# dtmf_outcome 事件里对端话语的截断长度：够判读，又不至于把整段通话搬进事件流。
+_OUTCOME_TEXT_CHARS = 80
+# 按键后等待对端反应的窗口，与 scripts/regression_call.py 的 8s 观察窗一致。
+# 超窗即「按键后无反应」——那本身就是证据，必须落，不能悄悄丢。
+_OUTCOME_WINDOW_SECONDS = 8.0
+
 
 AudioBridge = ModemAudioBridge | SerialPcmAudioBridge | FfmpegAudioBridge
 
@@ -244,6 +250,13 @@ class CallSession:
         self._dtmf_guard_until = 0.0
         # 本轮护窗内被丢弃的 Agent 下行字节数，窗口结束时汇总成一条事件（#81）。
         self._dtmf_guard_dropped_bytes = 0
+        # 按键推进校验（#50 第 4 项）：记住最近一次按键，等对端下一句到达时配对成
+        # 一条 dtmf_outcome 事件。只存"上一句对端话语"与"待配对的按键"两样。
+        # 单独一把锁：按键在通话线程（持 _dtmf_lock）、转写回调在 realtime 线程，
+        # 两边都要改这组状态。不复用 _dtmf_lock —— 那把锁跨越阻塞的 AT 往返。
+        self._outcome_lock = threading.Lock()
+        self._last_remote_utterance = ""
+        self._pending_dtmf_outcome: dict | None = None
         # 单独一把小锁：绝不能复用 _dtmf_lock —— 那把锁在 _send_dtmf_raw 里
         # 跨越阻塞的 AT 往返，音频回调等在上面会直接把下行卡住。
         self._guard_drop_lock = threading.Lock()
@@ -538,6 +551,7 @@ class CallSession:
             if role == "agent":
                 self._schedule_spoken_dtmf_followup(agent, text)
             elif role == "user":
+                self._settle_dtmf_outcome(record, text)
                 judge = self._dtmf_judge
                 if judge is not None:
                     judge.submit_remote_transcript(
@@ -1750,6 +1764,12 @@ class CallSession:
                 # 那会让新通话开场白被静音，必须随每通重置。
                 self._dtmf_guard_until = 0.0
                 self._dtmf_guard_dropped_bytes = 0
+                # 不重置会跨通话串味：上一通挂起的按键会跟下一通第一句对端话语
+                # 配对，把上一位来电者的话写进这一通的记录（Codex 评审 P1，
+                # 属隐私泄漏，不只是脏数据）。
+                with self._outcome_lock:
+                    self._pending_dtmf_outcome = None
+                    self._last_remote_utterance = ""
 
     def _cancel_spoken_dtmf_followups_locked(self) -> None:
         pending = list(self._pending_dtmf_followups.values())
@@ -1886,6 +1906,10 @@ class CallSession:
                     self._dtmf_guard_until,
                     time.monotonic() + tone_seconds + guard_seconds,
                 )
+                # 推进校验的挂起点必须在这里，不能放在 _record_dtmf_action 里：
+                # 那个方法在 DTMF_JUDGE_MODE=off（**默认值**）时会提前 return，
+                # 于是本事件在生产配置下**一次也不会产生**（Codex 评审 P1）。
+                self._arm_dtmf_outcome()
                 self._recent_dtmf_sent[digits] = (time.monotonic(), source)
                 self._record_dtmf_action(digits, source)
                 if source != "spoken_followup":
@@ -1920,6 +1944,83 @@ class CallSession:
                 "记录护窗丢弃事件失败: error_type=%s", type(exc).__name__
             )
 
+    def _arm_dtmf_outcome(self) -> None:
+        """按键发出后挂起一条待配对的推进证据。"""
+        with self._outcome_lock:
+            self._pending_dtmf_outcome = {
+                "action_id": "",
+                "pressed_at": time.monotonic(),
+                "menu_before": self._last_remote_utterance[:_OUTCOME_TEXT_CHARS],
+            }
+
+    def _emit_dtmf_outcome(
+        self, record: CallRecord, pending: dict, text: str, *, expired: bool
+    ) -> None:
+        try:
+            record.log_event(
+                "dtmf_outcome",
+                action_id=pending["action_id"],
+                menu_before=pending["menu_before"],
+                remote_after=text[:_OUTCOME_TEXT_CHARS],
+                latency_ms=round((time.monotonic() - pending["pressed_at"]) * 1000),
+                expired=expired,
+            )
+        except Exception as exc:  # noqa: BLE001 - 记账失败不该影响通话
+            logger.warning(
+                "记录按键推进证据失败: error_type=%s", type(exc).__name__
+            )
+
+    def _expire_dtmf_outcome(self, record: CallRecord | None) -> None:
+        """超窗仍无对端话语——把「按键后一片沉默」本身记下来。
+
+        沉默是有意义的证据：IVR 不理会一次按键时，往往就是什么都不说。若只在
+        「有下一句」时才落事件，这类失败会整个消失，而它恰恰是最该被找出来的。
+        """
+        with self._outcome_lock:
+            pending = self._pending_dtmf_outcome
+            if pending is None or (
+                time.monotonic() - pending["pressed_at"] < _OUTCOME_WINDOW_SECONDS
+            ):
+                return
+            self._pending_dtmf_outcome = None
+        if record is not None:
+            self._emit_dtmf_outcome(record, pending, "", expired=True)
+
+    def _settle_dtmf_outcome(self, record: CallRecord | None, text: str) -> None:
+        """把「按键 → 对端下一句」配成一条 dtmf_outcome 事件。
+
+        为什么要它（#50 第 4 项）：本机 `result: success` 已被反复证明是**假阳**
+        ——2026-08-03 拨 10086，4 次按键全 success，IVR 菜单一次没推进。判断按键
+        有没有生效，唯一可靠的依据是**对端接下来说了什么**。
+
+        本事件只**记录证据**，不下判断。这是刻意的，来自 WIL-82 手工判读的三次
+        踩坑：
+
+        1. **单位**：必须按按键记，不能按通话记 —— 同一通里不同按键结果可以不同；
+        2. **因果**：推进必须发生在按键**之后**。10086 菜单超时会自动转接，把按键
+           前的转接算作推进就是把 IVR 的自动行为记到按键头上（实测差 18 秒）；
+        3. **不写关键词表**：ASR 会输出繁体（「正在**為**您**轉**回」），简体关键词
+           表直接漏判。这既是非枚举硬原则，也是实测教训。
+
+        所以这里只如实记录 前一句 / 后一句 / 时延，判读留给离线分析或判官。
+        """
+        with self._outcome_lock:
+            pending = self._pending_dtmf_outcome
+            self._last_remote_utterance = text
+            if pending is None:
+                return
+            self._pending_dtmf_outcome = None
+            # 超窗的挂起不再与这句配对：否则被无视的那次按键会跟几分钟后的无关
+            # 话语凑成一条假证据（Codex 评审 P1）。
+            stale = (
+                time.monotonic() - pending["pressed_at"] >= _OUTCOME_WINDOW_SECONDS
+            )
+        if record is None:
+            return
+        self._emit_dtmf_outcome(
+            record, pending, "" if stale else text, expired=stale
+        )
+
     def _record_dtmf_action(self, digits: str, source: str) -> None:
         public_source = {
             "agent_tool": "realtime",
@@ -1952,6 +2053,10 @@ class CallSession:
         if record is not None:
             record.log_event("dtmf_action", **entry.public_fields())
         judge.record_action(entry)
+        # 影子判官开着时，把它的 action_id 补进待配对记录，便于两边对账。
+        with self._outcome_lock:
+            if self._pending_dtmf_outcome is not None:
+                self._pending_dtmf_outcome["action_id"] = entry.action_id
 
     def _resolve_dtmf_mode(self) -> str:
         configured = config.get_str("DTMF_MODE").strip().lower()
