@@ -260,6 +260,13 @@ class CallSession:
         # 单独一把小锁：绝不能复用 _dtmf_lock —— 那把锁在 _send_dtmf_raw 里
         # 跨越阻塞的 AT 往返，音频回调等在上面会直接把下行卡住。
         self._guard_drop_lock = threading.Lock()
+        # 单轮长度闸门（WIL-90）。on_agent_audio 是热路径且在 provider 线程上跑，
+        # 所以只在这里累加字节、判一次，真正的打断走 run_coroutine_threadsafe。
+        self._turn_audio_bytes = 0
+        self._turn_last_chunk_at = 0.0
+        self._turn_cancel_sent = False
+        self._turn_lock = threading.Lock()
+        self._max_turn_seconds = 0.0
         # 最近一次 Agent 音频采样率，供收尾兜底计算丢弃时长。
         self._agent_output_rate = 24000
 
@@ -586,6 +593,13 @@ class CallSession:
         def on_agent_audio(pcm_agent: bytes) -> None:
             if not self._agent_effect_allowed(generation):
                 return
+            # 单轮长度闸门必须在护窗**之前**结算（2026-08-05 Codex 评审 P1）。
+            # 闸门量的是「模型生成了多久」，护窗丢的是「要不要送出去」——两件事。
+            # 放在护窗之后会让护窗期内生成的音频对闸门完全不可见：轻则晚触发，
+            # 重则护窗一旦长过 _TURN_GAP_SECONDS，下一块就被当成新一轮而清零计数，
+            # 跑飞的长轮次就此绕过闸门。而这恰恰是 IVR 路径——模型边按键边说话
+            # 正是 WIL-49 记录在案的行为。
+            self._check_turn_length(pcm_agent, agent, record)
             # 按键护窗：DTMF 期间丢弃 Agent 下行，别让语音和双音挤在同一段上行。
             # 真机 2026-08-03 拨 10086：模型一边说「这边先按一下对应的键」一边按，
             # 4 次本机 success、IVR 菜单一次没推进（见 #45 评论）。
@@ -964,6 +978,7 @@ class CallSession:
     def _load_session_config(self) -> None:
         """每通会话开始时重读可调参数，支持不重启改参。"""
         self._hangover_seconds = config.get_float("HALF_DUPLEX_HANGOVER_SECONDS")
+        self._max_turn_seconds = config.get_float("AGENT_MAX_TURN_SECONDS")
         self._hangup_delay_seconds = config.get_float("HANGUP_TOOL_DELAY_SECONDS")
 
     def _begin_record(self, direction: str, number: str | None) -> CallRecord | None:
@@ -1918,6 +1933,85 @@ class CallSession:
                 # 没发出去就不该白白哑掉 Agent：预装的护窗要还原。
                 self._dtmf_guard_until = previous_guard
             return ok, mode
+
+    # 一轮之内 provider 是突发写音频的（分块几乎连着到），轮次之间才有真空档。
+    # 用这个空档判定「新的一轮开始了」，就不必依赖各 provider 的 response 事件。
+    _TURN_GAP_SECONDS = 1.5
+
+    def _check_turn_length(
+        self, pcm_agent: bytes, agent: VoiceAgent, record: CallRecord | None
+    ) -> None:
+        """单轮长度闸门（WIL-90 / WIL-85 N2）：一轮生成过长就打断生成。
+
+        为什么必须有这个闸门，而不能只在提示词里写「说短点」：WIL-83 已实测
+        证明模型**不可靠地遵守**提示词里的禁令——受限话术明令禁止「说会转告」，
+        AI 照说不误。判官范式：确定性策略要放在模型之外。
+
+        分工：提示词负责把中位数压下来，这里只兜住跑飞的长尾
+        （WIL-89 基线：中位 6.8s、p90 17.8s、最长 36.6s；默认阈值 20s）。
+
+        掐生成不掐播放——已排队的音频照常播完，对端听到的是完整播出的一段，
+        而不是被硬切掉半个字。
+        """
+        if self._max_turn_seconds <= 0 or not pcm_agent:
+            return
+        rate = getattr(agent, "output_rate", 0) or self._agent_output_rate
+        if rate <= 0:
+            return
+        now = time.monotonic()
+        with self._turn_lock:
+            if now - self._turn_last_chunk_at > self._TURN_GAP_SECONDS:
+                # 空档 → 新的一轮，计数与「已打断」标志一起重置。
+                self._turn_audio_bytes = 0
+                self._turn_cancel_sent = False
+            self._turn_last_chunk_at = now
+            self._turn_audio_bytes += len(pcm_agent)
+            seconds = self._turn_audio_bytes / (rate * 2)
+            if seconds <= self._max_turn_seconds or self._turn_cancel_sent:
+                return
+
+        # 先确认打断真的派发出去了，再置「已打断」标志、再落事件。
+        # 反过来（先置标志再派发）的话，事件流会显示「已掐断」而实际什么都没发生，
+        # 且这一轮之后再也不会重试——又是一次静默失效（2026-08-05 Codex 评审 P2）。
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            logger.warning(
+                "单轮生成超过 %.1fs，但事件循环不可用，本轮无法打断",
+                self._max_turn_seconds,
+            )
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self._cancel_agent_turn(agent), loop)
+        except RuntimeError as exc:
+            logger.warning("派发打断失败: %s", exc)
+            return
+
+        with self._turn_lock:
+            # 一轮只打断一次：cancel 之后余下的分块还会到，不设标志会反复下发。
+            self._turn_cancel_sent = True
+        logger.info("单轮生成超过 %.1fs，打断本轮", self._max_turn_seconds)
+        if record is not None:
+            record.log_event(
+                "turn_length_capped",
+                seconds=round(seconds, 1),
+                limit=self._max_turn_seconds,
+            )
+
+    async def _cancel_agent_turn(self, agent: VoiceAgent) -> None:
+        """把打断真正下发给 provider，并记录它到底有没有生效。
+
+        返回值必须落日志：豆包没有实现这条能力（WIL-75 的形态），
+        不区分「已下发」与「不支持」就又是一次静默失效。
+        """
+        try:
+            delivered = await agent.cancel_response()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("打断本轮回复异常: error_type=%s", type(exc).__name__)
+            return
+        if not delivered:
+            logger.warning(
+                "单轮长度闸门未生效：当前 provider 不支持打断，长轮次不会被掐断"
+            )
 
     def _flush_dtmf_guard_drop(self, record: CallRecord | None, rate: int) -> None:
         """护窗结束后落一条「丢了多少 Agent 语音」的事件。

@@ -291,6 +291,17 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # 两者都听不清。0 = 关闭护窗（回到旧行为）。
     ConfigSpec("DTMF_GUARD_MS", "按键前后静音护窗（毫秒）", "int", "400"),
     ConfigSpec("DTMF_TONE_AMPLITUDE", "带内按键音幅度 (0, 1]，默认 0.5（约 -6dBFS）", "float", "0.5"),
+    # 单轮长度闸门（WIL-90 / WIL-85 N2）：一轮生成超过这么多秒就打断生成。
+    #
+    # 分工要说清：**提示词负责把中位数压下来，本闸门只兜住跑飞的长尾**。
+    # 2026-08-05 WIL-89 基线（22 通）：单轮时长中位 6.8s、p90 17.8s、最长 36.6s。
+    # 默认 20s 取在 p90 之上，正常轮次不会被碰到，只掐那条 36 秒的。
+    #
+    # 掐的是**生成**不是**播放**——模型把整轮音频以突发写入、远快于实时播放
+    # （见 call_log._build_stereo_mix 注释），所以已排队的音频照常播完，
+    # 对端听到的是一段完整播出的语音，只是不再继续变长。
+    # 0 = 关闭。
+    ConfigSpec("AGENT_MAX_TURN_SECONDS", "AI 单轮生成上限（秒）；0=不限", "float", "20"),
     ConfigSpec("REPEAT_SUPPRESS_SIMILARITY", "复读抑制相似度阈值", "float", "0.9"),
     # 外呼硬时限（秒）：LLM 收尾裁判失灵/漏判时的最后防线，到点自动道别挂断；
     # 0 = 不限制。（正常收尾由 summarizer.judge_wrap_up 提前判定。）

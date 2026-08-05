@@ -223,6 +223,24 @@ class OpenAIVoiceAgent(VoiceAgent):
         logger.info("会话提示词已中途更新")
         return True
 
+    async def cancel_response(self) -> bool:
+        """打断本轮生成（Realtime ``response.cancel``）。
+
+        注意它掐的是**生成**，不是**播放**：模型把整轮音频以突发写入，远快于
+        实时播放（见 ``call_log._build_stereo_mix`` 的注释），所以 cancel 之后
+        已经排进 ``_outgoing_audio`` 的那部分仍会照常播完。这正是我们要的语义
+        ——对端最多听到闸门允许的那么长，而不是被硬生生切掉半个字。
+        """
+        ws = self._ws
+        if ws is None:
+            return False
+        try:
+            await ws.send(json.dumps({"type": "response.cancel"}))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("打断本轮回复失败: error_type=%s", type(exc).__name__)
+            return False
+        return True
+
     async def start(self, on_audio_out: Callable[[bytes], None]) -> None:
         self._loop = asyncio.get_running_loop()
         self._on_audio_out = on_audio_out
