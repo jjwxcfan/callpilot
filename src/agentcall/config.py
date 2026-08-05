@@ -267,6 +267,27 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("MODEM_PCM_BAUD", "PCM 串口波特率", "int", "921600",
                requires_restart=True),
     ConfigSpec("MODEM_TX_GAIN", "上行发送增益", "float", "1.0"),
+    # ---- 模组：安卓短信网关（无 EC20 硬件时的短信专用替代，见 modem_android_sms.py）----
+    # eg25=真实 EC20/EG25 模组（默认）；android_sms_gateway=只走短信，语音方法全部
+    # 报错桩，见 AndroidSmsGatewayModem。
+    ConfigSpec("MODEM_BACKEND", "模组后端", "select", "eg25",
+               choices=("eg25", "android_sms_gateway"), requires_restart=True),
+    # 手机上 capcom6/android-sms-gateway App「本机服务器模式」显示的地址。
+    ConfigSpec("ANDROID_SMS_GATEWAY_URL", "安卓短信网关地址", "str", "",
+               requires_restart=True),
+    ConfigSpec("ANDROID_SMS_GATEWAY_USERNAME", "安卓短信网关用户名", "str", "",
+               requires_restart=True),
+    # 凭证：登记只为面板显示「已设置/未设置」，真值不进注册表默认值——
+    # 用到时 os.environ["ANDROID_SMS_GATEWAY_PASSWORD"] 直读，缺失即 fail-fast
+    # （与 DASHSCOPE_API_KEY 同一模式）。
+    ConfigSpec("ANDROID_SMS_GATEWAY_PASSWORD", "安卓短信网关密码", "str", "",
+               secret=True, requires_restart=True),
+    # 本机 webhook 接收端监听的局域网地址：必须是手机能连到的这台电脑的 IP，
+    # 不能填 127.0.0.1（手机连不到）。
+    ConfigSpec("ANDROID_SMS_GATEWAY_WEBHOOK_HOST", "短信 webhook 接收地址", "str", "",
+               requires_restart=True),
+    ConfigSpec("ANDROID_SMS_GATEWAY_WEBHOOK_PORT", "短信 webhook 接收端口", "int",
+               "47101", requires_restart=True),
     # 对方语音送 AI 模型前的独立增益；每通开始读取，录音/监听仍保留各自路径。
     ConfigSpec("AGENT_UPLINK_GAIN", "AI 输入增益（对方语音）", "float", "1.0"),
     # 模组语音送远程手机前的独立增益；每个 LiveKit 会话创建时读取，支持热更新。

@@ -140,6 +140,26 @@ def main() -> None:
         )
         sys.exit(1)
 
+    # MODEM_BACKEND=android_sms_gateway：无 EC20 硬件时用安卓手机顶替，只走短信
+    # （见 modem_android_sms.py）。必需项缺失时启动期直接拦，比留到 supervisor
+    # 重连失败刷屏更清楚。
+    modem_backend = config.get_str("MODEM_BACKEND").lower()
+    if modem_backend == "android_sms_gateway":
+        _required_str_keys = (
+            "ANDROID_SMS_GATEWAY_URL",
+            "ANDROID_SMS_GATEWAY_USERNAME",
+            "ANDROID_SMS_GATEWAY_WEBHOOK_HOST",
+        )
+        _missing = [name for name in _required_str_keys if not config.get_str(name).strip()]
+        if not os.environ.get("ANDROID_SMS_GATEWAY_PASSWORD", "").strip():
+            _missing.append("ANDROID_SMS_GATEWAY_PASSWORD")
+        if _missing:
+            print(
+                f"错误: MODEM_BACKEND=android_sms_gateway 缺少配置: {', '.join(_missing)}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
     # local provider 模型预下载：~300MB 必须在通话前备好，否则放到 agent.start()
     # （通话已接通）里下载会超过外呼时限，通话空转到超时（2026-07-10 真机实证）。
     # 后台线程下载，不阻塞 Web 启动；下载中来电会因模型未就绪走既有 fatal 降级。
@@ -200,6 +220,22 @@ def main() -> None:
     store_path = data_dir / "messages.json"
     hub = EventHub(loop, store_path=store_path)
 
+    modem_override = None
+    if modem_backend == "android_sms_gateway":
+        from agentcall.modem_android_sms import AndroidSmsGatewayModem
+
+        modem_override = AndroidSmsGatewayModem(
+            base_url=config.get_str("ANDROID_SMS_GATEWAY_URL"),
+            username=config.get_str("ANDROID_SMS_GATEWAY_USERNAME"),
+            password=os.environ["ANDROID_SMS_GATEWAY_PASSWORD"],
+            webhook_host=config.get_str("ANDROID_SMS_GATEWAY_WEBHOOK_HOST"),
+            webhook_port=config.get_int("ANDROID_SMS_GATEWAY_WEBHOOK_PORT"),
+        )
+        logger.info(
+            "模组后端 = android_sms_gateway（不支持语音，仅短信）: %s",
+            config.get_str("ANDROID_SMS_GATEWAY_URL"),
+        )
+
     service = CallAgentService(
         modem_port=modem_port,
         audio_keyword=config.get_str("MODEM_AUDIO_KEYWORD"),
@@ -210,6 +246,7 @@ def main() -> None:
         pcm_baudrate=config.get_int("MODEM_PCM_BAUD"),
         tx_gain=config.get_float("MODEM_TX_GAIN"),
         hub=hub,
+        modem=modem_override,
     )
 
     # provider -> 模型显示名的注册表 key（未知 provider 回落 qwen 显示名）。
@@ -344,6 +381,7 @@ def _selftest() -> int:
         "agentcall.agents.local_agent",
         "agentcall.local_models",
         "agentcall.sms_email_forwarder",
+        "agentcall.modem_android_sms",
         "agentcall.remote_dialer",
         "agentcall.remote_pairing",
         "agentcall.cloud_control",
