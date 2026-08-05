@@ -243,6 +243,14 @@ class CallSession:
         self._triage_results: Queue[TriageVerdict] = Queue(maxsize=4)
         self._triage_consumer = TriageVerdictConsumer()
         self._triage_pending = False
+        # 受限期内 AI 说过的话（WIL-83）。只在 enforce 且判官未定论时累积，
+        # 挂断后交给判官检测有没有越界——纯观测，不影响通话行为。
+        #
+        # 必须加锁：追加发生在 provider 的转写回调线程，取用与清空发生在收尾
+        # 路径。不加锁时，取用与清空之间的一次追加会被静默丢掉，清空之后的
+        # 一次追加会漏进**下一通**（2026-08-05 Codex 评审 P1）。
+        self._restricted_utterances: list[str] = []
+        self._restricted_lock = threading.Lock()
         self._triage_terminal = False
         self._triage_reject_deadline: float | None = None
         self._triage_clarification_spoken = False
@@ -556,6 +564,11 @@ class CallSession:
                 }
             )
             if role == "agent":
+                # WIL-83：受限期内 AI 说过的话单独留一份，挂断后判越界。
+                # 这里只是采样，不做任何判断——判断在 _check_triage_compliance。
+                if self._triage_pending and text:
+                    with self._restricted_lock:
+                        self._restricted_utterances.append(text)
                 self._schedule_spoken_dtmf_followup(agent, text)
             elif role == "user":
                 self._settle_dtmf_outcome(record, text)
@@ -1005,6 +1018,11 @@ class CallSession:
     ) -> None:
         """收尾：落盘通话记录，并按需在后台线程生成通话摘要。"""
         if record is None:
+            # 即便这通没有 record（关了通话记录 / 创建失败），受限期采集也必须
+            # 在这里清掉——否则它会漏进下一通有 record 的通话，把别人的话算到
+            # 那一通头上（2026-08-05 Codex 评审 P1）。
+            with self._restricted_lock:
+                self._restricted_utterances.clear()
             return
         # 兜底汇总最后一个护窗：常见形态正是「模型说完『我按一下』→ 按键 →
         # 随后安静等 IVR」，那样就永远等不到下一块非护窗音频来触发汇总，
@@ -1014,6 +1032,7 @@ class CallSession:
             record.finish(status)
         except Exception as exc:  # noqa: BLE001
             logger.warning("落盘通话记录 %s 失败: %s", record.id, exc)
+        self._check_triage_compliance(record)
         sim_identity = getattr(self.modem, "sim_identity", None)
         service_number = str(getattr(sim_identity, "service_number", "") or "")
         self._maybe_summarize(
@@ -1024,6 +1043,76 @@ class CallSession:
             self._result_verification_mode,
             service_number,
         )
+
+    def _check_triage_compliance(self, record: CallRecord | None) -> None:
+        """检测分诊受限期内 AI 有没有越界，落一条结构化事件（WIL-83）。
+
+        **纯观测**：不拦截、不改写、不影响通话。它要回答的是「这条约束在生产里
+        多久破一次」——今天这个数字完全未知，而它正是决定「继续靠提示词
+        还是搬到编排层」的依据。
+
+        判定走文本模型（非枚举硬原则：「我会转告」有无数种说法，禁语表必然漏），
+        fail-closed：判不出来当作未越界，宁可漏报也不用一次判定失败去污染统计。
+
+        跑在后台线程：判官是带 8s 超时的网络调用，不能卡住通话收尾。
+        `finish()` 之后再 log_event 会直接追加到磁盘，所以事件不会丢。
+        """
+        with self._restricted_lock:
+            utterances = list(self._restricted_utterances)
+            self._restricted_utterances.clear()
+        if record is None or not utterances:
+            return
+
+        def worker() -> None:
+            try:
+                from .triage_compliance import detect_restricted_violation
+
+                verdict = detect_restricted_violation(utterances)
+            except Exception as exc:  # noqa: BLE001
+                verdict = {"status": "unavailable", "reason": type(exc).__name__}
+            status = verdict.get("status")
+            if status == "violation":
+                index = int(verdict["index"])
+                logger.warning(
+                    "分诊受限期内 AI 越界（第 %d 句，%s）——受限话术未被遵守",
+                    index + 1,
+                    verdict["reason_code"],
+                )
+                record.log_event(
+                    "triage_restriction_check",
+                    status="violation",
+                    utterances=len(utterances),
+                    index=index,
+                    reason_code=verdict["reason_code"],
+                    # 留原文便于人工复核判官判得对不对——判官本身也会出错（WIL-74）。
+                    # 这段文本在同一份 events.jsonl 的 transcript 事件里本就有，
+                    # 不构成新的暴露面；但若日后把本事件单独导出到别处，要重新评估。
+                    text=utterances[index][:200],
+                )
+                return
+            if status == "compliant":
+                record.log_event(
+                    "triage_restriction_check",
+                    status="compliant",
+                    utterances=len(utterances),
+                )
+                return
+            # unavailable：**不能记成 compliant**。观测器的价值就是那个比例，
+            # 把判不出来的并进合规会让分母虚高、越界率虚低（Codex 评审 P1）。
+            logger.warning(
+                "分诊受限期合规检测不可用（%s），本通不计入统计",
+                verdict.get("reason", "unknown"),
+            )
+            record.log_event(
+                "triage_restriction_check",
+                status="unavailable",
+                utterances=len(utterances),
+                reason=str(verdict.get("reason", "unknown"))[:40],
+            )
+
+        threading.Thread(
+            target=worker, name="triage-compliance", daemon=True
+        ).start()
 
     def _maybe_summarize(
         self,
