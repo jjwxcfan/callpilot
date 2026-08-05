@@ -411,6 +411,30 @@ class QwenVoiceAgent(VoiceAgent):
         logger.info("会话提示词已中途更新")
         return True
 
+    async def cancel_response(self) -> bool:
+        """打断本轮生成（dashscope ``cancel_response``）。
+
+        掐的是**生成**不是**播放**：已经排进下行队列的音频仍会播完，所以对端
+        听到的是一段完整播出的语音，只是不再继续变长。
+        """
+        conversation = self._conversation
+        if conversation is None:
+            return False
+        try:
+            # 与 update_session_instructions 同样的熔断理由：dashscope 的 ws send
+            # 是同步阻塞调用，死链时能把音频主循环一起拖停。
+            await asyncio.wait_for(
+                asyncio.to_thread(conversation.cancel_response),
+                timeout=_SEND_TIMEOUT_SECONDS,
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            logger.warning("打断本轮回复超时")
+            return False
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("打断本轮回复失败: error_type=%s", type(exc).__name__)
+            return False
+        return True
+
     def _mark_disconnected(self) -> None:
         """回调线程通知：运行中连接被动关闭，等待 send_audio 触发重连。"""
         if not self._disconnected.is_set():

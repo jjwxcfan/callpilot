@@ -55,6 +55,19 @@ class VoiceAgent(ABC):
         self._session_instructions = instructions
         return False
 
+    async def cancel_response(self) -> bool:
+        """打断本轮正在生成的回复；返回是否真的下发到了 provider。
+
+        用于 WIL-90 的单轮长度闸门：模型不可靠地遵守「说短点」的提示词
+        （WIL-83 已实测证明），所以需要一个模型之外的确定性手段把跑飞的
+        长轮次掐掉。
+
+        默认实现什么都不做。返回值不能省——与
+        ``update_session_instructions()`` 同理，调用方必须能区分「已下发」
+        与「本 provider 不支持」，否则又是一次静默失效（WIL-75 的形态）。
+        """
+        return False
+
     def set_repeat_stuck_handler(
         self, handler: "Callable[[str], None] | None"
     ) -> None:
