@@ -144,6 +144,9 @@ class _QwenCallback(OmniRealtimeCallback):
     ) -> None:
         self._audio_queue = audio_queue
         self._agent = agent
+        # 由 QwenVoiceAgent._connect 在建连后回填；此前是动态挂属性，
+        # dashscope 1.26.5 的类型信息补全后被 mypy 判为 attr-defined。
+        self._conversation: OmniRealtimeConversation | None = None
 
     def on_open(self) -> None:
         logger.info("千问 Realtime 连接已建立")
@@ -158,7 +161,9 @@ class _QwenCallback(OmniRealtimeCallback):
         else:
             self._audio_queue.put(None)
 
-    def on_event(self, response: dict) -> None:
+    def on_event(self, response: Any) -> None:
+        # SDK 基类把该参数注解成 str，但运行时传的是事件 dict（下面 .get 即证）。
+        # 注解成 Any 以兼容这份不准确的父类签名，运行时行为不变。
         event_type = response.get("type", "")
         if event_type == "response.audio.delta":
             delta = response.get("delta", "")
@@ -313,7 +318,9 @@ class QwenVoiceAgent(VoiceAgent):
         start() 与断线重连共用；全部成功后才把新 conversation 挂到
         self._conversation 上，失败则抛出最后一次异常。
         """
-        conversation_kwargs = {
+        # 显式标注 Any：值是异构的（str 与 callback 对象），推断出的
+        # dict[str, object] 在 ** 解包时与 SDK 形参类型冲突。
+        conversation_kwargs: dict[str, Any] = {
             "model": self.model,
             "callback": self._callback,
         }

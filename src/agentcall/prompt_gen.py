@@ -15,7 +15,7 @@ import unicodedata
 import urllib.error
 import urllib.request
 from collections import OrderedDict
-from typing import Any
+from typing import Any, cast
 
 from . import config
 from .prompts import agent_persona, normalize_lang, owner_name
@@ -203,7 +203,10 @@ def _call_qwen_sync(
 
     response = dashscope.Generation.call(
         model=model,
-        messages=messages,
+        # dashscope 1.26.5 起把 messages 注解收窄成 list[Message]，但 SDK 运行时
+        # 一直接受、官方文档也一直示例 list[dict]。注解比实际窄，这里显式放宽，
+        # 不改传参形态（改成 Message 对象反而偏离官方用法）。
+        messages=cast(Any, messages),
         result_format="message",
         api_key=os.environ.get("DASHSCOPE_API_KEY"),
     )
