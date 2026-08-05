@@ -189,17 +189,47 @@ class OpenAIVoiceAgent(VoiceAgent):
         self._ws = ws
         logger.info("OpenAI Realtime 连接已建立: %s", self.model)
 
+    def _compose_instructions(self, base: str | None) -> str:
+        text = base or _default_instructions()
+        # OpenAI-only 说话 Vibe：追加在 VOICE_STYLE（已并入 instructions）之后。
+        vibe_line = openai_vibe_line()
+        if vibe_line:
+            text = f"{text.rstrip()}\n{vibe_line}"
+        return text
+
+    async def update_session_instructions(self, instructions: str) -> bool:
+        """中途下发新的系统提示词（Realtime session.update 是增量合并）。"""
+        self._session_instructions = instructions
+        self._instructions = self._compose_instructions(instructions)
+        ws = self._ws
+        if ws is None:
+            # 还没连上：start() 会带着新的 instructions 建会话，等价生效。
+            return False
+        try:
+            await ws.send(
+                json.dumps(
+                    {
+                        "type": "session.update",
+                        "session": {
+                            "type": "realtime",
+                            "instructions": self._instructions,
+                        },
+                    }
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("中途更新会话提示词失败: error_type=%s", type(exc).__name__)
+            return False
+        logger.info("会话提示词已中途更新")
+        return True
+
     async def start(self, on_audio_out: Callable[[bytes], None]) -> None:
         self._loop = asyncio.get_running_loop()
         self._on_audio_out = on_audio_out
         self._running = True
         self._manual_response_enabled = config.get_bool("MANUAL_RESPONSE_CONTROL")
         self._reset_manual_response_state()
-        self._instructions = self._session_instructions or _default_instructions()
-        # OpenAI-only 说话 Vibe：追加在 VOICE_STYLE（已并入上面的 instructions）之后。
-        vibe_line = openai_vibe_line()
-        if vibe_line:
-            self._instructions = f"{self._instructions.rstrip()}\n{vibe_line}"
+        self._instructions = self._compose_instructions(self._session_instructions)
         await self._connect()
         self._recv_task = asyncio.create_task(self._recv_loop())
 

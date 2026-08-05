@@ -13,6 +13,7 @@ from pathlib import Path
 import dashscope
 import pytest
 
+from agentcall import dtmf_judge
 from agentcall.dtmf_judge import (
     DtmfActionLedger,
     DtmfJudge,
@@ -440,9 +441,16 @@ def test_default_model_timeout_never_starts_a_second_live_sdk_request(
     assert calls == 1
 
 
-def test_default_model_single_flight_is_shared_across_call_instances(
-    tmp_path, monkeypatch
-):
+def test_hung_sdk_cannot_grow_model_threads_without_bound(tmp_path, monkeypatch):
+    """SDK 挂死时在飞的模型调用必须有上限。
+
+    原测试名是 `..._single_flight_is_shared_across_call_instances`，断言
+    `calls == 1` —— 那是把全局并发钉成 1 来实现这个保护。#72 指出它的副作用：
+    两通并发通话里第二通每次都拿到伪 `"timeout"`，污染 shadow 采集数据。
+
+    保护的**意图**（挂死时不无限堆线程）保留，实现换成有界信号量；断言随之
+    从「恰好 1」改为「不超过上限」。并发通话各自拿得到槽位，这正是 #72 要的。
+    """
     entered = threading.Event()
     release = threading.Event()
     calls = 0
@@ -494,7 +502,10 @@ def test_default_model_single_flight_is_shared_across_call_instances(
     release.set()
     wait_for_model_threads()
 
-    assert calls == 1
+    # 两通并发**都**必须真的调到模型（#72 的核心）。写成 `1 <= calls <= 上限`
+    # 是没用的断言——旧的模块级 single-flight 下 calls==1 也能通过（Codex 评审 P2）。
+    assert calls == 2, "并发通话应各自拿到槽位，而不是第二通被顶成伪超时"
+    assert calls <= dtmf_judge._MAX_CONCURRENT_MODEL_CALLS
 
 
 def test_blocked_judge_does_not_block_submit_or_stop_and_stale_result_is_dropped(

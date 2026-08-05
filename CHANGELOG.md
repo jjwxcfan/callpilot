@@ -8,6 +8,33 @@ versioning follows [SemVer](https://semver.org/) (pre-1.0: minor bumps may break
 
 ### Added
 
+- **IVR keypress advance evidence (#50)**: a new `dtmf_outcome` event pairs each
+  keypress with the peer's next utterance (`menu_before` / `remote_after` /
+  `latency_ms` / `expired`), because the local `result: success` signal is a
+  proven false positive — dialing 10086 on 2026-08-03 produced four `success`
+  keypresses while the IVR menu never advanced once. The event records evidence
+  rather than a verdict: silence after a press is itself recorded (`expired`),
+  and no keyword table is used (the ASR emits Traditional Chinese, which a
+  Simplified keyword list silently misjudges).
+- **Guarded-audio accounting (#45)**: `agent_audio_dropped` records AI speech
+  discarded inside the DTMF guard window, so a transcript that disagrees with
+  the recording is self-explaining instead of looking like packet loss.
+- **Mid-call session instruction updates (#76)**: `VoiceAgent.update_session_instructions()`
+  lets a provider's realtime session be re-instructed mid-call (OpenAI sends an
+  incremental `session.update`; Qwen rebuilds the full session because its SDK
+  replaces rather than merges). No provider previously had this capability.
+- **`CARRIER_HOTLINE` override (#44)**: fills in the SIM's free hotline when
+  carrier auto-detection fails or number portability makes it wrong. Without it
+  the cross-carrier mis-dial guard is entirely inert, since it compares against
+  an empty value. Restricted to known free hotlines — an arbitrary value would
+  invert the protection.
+- **`DTMF_GUARD_MS` (#45)**: silence window around a keypress, default 400ms.
+- **Redacted gateway access log (#98)**: the public remote gateway previously
+  logged nothing at all — a successful pairing, dial and two-way call left no
+  request trace. It now records route template / status / duration / client
+  network prefix only; request bodies (pairing codes), cookies (device
+  credentials), User-Agent, full IP and query strings are deliberately excluded.
+
 - **Mobile inbox and call history (#99)**: the paired iOS and Android apps now
   expose read-only SMS and call records (timeline, transcript and summary
   lifecycle), with bounded encrypted local caches, incremental pagination,
@@ -45,6 +72,46 @@ versioning follows [SemVer](https://semver.org/) (pre-1.0: minor bumps may break
 
 ### Fixed
 
+- **DTMF tone collided with AI speech (#45)**: the synthesized tone was queued
+  onto the *same* uplink as agent TTS, so the carrier IVR could decode neither.
+  A keypress now flushes in-flight speech and holds a guard window. Verified on
+  real hardware: the 10086 menu advanced (`正在为您转回广东10086`) where the same
+  mode had failed four times that morning.
+- **Triage `continue_ai` verdicts had no effect (#76)**: `_triage_pending` was a
+  write-only flag (4 writes, 0 reads) and the prompt followed the mode instead;
+  even rebuilding the prompt could not have reached the provider. Verified on a
+  real inbound call: 7 successful mid-call pushes, 0 failures, against 0 on a
+  control call that ruled `transfer`.
+- **Triage judge hardcoded OpenAI (#67)**: the judge now follows
+  `AGENT_PROVIDER`, so non-OpenAI deployments receive verdicts at all.
+- **Marketing SMS posing as a verified bill result (#68)**: evidence must now be
+  judged relevant to the call's task, fail-closed.
+- **Preset opening line unsaveable (#70)**: the 40-character cap is now measured
+  by display width (limit 100); the shipped seed data itself violated the old cap.
+- **Preset lookup missed `+86` numbers (#75)**: dialing with a country code
+  silently fell back to a generated prompt. Only the local country code is
+  stripped — a generic 1–3 digit rule matched `+33123456789` to `3123456789`.
+- **Concurrent calls faked each other's judge timeouts (#72)**: the DTMF judge's
+  single-flight guard was module-global, so a second call was recorded as
+  `timeout` without ever invoking the model, corrupting keypress statistics.
+  Now per-instance, with a bounded global semaphore retained so a hung SDK still
+  cannot grow threads without limit; saturation reports a distinct
+  `model_saturated` code rather than masquerading as a timeout.
+- **Content sync re-read every call on every request (#73)**: now cached by
+  file mtime with a `callId` index — 5 file reads to 0 on a warm request.
+- **PWA swallowed a fresh pairing code (#60)**: a stale `__Host-` cookie
+  short-circuited before the fragment code was consumed, leaving the user with
+  no way forward. Verified on a real device.
+- **PWA reported local media errors as "Edge is unavailable" (#60)**: missing or
+  busy microphones now map to their own messages; `getUserMedia` was split into
+  its own try block because `SecurityError` is also thrown by the WebSocket
+  constructor, which would have misreported real LiveKit failures.
+- **Doubao ignored session instructions (#69)**: it used a hardcoded persona and
+  discarded server event payloads. Instructions are now honoured; unimplemented
+  capabilities (function calling, transcripts) warn loudly instead of failing
+  silently, and each distinct server event is sampled once (field names only,
+  never values) so the wire format can be recovered in a single call.
+
 - **iOS VoIP wake reliability (#96/#102)**: PushKit now reports incoming calls
   synchronously on its main-queue callback before returning, preventing iOS
   from terminating the app for an unhandled VoIP push. App Store exports now
@@ -57,6 +124,15 @@ versioning follows [SemVer](https://semver.org/) (pre-1.0: minor bumps may break
   longer block later offers); takeover now publishes `connected` to the app.
 
 ### Security
+
+- **Local gateway allowed any WSS media endpoint (#41)**: the gateway CSP shipped
+  `connect-src 'self' wss:` while the PWA read the media endpoint straight from
+  the URL fragment, so one malicious link on the real domain could point a
+  paired phone's media at an attacker's server. The CSP now pins the configured
+  LiveKit host and the PWA enforces an exact-host allowlist, delivered to
+  unpaired clients too (the temporary-link flow is unpaired by definition).
+  The legacy fragment entry was **kept** — it is a shipped feature — and secured
+  rather than removed.
 
 - Hosted PWA CSP tightened to the exact LiveKit host (no bare `wss:` /
   wildcard) and the legacy pairing-free invite fragment entry removed (#54);

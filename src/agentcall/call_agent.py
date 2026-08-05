@@ -63,6 +63,7 @@ from .result_verification import (
     apply_carrier_sms_verification,
     carrier_sms_evidence,
     is_carrier_service_call,
+    select_task_relevant_evidence,
 )
 from .sim_identity import SimIdentity
 from .sms_email_forwarder import SmsEmailForwarder
@@ -88,6 +89,12 @@ from .triage_judge import (
 )
 
 logger = logging.getLogger(__name__)
+
+# dtmf_outcome 事件里对端话语的截断长度：够判读，又不至于把整段通话搬进事件流。
+_OUTCOME_TEXT_CHARS = 80
+# 按键后等待对端反应的窗口，与 scripts/regression_call.py 的 8s 观察窗一致。
+# 超窗即「按键后无反应」——那本身就是证据，必须落，不能悄悄丢。
+_OUTCOME_WINDOW_SECONDS = 8.0
 
 
 AudioBridge = ModemAudioBridge | SerialPcmAudioBridge | FfmpegAudioBridge
@@ -200,6 +207,9 @@ class CallSession:
         self._prompt_gen_dtmf_spoken_followup = False
         self._result_verification_mode = "none"
         self._dtmf_lock = threading.RLock()
+        # 上行媒体互斥：drain 的「取空队列再写桥」与 DTMF 的「清队列再入双音」
+        # 必须原子，否则清队列会清了个空、语音仍抢在双音前面写进桥。
+        self._media_lock = threading.Lock()
         self._recent_dtmf_sent: dict[str, tuple[float, str]] = {}
         self._pending_dtmf_followups: dict[
             int,
@@ -236,6 +246,22 @@ class CallSession:
         self._triage_terminal = False
         self._triage_reject_deadline: float | None = None
         self._triage_clarification_spoken = False
+        # 按键护窗截止时刻（monotonic）：DTMF 期间丢弃 Agent 下行。
+        self._dtmf_guard_until = 0.0
+        # 本轮护窗内被丢弃的 Agent 下行字节数，窗口结束时汇总成一条事件（#81）。
+        self._dtmf_guard_dropped_bytes = 0
+        # 按键推进校验（#50 第 4 项）：记住最近一次按键，等对端下一句到达时配对成
+        # 一条 dtmf_outcome 事件。只存"上一句对端话语"与"待配对的按键"两样。
+        # 单独一把锁：按键在通话线程（持 _dtmf_lock）、转写回调在 realtime 线程，
+        # 两边都要改这组状态。不复用 _dtmf_lock —— 那把锁跨越阻塞的 AT 往返。
+        self._outcome_lock = threading.Lock()
+        self._last_remote_utterance = ""
+        self._pending_dtmf_outcome: dict | None = None
+        # 单独一把小锁：绝不能复用 _dtmf_lock —— 那把锁在 _send_dtmf_raw 里
+        # 跨越阻塞的 AT 往返，音频回调等在上面会直接把下行卡住。
+        self._guard_drop_lock = threading.Lock()
+        # 最近一次 Agent 音频采样率，供收尾兜底计算丢弃时长。
+        self._agent_output_rate = 24000
 
     def _publish(self, event: dict) -> None:
         if self.hub:
@@ -525,6 +551,7 @@ class CallSession:
             if role == "agent":
                 self._schedule_spoken_dtmf_followup(agent, text)
             elif role == "user":
+                self._settle_dtmf_outcome(record, text)
                 judge = self._dtmf_judge
                 if judge is not None:
                     judge.submit_remote_transcript(
@@ -549,6 +576,7 @@ class CallSession:
     ) -> Callable[[bytes], None]:
         """Agent 下行音频回调：浏览器实时旁听、本机监听旁路、重采样到 8k、录音、入发送队列。"""
 
+        self._agent_output_rate = agent.output_rate
         # 实时旁听按 Agent 输出采样率播放（qwen/openai 均 24k）。
         if self.hub is not None:
             self.hub.set_audio_rate(agent.output_rate)
@@ -558,6 +586,16 @@ class CallSession:
         def on_agent_audio(pcm_agent: bytes) -> None:
             if not self._agent_effect_allowed(generation):
                 return
+            # 按键护窗：DTMF 期间丢弃 Agent 下行，别让语音和双音挤在同一段上行。
+            # 真机 2026-08-03 拨 10086：模型一边说「这边先按一下对应的键」一边按，
+            # 4 次本机 success、IVR 菜单一次没推进（见 #45 评论）。
+            if time.monotonic() < self._dtmf_guard_until:
+                # 按窗累计而不是逐块记事件：这里是热路径（约每 20ms 一块），
+                # 逐块写会把 events.jsonl 冲垮。窗口结束后统一落一条。
+                with self._guard_drop_lock:
+                    self._dtmf_guard_dropped_bytes += len(pcm_agent)
+                return
+            self._flush_dtmf_guard_drop(record, agent.output_rate)
             if pcm_agent and on_first_audio is not None:
                 on_first_audio()
             # 浏览器实时旁听下行 AI（Web Audio）：无监听端时零成本返回。kind=0=下行。
@@ -953,6 +991,10 @@ class CallSession:
         """收尾：落盘通话记录，并按需在后台线程生成通话摘要。"""
         if record is None:
             return
+        # 兜底汇总最后一个护窗：常见形态正是「模型说完『我按一下』→ 按键 →
+        # 随后安静等 IVR」，那样就永远等不到下一块非护窗音频来触发汇总，
+        # 这条事件会整个丢掉——而它恰恰是用来解释这一段的（Codex 评审 P1）。
+        self._flush_dtmf_guard_drop(record, self._agent_output_rate)
         try:
             record.finish(status)
         except Exception as exc:  # noqa: BLE001
@@ -1047,6 +1089,19 @@ class CallSession:
                         service_number=service_number,
                         started_at=record.started_at,
                         ended_at=time.time(),
+                    )
+                    # 时间窗+发件人不足以判定相关：运营商在通话期间也推营销短信。
+                    # 挑出真正回答本次任务的那条，判定不可用则 fail-closed 到未核实。
+                    evidence = select_task_relevant_evidence(
+                        evidence,
+                        # 相关性判定的任务口径：预设 hint 优先（声明
+                        # result_verification 的正是那条预设），其次本通显式主题。
+                        # 两者皆空则 select_task_relevant_evidence 会 fail-closed。
+                        task=(
+                            self._preset_hint
+                            or self._outbound_task(agent_language())
+                        ),
+                        lang=agent_language(),
                     )
                 else:
                     evidence = []
@@ -1263,7 +1318,11 @@ class CallSession:
             if result.outcome in {"ignored", "observe"}:
                 continue
             if result.outcome == "continue_ai":
+                # 放行：先清标志，再把重建后的提示词真正下发给 provider。
+                # 只清标志是没用的——会话建立时那份 instructions 已经发出去了，
+                # 不中途 session.update，AI 会被限制话术锁住整通电话（#76）。
                 self._triage_pending = False
+                await self._push_triage_release_instructions(agent)
                 continue
             if result.outcome == "clarify":
                 if self._triage_clarification_spoken:
@@ -1310,6 +1369,28 @@ class CallSession:
                 terminal_action = "reject"
         return terminal_action
 
+    async def _push_triage_release_instructions(self, agent: VoiceAgent) -> None:
+        """分诊放行后下发解除限制的提示词。
+
+        provider 不支持中途 session.update 时如实告警——那种部署下 AI 会一直
+        停在限制话术，是可观测的降级，而不是静默失效。
+        """
+        try:
+            pushed = await agent.update_session_instructions(
+                self._build_agent_instructions("inbound")
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "分诊放行后更新提示词失败: error_type=%s", type(exc).__name__
+            )
+            return
+        if pushed:
+            logger.info("分诊放行: 已解除限制话术")
+        else:
+            logger.warning(
+                "分诊放行: provider 不支持中途更新提示词，AI 仍受限于分诊话术"
+            )
+
     def _log_triage_consumption(self, result: TriageConsumption) -> None:
         record = self._record
         if record is not None:
@@ -1354,7 +1435,10 @@ class CallSession:
             lang,
             scenario=scenario,
             takeover_preference=takeover_preference,
-            triage_pending=triage_mode == "enforce",
+            # 读标志而不是 mode：裁决 continue_ai 后要能真的解除限制话术。
+            # 曾写成 triage_mode == "enforce"，于是 _triage_pending 成了只写
+            # 标志（4 处写、0 处读），放行裁决完全落空（#76）。
+            triage_pending=self._triage_pending if direction == "inbound" else False,
         )
 
     def _opening_instructions(self, direction: str) -> str:
@@ -1676,6 +1760,16 @@ class CallSession:
             self._cancel_spoken_dtmf_followups_locked()
             if clear_recent:
                 self._recent_dtmf_sent.clear()
+                # 护窗是 monotonic 时刻：背靠背通话可能落在上一通的护窗内，
+                # 那会让新通话开场白被静音，必须随每通重置。
+                self._dtmf_guard_until = 0.0
+                self._dtmf_guard_dropped_bytes = 0
+                # 不重置会跨通话串味：上一通挂起的按键会跟下一通第一句对端话语
+                # 配对，把上一位来电者的话写进这一通的记录（Codex 评审 P1，
+                # 属隐私泄漏，不只是脏数据）。
+                with self._outcome_lock:
+                    self._pending_dtmf_outcome = None
+                    self._last_remote_utterance = ""
 
     def _cancel_spoken_dtmf_followups_locked(self) -> None:
         pending = list(self._pending_dtmf_followups.values())
@@ -1759,8 +1853,21 @@ class CallSession:
                     self._cancel_pending_dtmf_locked(digits)
                 return True, mode
 
+            # 按键护窗（#45 候选方向 2「信号层」）：真机 2026-08-03 拨 10086，
+            # 模型一边说「这边先按一下对应的键」一边按，4 次本机 success、IVR
+            # 菜单一次没推进。双音与 Agent 语音共用 _outgoing_audio 这条上行，
+            # 混叠后对端两者都识别不出。护窗期间丢弃 Agent 下行，让双音独占上行。
+            #
+            # 护窗必须**先装再动手**：qvts 的 send_dtmf 是阻塞 AT 往返，inband 的
+            # 入队到实际送出也隔着一次 drain——若等发完才装，realtime 在这段空档
+            # 产出的语音会正好落进按键窗口。
+            guard_seconds = max(0.0, config.get_int("DTMF_GUARD_MS") / 1000.0)
+            previous_guard = self._dtmf_guard_until
+            self._dtmf_guard_until = time.monotonic() + guard_seconds
+
             ok = True
             sent = False
+            tone_seconds = 0.0
             if mode in {"inband", "both"}:
                 tone = dtmf_tone(
                     digits,
@@ -1769,22 +1876,150 @@ class CallSession:
                     amplitude=config.get_float("DTMF_TONE_AMPLITUDE"),
                 )
                 if not tone:
+                    self._dtmf_guard_until = previous_guard
                     return False, mode
-                # 与 Agent 语音共用 _outgoing_audio，后续由 _drain_agent_audio
-                # 按既有下行链路送入桥；半双工 pending 判定也会自然把它当成正在说话。
-                if self._record is not None:
-                    self._record.write_downlink(tone)
-                self._outgoing_audio.put(tone)
+                # 清空 + 入队要与 _drain_agent_audio 的「取空再写桥」互斥：drain
+                # 已把语音取进本地 chunks 时，单清队列是空操作，那段语音照样写进
+                # 桥、排在双音前面。
+                with self._media_lock:
+                    self._clear_outgoing_audio()
+                    # 与 Agent 语音共用 _outgoing_audio，后续由 _drain_agent_audio
+                    # 按既有下行链路送入桥；半双工 pending 判定也会自然把它当成正在说话。
+                    if self._record is not None:
+                        self._record.write_downlink(tone)
+                    self._outgoing_audio.put(tone)
+                # 双音本身的时长要计入护窗，否则语音会紧跟在双音尾巴上。
+                tone_seconds = len(tone) / 2 / MODEM_RATE
                 sent = True
             if mode in {"qvts", "both"}:
+                # qvts 走 AT 带外，双音不进上行队列；但 AI 在按键瞬间继续说话，
+                # 同样会占住 IVR 的按键识别窗口——两种 mode 都要护窗。
+                if mode == "qvts":
+                    with self._media_lock:
+                        self._clear_outgoing_audio()
                 ok = self.modem.send_dtmf(digits)
                 sent = sent or ok
             if sent:
+                # 发完再从「此刻」重算：AT 往返耗时不该吃掉护窗。只延不缩，
+                # 免得连按时后一次把前一次的护窗改短。
+                self._dtmf_guard_until = max(
+                    self._dtmf_guard_until,
+                    time.monotonic() + tone_seconds + guard_seconds,
+                )
+                # 推进校验的挂起点必须在这里，不能放在 _record_dtmf_action 里：
+                # 那个方法在 DTMF_JUDGE_MODE=off（**默认值**）时会提前 return，
+                # 于是本事件在生产配置下**一次也不会产生**（Codex 评审 P1）。
+                self._arm_dtmf_outcome()
                 self._recent_dtmf_sent[digits] = (time.monotonic(), source)
                 self._record_dtmf_action(digits, source)
                 if source != "spoken_followup":
                     self._cancel_pending_dtmf_locked(digits)
+            else:
+                # 没发出去就不该白白哑掉 Agent：预装的护窗要还原。
+                self._dtmf_guard_until = previous_guard
             return ok, mode
+
+    def _flush_dtmf_guard_drop(self, record: CallRecord | None, rate: int) -> None:
+        """护窗结束后落一条「丢了多少 Agent 语音」的事件。
+
+        录音只记实际发出的内容（刻意如此），但**文字 transcript 不受护窗影响**：
+        模型「说」的那句话仍会完整进 transcript，哪怕它一个字节都没发出去。
+        事后复盘会看到转写与录音对不上，误判成丢包或录音坏了——这条事件让这个
+        差异在记录里自解释（#81）。
+        """
+        with self._guard_drop_lock:
+            dropped = self._dtmf_guard_dropped_bytes
+            self._dtmf_guard_dropped_bytes = 0
+        if dropped <= 0 or record is None:
+            return
+        try:
+            record.log_event(
+                "agent_audio_dropped",
+                reason="dtmf_guard",
+                bytes=dropped,
+                duration_ms=round(dropped / 2 / max(1, rate) * 1000),
+            )
+        except Exception as exc:  # noqa: BLE001 - 记账失败不该影响通话
+            logger.warning(
+                "记录护窗丢弃事件失败: error_type=%s", type(exc).__name__
+            )
+
+    def _arm_dtmf_outcome(self) -> None:
+        """按键发出后挂起一条待配对的推进证据。"""
+        with self._outcome_lock:
+            self._pending_dtmf_outcome = {
+                "action_id": "",
+                "pressed_at": time.monotonic(),
+                "menu_before": self._last_remote_utterance[:_OUTCOME_TEXT_CHARS],
+            }
+
+    def _emit_dtmf_outcome(
+        self, record: CallRecord, pending: dict, text: str, *, expired: bool
+    ) -> None:
+        try:
+            record.log_event(
+                "dtmf_outcome",
+                action_id=pending["action_id"],
+                menu_before=pending["menu_before"],
+                remote_after=text[:_OUTCOME_TEXT_CHARS],
+                latency_ms=round((time.monotonic() - pending["pressed_at"]) * 1000),
+                expired=expired,
+            )
+        except Exception as exc:  # noqa: BLE001 - 记账失败不该影响通话
+            logger.warning(
+                "记录按键推进证据失败: error_type=%s", type(exc).__name__
+            )
+
+    def _expire_dtmf_outcome(self, record: CallRecord | None) -> None:
+        """超窗仍无对端话语——把「按键后一片沉默」本身记下来。
+
+        沉默是有意义的证据：IVR 不理会一次按键时，往往就是什么都不说。若只在
+        「有下一句」时才落事件，这类失败会整个消失，而它恰恰是最该被找出来的。
+        """
+        with self._outcome_lock:
+            pending = self._pending_dtmf_outcome
+            if pending is None or (
+                time.monotonic() - pending["pressed_at"] < _OUTCOME_WINDOW_SECONDS
+            ):
+                return
+            self._pending_dtmf_outcome = None
+        if record is not None:
+            self._emit_dtmf_outcome(record, pending, "", expired=True)
+
+    def _settle_dtmf_outcome(self, record: CallRecord | None, text: str) -> None:
+        """把「按键 → 对端下一句」配成一条 dtmf_outcome 事件。
+
+        为什么要它（#50 第 4 项）：本机 `result: success` 已被反复证明是**假阳**
+        ——2026-08-03 拨 10086，4 次按键全 success，IVR 菜单一次没推进。判断按键
+        有没有生效，唯一可靠的依据是**对端接下来说了什么**。
+
+        本事件只**记录证据**，不下判断。这是刻意的，来自 WIL-82 手工判读的三次
+        踩坑：
+
+        1. **单位**：必须按按键记，不能按通话记 —— 同一通里不同按键结果可以不同；
+        2. **因果**：推进必须发生在按键**之后**。10086 菜单超时会自动转接，把按键
+           前的转接算作推进就是把 IVR 的自动行为记到按键头上（实测差 18 秒）；
+        3. **不写关键词表**：ASR 会输出繁体（「正在**為**您**轉**回」），简体关键词
+           表直接漏判。这既是非枚举硬原则，也是实测教训。
+
+        所以这里只如实记录 前一句 / 后一句 / 时延，判读留给离线分析或判官。
+        """
+        with self._outcome_lock:
+            pending = self._pending_dtmf_outcome
+            self._last_remote_utterance = text
+            if pending is None:
+                return
+            self._pending_dtmf_outcome = None
+            # 超窗的挂起不再与这句配对：否则被无视的那次按键会跟几分钟后的无关
+            # 话语凑成一条假证据（Codex 评审 P1）。
+            stale = (
+                time.monotonic() - pending["pressed_at"] >= _OUTCOME_WINDOW_SECONDS
+            )
+        if record is None:
+            return
+        self._emit_dtmf_outcome(
+            record, pending, "" if stale else text, expired=stale
+        )
 
     def _record_dtmf_action(self, digits: str, source: str) -> None:
         public_source = {
@@ -1818,6 +2053,10 @@ class CallSession:
         if record is not None:
             record.log_event("dtmf_action", **entry.public_fields())
         judge.record_action(entry)
+        # 影子判官开着时，把它的 action_id 补进待配对记录，便于两边对账。
+        with self._outcome_lock:
+            if self._pending_dtmf_outcome is not None:
+                self._pending_dtmf_outcome["action_id"] = entry.action_id
 
     def _resolve_dtmf_mode(self) -> str:
         configured = config.get_str("DTMF_MODE").strip().lower()
@@ -2200,14 +2439,15 @@ class CallSession:
         )
 
     def _drain_agent_audio(self, bridge: AudioBridge) -> None:
-        chunks: list[bytes] = []
-        while True:
-            try:
-                chunks.append(self._outgoing_audio.get_nowait())
-            except Empty:
-                break
-        if chunks:
-            bridge.write_modem_chunks(chunks)
+        with self._media_lock:
+            chunks: list[bytes] = []
+            while True:
+                try:
+                    chunks.append(self._outgoing_audio.get_nowait())
+                except Empty:
+                    break
+            if chunks:
+                bridge.write_modem_chunks(chunks)
 
     def _clear_outgoing_audio(self) -> None:
         while True:
@@ -2609,6 +2849,12 @@ class CallAgentService:
     def remote_dialer_status(self) -> dict:
         """Return non-secret readiness/session state for the local dashboard."""
 
+        def _livekit_media_host() -> str:
+            # 局部导入：web 层依赖 call_agent，模块级导入会成环。
+            from .web.remote_gateway import livekit_media_host
+
+            return livekit_media_host(config.get_str("LIVEKIT_URL"))
+
         enabled = config.get_bool("REMOTE_WEB_DIALER_ENABLED")
         cloud_enabled = config.get_bool("REMOTE_CLOUD_ENABLED")
         required = (
@@ -2630,6 +2876,9 @@ class CallAgentService:
             "missing": missing,
             "active": bool(worker and worker.is_running),
             "modem_online": self.modem_connected,
+            # PWA 用它做 fragment 邀请的 exact-host 白名单（#41）。非机密：
+            # 同一个 host 本来就写在 CSP connect-src 里。空串 = 不接受任何 fragment。
+            "media_host": _livekit_media_host(),
         }
         if worker is not None:
             payload.update(worker.coordinator.status())

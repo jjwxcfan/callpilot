@@ -13,11 +13,14 @@ AT 交互与缓存在 modem 层(Eg25Modem.refresh_sim_identity)。
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import asdict, dataclass, replace
 
 # 中国大陆四大运营商 PLMN(MCC=460 + MNC)。来源:公开号段分配(ITU/工信部),
 # 与 ~/.claude skill callpilot-sim-check、issue #72/#88 一致。
+logger = logging.getLogger(__name__)
+
 _PLMN_CARRIERS: dict[str, str] = {
     # 中国移动
     "46000": "中国移动", "46002": "中国移动", "46004": "中国移动",
@@ -38,6 +41,11 @@ _SERVICE_NUMBERS: dict[str, str] = {
     "中国电信": "10000",
     "中国广电": "10099",
 }
+
+# 可作为人工覆盖值的合法客服号 = 上表的全部取值。限定在这个集合里，是因为
+# 误填会让保护**反向失效**：移动卡误填 10010 时，本卡免费的 10086 被拦、而对
+# 移动收费的 10010 反而放行（Codex 评审 P1 复现）。
+VALID_SERVICE_NUMBERS: frozenset[str] = frozenset(_SERVICE_NUMBERS.values())
 
 _IMSI_RE = re.compile(r"\b(\d{14,15})\b")
 _CREG_RE = re.compile(r"\+CREG:\s*(?:\d+\s*,\s*)?(\d+)(?:\s|$)")
@@ -116,6 +124,47 @@ def identify(imsi_raw: str, creg_raw: str = "") -> SimIdentity:
         registered=registered,
         reg_status=reg_status,
     )
+
+
+def with_service_number_override(
+    identity: SimIdentity, override: str
+) -> SimIdentity:
+    """用配置的免费客服号覆盖自动识别结果（#72 的兜底项）。
+
+    两种情况需要它：
+
+    1. **识别不到**——非大陆卡、读不到 IMSI、或运营商 PLMN 不在表里。此时
+       ``service_number`` 为空，`dial_guard` 的误拨保护会**整个失效**：它靠
+       「拨的号在已知客服号里、但不等于本卡客服号」来拦截，本卡客服号为空就
+       永远拦不住。跨运营商客服号按普通通话计费（2026-07-13 实测）。
+    2. **携号转网**——号在移动、号段/识别结果却指向别家。
+
+    留空 = 按 SIM 自动识别（默认行为不变）。非纯数字的配置一律忽略并回落到
+    自动识别：宁可退回已知行为，也不要拿一个畸形号码去喂误拨保护。
+    """
+    cleaned = (override or "").strip()
+    if not cleaned:
+        return identity
+    # 只接受已知的免费客服号，不接受任意数字串。理由是误填会让保护**反向**失效：
+    # 移动卡误填 10010 → 本卡免费的 10086 被拦、对移动收费的 10010 反而放行。
+    # 顺带也挡掉「把完整手机号粘进来」这种最危险的输入。
+    # （isascii 一并解决全角数字：str.isdigit() 对 "１００８６" 返回 True。）
+    if not cleaned.isascii() or cleaned not in VALID_SERVICE_NUMBERS:
+        logger.warning(
+            "CARRIER_HOTLINE 取值不是已知的免费客服号，已忽略并回落到自动识别"
+        )
+        return identity
+    if identity.service_number and identity.service_number != cleaned:
+        # 自动识别成功却与人工覆盖不一致：携号转网时这是对的，填错时这是危险的。
+        # 无论哪种都要看得见，不能悄悄改掉一个安全相关的值。
+        logger.warning(
+            "CARRIER_HOTLINE 覆盖了自动识别结果：识别为 %s(%s)，改用 %s。"
+            "若填错，拨本卡免费号会被拦、拨该号可能产生话费。",
+            identity.carrier,
+            identity.service_number,
+            cleaned,
+        )
+    return replace(identity, service_number=cleaned)
 
 
 def with_registration(identity: SimIdentity, creg_raw: str) -> SimIdentity:

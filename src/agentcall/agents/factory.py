@@ -30,8 +30,16 @@ def create_agent(provider: str | None = None) -> VoiceAgent:
     if selected == "doubao":
         # 豆包 realtime 二进制协议中未确认与 qwen create_response 等价的
         # 文本指令注入消息格式，say() 保持 base 默认 no-op（详见 roadmap P3-5）。
+        #
+        # 原来这里只提 say()，严重低估了缺口（#69）：它看起来像个平等的
+        # provider，实际能力远低于其它三个，选了它的人会一路踩坑而无提示。
+        # 如实列出，别让人以为只是少一句开场白。
         logger.warning(
-            "豆包 provider 暂不支持外呼开场白（say 未实现），外呼请用 qwen"
+            "豆包 provider 为实验性，能力显著少于 openai / qwen：\n"
+            "  - 无 function calling：按键(DTMF) / 挂断 / 发短信 均不生效\n"
+            "  - 无转写输出：摘要、收尾裁判、分诊判官、复读抑制 输入恒空\n"
+            "  - 无 say()：外呼开场白不可用\n"
+            "  两个目标场景（来电筛选 / 外呼 IVR 导航）请使用 openai 或 qwen。"
         )
         return DoubaoVoiceAgent(
             # APP_ID/ACCESS_KEY 属凭证，不进注册表（见 PROVIDER_REQUIRED_KEYS）。

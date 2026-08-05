@@ -135,10 +135,13 @@ def test_public_gateway_denies_unpaired_revoked_cross_origin_and_admin_requests(
             "call_active": True,
         }
         anonymous_status = await client.get("/api/device")
+        # media_host 自 #41 起也发给未配对客户端：临时链接的使用者按定义就是
+        # 未配对的，拿不到白名单会把这个在售功能堵死。它不构成新的泄露——
+        # 同一个 host 就写在本页 CSP 的 connect-src 里，匿名请求本来就能看到。
         assert await anonymous_status.json() == {
             "ok": True,
             "paired": False,
-            "edge": {"enabled": True, "configured": True},
+            "edge": {"enabled": True, "configured": True, "media_host": ""},
         }
 
         no_cookie = await client.post(

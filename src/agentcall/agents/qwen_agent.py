@@ -144,6 +144,9 @@ class _QwenCallback(OmniRealtimeCallback):
     ) -> None:
         self._audio_queue = audio_queue
         self._agent = agent
+        # 由 QwenVoiceAgent._connect 在建连后回填；此前是动态挂属性，
+        # dashscope 1.26.5 的类型信息补全后被 mypy 判为 attr-defined。
+        self._conversation: OmniRealtimeConversation | None = None
 
     def on_open(self) -> None:
         logger.info("千问 Realtime 连接已建立")
@@ -158,7 +161,9 @@ class _QwenCallback(OmniRealtimeCallback):
         else:
             self._audio_queue.put(None)
 
-    def on_event(self, response: dict) -> None:
+    def on_event(self, response: Any) -> None:
+        # SDK 基类把该参数注解成 str，但运行时传的是事件 dict（下面 .get 即证）。
+        # 注解成 Any 以兼容这份不准确的父类签名，运行时行为不变。
         event_type = response.get("type", "")
         if event_type == "response.audio.delta":
             delta = response.get("delta", "")
@@ -313,7 +318,9 @@ class QwenVoiceAgent(VoiceAgent):
         start() 与断线重连共用；全部成功后才把新 conversation 挂到
         self._conversation 上，失败则抛出最后一次异常。
         """
-        conversation_kwargs = {
+        # 显式标注 Any：值是异构的（str 与 callback 对象），推断出的
+        # dict[str, object] 在 ** 解包时与 SDK 形参类型冲突。
+        conversation_kwargs: dict[str, Any] = {
             "model": self.model,
             "callback": self._callback,
         }
@@ -347,6 +354,12 @@ class QwenVoiceAgent(VoiceAgent):
             tool_kwargs["tools"] = self._tools.specs()
             logger.info("已为会话注册 %d 个工具", len(self._tools.specs()))
 
+        session_kwargs = self._session_kwargs(tool_kwargs)
+        conversation.update_session(**session_kwargs)
+
+        self._conversation = conversation
+
+    def _session_kwargs(self, tool_kwargs: dict) -> dict:
         session_kwargs = {
             "output_modalities": [MultiModality.AUDIO, MultiModality.TEXT],
             "voice": self.voice,
@@ -362,9 +375,41 @@ class QwenVoiceAgent(VoiceAgent):
         }
         if self._manual_response_enabled:
             session_kwargs["turn_detection_param"] = {"create_response": False}
-        conversation.update_session(**session_kwargs)
+        return session_kwargs
 
-        self._conversation = conversation
+    async def update_session_instructions(self, instructions: str) -> bool:
+        """中途下发新的系统提示词。
+
+        千问 SDK 的 update_session 是整份覆盖，不是增量合并——只传 instructions
+        会把音色/采样率/转写/工具一并抹掉。所以这里重建完整 session_kwargs。
+        """
+        self._session_instructions = instructions
+        self._instructions = instructions
+        conversation = self._conversation
+        if conversation is None:
+            # 还没连上：start() 会带着新的 instructions 建会话，等价生效。
+            return False
+        tool_kwargs: dict = {}
+        if self._tools is not None and self._tools.has_tools():
+            tool_kwargs["tools"] = self._tools.specs()
+        try:
+            # 与 append_audio 同样的熔断：dashscope 的 ws send 是同步阻塞调用，
+            # 死链时可挂几十秒。直接在通话循环里调用会把音频主循环一起拖停
+            # （2026-07-10 真机两通 180s+ 卡死的同一形态）。
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    conversation.update_session, **self._session_kwargs(tool_kwargs)
+                ),
+                timeout=_SEND_TIMEOUT_SECONDS,
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            logger.warning("中途更新会话提示词超时，AI 仍受限于旧提示词")
+            return False
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("中途更新会话提示词失败: error_type=%s", type(exc).__name__)
+            return False
+        logger.info("会话提示词已中途更新")
+        return True
 
     def _mark_disconnected(self) -> None:
         """回调线程通知：运行中连接被动关闭，等待 send_audio 触发重连。"""

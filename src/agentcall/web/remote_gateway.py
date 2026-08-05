@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import logging
 import secrets
 import time
 from collections import OrderedDict, deque
@@ -20,22 +21,133 @@ from ..remote_pairing import (
     RemotePairingStore,
 )
 
+logger = logging.getLogger(__name__)
+
 STATIC_DIR = Path(__file__).parent / "static"
 DEVICE_COOKIE = "__Host-callpilot-device"
 _COOKIE_MAX_AGE = 180 * 24 * 60 * 60
-_SECURITY_HEADERS = {
-    "Cache-Control": "no-store",
-    "Referrer-Policy": "no-referrer",
-    "X-Content-Type-Options": "nosniff",
-    "X-Frame-Options": "DENY",
-    "Permissions-Policy": "microphone=(self), camera=(), geolocation=()",
-    "Content-Security-Policy": (
-        "default-src 'none'; script-src 'self' https://cdn.jsdelivr.net; "
-        "style-src 'self'; connect-src 'self' wss:; media-src blob:; worker-src 'self' blob:; "
-        "manifest-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'; "
-        "frame-ancestors 'none'"
-    ),
-}
+def livekit_media_host(value: str) -> str:
+    """从配置的 LiveKit 地址取出 host[:port]；任何不合法输入一律返回空串。
+
+    与云侧 `cloud/src/csp.ts` 的 `liveKitConnectSources()` 同语义。**只认整段
+    netloc**：只钉 hostname 会连带放行同主机的其它端口。
+
+    「不合法就返回空串」是硬契约——调用方（CSP 与 PWA 白名单）都靠空串
+    fail-closed。所以这里把畸形输入全部吃掉，绝不让异常漏出去变成 500，
+    也绝不让 `@host` / `:badport` 这类残缺串流进 CSP。
+    """
+    try:
+        parsed = urlsplit((value or "").strip())
+        if parsed.scheme != "wss" or not parsed.hostname:
+            return ""
+        # username/password 为空串时是 falsey，不能只用 `or` 判断——
+        # `wss://@host` 会漏过去（Codex 评审）。直接看 netloc 里有没有 userinfo。
+        if "@" in parsed.netloc:
+            return ""
+        parsed.port  # 端口非法时抛 ValueError（如 wss://h:bad）
+    except ValueError:
+        # 畸形 IPv6（wss://[::1）与非法端口都走这里。
+        return ""
+    return parsed.netloc
+
+
+def livekit_connect_sources(value: str) -> str:
+    """把配置的 LiveKit 地址收敛成 CSP connect-src 片段（无效配置返回空串）。
+
+    空串意味着 connect-src 只剩 'self'——宁可让远程拨号连不上（可见故障），
+    也不要退回 `wss:` 通配（静默放行任意媒体端点）。
+    """
+    host = livekit_media_host(value)
+    return f" https://{host} wss://{host}" if host else ""
+
+
+def security_headers() -> dict[str, str]:
+    """PWA 页面的安全响应头。
+
+    connect-src 必须钉死到配置的 LiveKit host：曾经写的是 `wss:` 通配，配合
+    legacy fragment 直连入口，真域名上一个恶意 fragment 就能把媒体连到任意
+    WSS 端点（#41 / G-04）。fragment 入口已移除，这里是浏览器强制的第二道。
+    """
+    return {
+        "Cache-Control": "no-store",
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Permissions-Policy": "microphone=(self), camera=(), geolocation=()",
+        "Content-Security-Policy": (
+            "default-src 'none'; script-src 'self' https://cdn.jsdelivr.net; "
+            "style-src 'self'; connect-src 'self'"
+            f"{livekit_connect_sources(config.get_str('LIVEKIT_URL'))}; "
+            "media-src blob:; worker-src 'self' blob:; "
+            "manifest-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'; "
+            "frame-ancestors 'none'"
+        ),
+    }
+
+
+def _route_label(request: web.Request) -> str:
+    """请求的**路由模板**，不是原始路径。
+
+    原始路径是调用方完全可控的文本：`/api/pair/<把配对码贴进来>` 会在返回 404
+    之前被原样记进日志。本模块的不变量是「凭证绝不进日志」，所以只记路由模板，
+    未匹配的一律记成 <unmatched>（Codex 评审 P1）。
+    """
+    route = getattr(request.match_info, "route", None)
+    resource = getattr(route, "resource", None)
+    canonical = getattr(resource, "canonical", None)
+    return canonical if isinstance(canonical, str) and canonical else "<unmatched>"
+
+
+def _client_prefix(request: web.Request) -> str:
+    """客户端地址前缀。只保留网段，不记完整 IP。
+
+    足以把同一来源的请求串起来做排障与滥用调查，又不把完整地址落盘。
+    """
+    raw = _client_key(request)
+    try:
+        address = ipaddress.ip_address(raw)
+    except ValueError:
+        return "unknown"
+    if address.version == 4:
+        return ".".join(address.exploded.split(".")[:3]) + ".x"
+    # 必须用 exploded 而不是原串：压缩写法下按 ":" 切会切出畸形结果，
+    # 且可能把整个地址留在里面——"::1" 会变成 "::1::x"（Codex 评审 P2）。
+    return ":".join(address.exploded.split(":")[:3]) + "::x"
+
+
+@web.middleware
+async def _access_log(request: web.Request, handler):
+    """网关访问日志：只记方法 / 路径 / 状态码 / 耗时 / 客户端网段。
+
+    原实现用 `AppRunner(..., access_log=None)` 整个关掉（app.py:284，无注释说明
+    原因）。关掉是有道理的——aiohttp 默认格式会记完整请求行、完整来源地址与
+    User-Agent，而这是个公网可达、处理配对凭证的网关。
+
+    但代价是**手机侧发生了什么，Edge 完全看不见**：#98 实测一次成功的配对+拨号+
+    双向通话，日志里一条请求都没有。这条路径本就隔着一层（用户在手机上、日志在
+    电脑上），没有请求日志就只剩「用户描述现象」这一个信息源。
+
+    折中：自己记一条**脱敏**的。刻意不记 —— 请求体（含配对码）、Cookie（含设备
+    凭证）、User-Agent、完整 IP、query string。
+    """
+    started = time.monotonic()
+    status = 500
+    try:
+        response = await handler(request)
+        status = response.status
+        return response
+    except web.HTTPException as exc:
+        status = exc.status
+        raise
+    finally:
+        logger.info(
+            "网关 %s %s -> %d %.0fms client=%s",
+            request.method,
+            _route_label(request),  # 路由模板，不是可控的原始路径
+            status,
+            (time.monotonic() - started) * 1000.0,
+            _client_prefix(request),
+        )
 
 
 class _AttemptLimiter:
@@ -79,7 +191,7 @@ def build_remote_gateway(
     ):
         raise ValueError("REMOTE_CONTROL_URL 必须是 HTTPS URL")
     public_origin = f"{parsed.scheme}://{parsed.netloc}"
-    app = web.Application(client_max_size=16 * 1024)
+    app = web.Application(client_max_size=16 * 1024, middlewares=[_access_log])
     app["service"] = service
     app["pairing_store"] = pairing_store
     app["public_origin"] = public_origin
@@ -103,7 +215,7 @@ def build_remote_gateway(
 
 
 async def _page(_request: web.Request) -> web.StreamResponse:
-    return web.FileResponse(STATIC_DIR / "remote_dialer.html", headers=_SECURITY_HEADERS)
+    return web.FileResponse(STATIC_DIR / "remote_dialer.html", headers=security_headers())
 
 
 async def _asset(request: web.Request) -> web.StreamResponse:
@@ -138,6 +250,10 @@ async def _device(request: web.Request) -> web.Response:
                 "edge": {
                     "enabled": bool(status.get("enabled")),
                     "configured": bool(status.get("configured")),
+                    # 未配对也要给 media_host：临时链接（fragment 邀请）的使用者
+                    # 按定义就是未配对的，拿不到白名单就会 fail-closed，把这个
+                    # 在售功能整个堵死。它非机密——同一个 host 就写在 CSP 里。
+                    "media_host": str(status.get("media_host") or ""),
                 },
             }
         )

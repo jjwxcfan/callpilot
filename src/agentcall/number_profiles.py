@@ -40,8 +40,9 @@ from typing import Any
 
 from . import config
 from .prompt_gen import (
-    MAX_OPENING_CHARS,
+    MAX_OPENING_WIDTH,
     _normalize_opening,
+    display_width,
 )
 
 logger = logging.getLogger(__name__)
@@ -178,7 +179,7 @@ def lookup_profile(
         exact: tuple[dict[str, Any], str] | None = None
         wildcard: tuple[dict[str, Any], str] | None = None
         for item, profile_id in _profiles_with_ids(profiles):
-            if not _is_enabled(item) or _norm(item.get("number")) != target_number:
+            if not _is_enabled(item) or not same_dial_number(item.get("number"), target_number):
                 continue
             task_variants = {_norm(v) for v in _task_values(item.get("task")) if _norm(v)}
             if task_variants:
@@ -220,7 +221,9 @@ def lookup_profile_by_id(
         for item, item_id in _profiles_with_ids(data["profiles"]):
             if item_id != target_id:
                 continue
-            if not _is_enabled(item) or _norm(item.get("number")) != target_number:
+            if not _is_enabled(item) or not same_dial_number(
+                item.get("number"), target_number
+            ):
                 return None
             return _normalize_profile(item, target_number, _norm(task), lang, item_id)
         return None
@@ -472,7 +475,7 @@ def _validate_profile_payload(payload: Any) -> dict[str, Any]:
         required=True,
     )
     opening = _validate_localized(
-        payload.get("opening"), "opening", max_chars=MAX_OPENING_CHARS
+        payload.get("opening"), "opening", max_width=MAX_OPENING_WIDTH
     )
     match_mode = _norm(payload.get("match_mode"))
     if not match_mode:
@@ -517,6 +520,7 @@ def _validate_localized(
     field: str,
     *,
     max_chars: int | None = None,
+    max_width: int | None = None,
     required: bool = False,
 ) -> str | dict[str, str]:
     if value is None:
@@ -539,6 +543,11 @@ def _validate_localized(
         raise ProfileValidationError(f"{field} 不能为空")
     if max_chars is not None and any(len(item) > max_chars for item in values):
         raise ProfileValidationError(f"{field} 不能超过 {max_chars} 个字符")
+    if max_width is not None and any(display_width(item) > max_width for item in values):
+        # 宽度口径：中文按 2、拉丁按 1，两种文字用同一阈值才公平。
+        raise ProfileValidationError(
+            f"{field} 不能超过 {max_width} 显示宽度（中文约 {max_width // 2} 字）"
+        )
     return cleaned
 
 
@@ -564,7 +573,11 @@ def _check_conflicts(
     candidate_number = _norm(candidate.get("number"))
     candidate_tasks = {_norm(value) for value in _task_values(candidate.get("task")) if _norm(value)}
     for item, profile_id in _profiles_with_ids(profiles):
-        if profile_id == exclude_id or _norm(item.get("number")) != candidate_number:
+        # 冲突检测必须与 lookup 用同一套等价关系，否则 13800138000 与
+        # +8613800138000 可以并存为两条预设，之后命中哪条取决于文件顺序。
+        if profile_id == exclude_id or not same_dial_number(
+            item.get("number"), candidate_number
+        ):
             continue
         item_tasks = {_norm(value) for value in _task_values(item.get("task")) if _norm(value)}
         if not candidate_tasks and not item_tasks:
@@ -620,6 +633,60 @@ def _find_profile_index(profiles: list[Any], profile_id: str) -> int | None:
 
 def _norm(value: Any) -> str:
     return str(value or "").strip()
+
+
+# 本机 SIM 所在国家的国际区号。**只**剥离这一个前缀，不做「1–3 位随便试」。
+#
+# 第一版写的是「试 1–3 位，凑得上就算同号」，Codex 评审给出反例：
+#   same_dial_number("+33123456789", "3123456789") → True
+# 只剥掉一个 "3" 就凑上了，但 +33 是法国、3123456789 是另一个国家的号码。
+# 误判的代价比原 bug 更重 —— 拨 A 号却套用了 B 号的精调提示词。
+#
+# 定成单一常量是有先例的：sim_identity.py 的 PLMN→运营商映射同样是
+# 「公开电信标准的确定性事实数据」，项目已明确它不属于被禁止的枚举
+# （非枚举硬原则针对的是对话理解与交互管控，不是号码格式）。
+# 真机硬约束本来也只允许拨本卡运营商的免费客服号（大陆），默认 86 相符。
+DIAL_COUNTRY_CODE = "86"
+# 允许「去国家码后仍相等」的最短有效长度。短号（10086 / 110 等）绝不能靠
+# 后缀匹配去命中长号码，否则 10086 的预设会误命中任意以 10086 结尾的号码。
+_MIN_SUBSCRIBER_DIGITS = 7
+
+
+def canonical_dial_number(value: Any) -> str:
+    """把拨号号码收敛成可比较形式：去掉分隔符，保留前导 + 与 * #。"""
+    raw = _norm(value)
+    if not raw:
+        return ""
+    plus = raw.startswith("+")
+    body = "".join(ch for ch in raw if ch.isdigit() or ch in "*#")
+    return ("+" + body) if plus else body
+
+
+def same_dial_number(left: Any, right: Any) -> bool:
+    """两个号码是否指向同一个被叫。
+
+    #75：预设匹配曾是裸字符串相等，而拨号号码允许前导 `+`。用户从通讯录带
+    `+86` 拨出时，精心写好的预设**静默失配**并落回动态生成——表现为「同一个
+    号码有时用预设有时不用」，且没有任何日志说明原因。
+
+    规则刻意收得很紧，因为**误判比漏判更糟**（拨 A 号却套用 B 号的精调提示词）：
+    只有带 `+` 的那一方、且其国家码正好是本机的 DIAL_COUNTRY_CODE 时才剥离；
+    剩余订户号还要至少 _MIN_SUBSCRIBER_DIGITS 位，防止短号被后缀误命中。
+    """
+    a = canonical_dial_number(left)
+    b = canonical_dial_number(right)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    # 只有带 + 的那一方才可能含国家码；两边都不带 + 时不做任何猜测。
+    longer, shorter = (a, b) if len(a) > len(b) else (b, a)
+    bare = shorter.lstrip("+")
+    if shorter.startswith("+") or not longer.startswith("+"):
+        return False
+    if len(bare) < _MIN_SUBSCRIBER_DIGITS or not bare.isdigit():
+        return False
+    return longer == f"+{DIAL_COUNTRY_CODE}{bare}"
 
 
 def _fallback_label(number: str, task: str, lang: str) -> str:

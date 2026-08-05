@@ -12,7 +12,13 @@ from typing import Callable
 import serial
 
 from . import config, platforms, port_detect
-from .sim_identity import UNKNOWN_SIM, SimIdentity, identify, with_registration
+from .sim_identity import (
+    UNKNOWN_SIM,
+    SimIdentity,
+    identify,
+    with_registration,
+    with_service_number_override,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -284,7 +290,15 @@ class Eg25Modem:
             and expected_generation != self._sim_refresh_generation
         ):
             return
-        self._set_sim_identity(identify(imsi_raw, creg_raw), notify=notify)
+        # 覆盖在缓存点统一施加：下游（dial_guard 误拨保护、结果校验、
+        # /api/meta 展示）拿到的都是同一份「有效身份」，不必各自处理配置。
+        self._set_sim_identity(
+            with_service_number_override(
+                identify(imsi_raw, creg_raw),
+                config.get_str("CARRIER_HOTLINE"),
+            ),
+            notify=notify,
+        )
         sim = self._sim_identity
         if sim.present:
             logger.info(
