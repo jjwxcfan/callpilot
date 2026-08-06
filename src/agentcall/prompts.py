@@ -225,7 +225,11 @@ def _build_zh(
         f"来电任务：自然接待，了解对方是谁、找{owner}什么事、急不急、"
         f"是否需要{owner}回拨，并记下要点转告{owner}。\n"
         "来电规则：\n"
-        f"1. 不要冒充{owner}本人；被问身份时说你是{owner}的{persona}。\n"
+        # 开场白只说「喂?」之后，主动表明身份就成了必需（WIL-91）：靠「被问才说」
+        # 的话，对方可能整通都以为在跟{owner}本人讲话。所以改成一有自然时机就说，
+        # 而不是等对方开口问。绝不冒充本人这条不变。
+        f"1. 不要冒充{owner}本人。开场只说「喂？」，对方一说明来意，就顺势表明"
+        f"你是{owner}的{persona}、{owner}现在不方便接；被直接问身份时如实回答。\n"
         f"2. 不要暗示是{owner}主动联系对方。\n"
         f"3. 不承诺回拨时间、不替{owner}做决定；只说会转告{owner}。\n"
         "4. 对方明显是广告、骚扰、诈骗或机器人话术时，问一两句确认后礼貌收束并记录。\n"
@@ -269,11 +273,14 @@ def _opening_zh(direction: str, owner: str, persona: str, task: str) -> str:
             "请直接用中文说一句简短自然的电话开场白，只说这一句、别超过 25 字、不要解释："
             f"你好，我是{owner}的{persona}，{purpose}。"
         )
-    return (
-        "请直接用中文说一句自然电话开场白，不要解释："
-        f"喂，你好，我是{owner}的{persona}，"
-        f"{owner}现在不方便接，你说。"
-    )
+    # 来电开场白：真人接起来就是「喂?」，不会先做自我介绍（WIL-91 / WIL-85 N4）。
+    #
+    # 原开场白宽度 56、实测播完约 5.3 秒（WIL-89 基线，6 通来电样本），
+    # 而真人约 0.5 秒——这是「一听就是机器人」最早、也最容易察觉的一处。
+    #
+    # 代价：不再主动报身份。补偿见来电规则第 1 条——改成「对方一说明来意就
+    # 顺势表明自己是{persona}」，而不是等被问才说。绝不冒充本人这条不变。
+    return "请直接用中文只说两个字，不要解释、不要自我介绍：喂？"
 
 
 # ---- English ----
@@ -396,8 +403,11 @@ def _build_en(
         f"need {owner} for, how urgent it is, and whether {owner} should call back; "
         f"note the key points to pass on to {owner}.\n"
         "Incoming-call rules:\n"
-        f"1. Never impersonate {owner} in person; when asked, say you are {owner}'s "
-        f"{persona}.\n"
+        # 与中文侧同步（WIL-91）：开场只说 Hello? 之后，身份必须主动说而不是等被问。
+        f"1. Never impersonate {owner} in person. Open with just \"Hello?\"; as soon "
+        f"as the caller states what they want, say naturally that you are {owner}'s "
+        f"{persona} and {owner} can't take the call right now. Answer truthfully if "
+        "asked directly.\n"
         f"2. Don't imply that {owner} initiated contact.\n"
         f"3. Don't promise a callback time or make decisions for {owner}; only say "
         f"you'll pass it on to {owner}.\n"
@@ -417,8 +427,5 @@ def _opening_en(direction: str, owner: str, persona: str, task: str) -> str:
             "no explanation: "
             f"Hi, this is {owner}'s {persona}, {purpose}."
         )
-    return (
-        "Say one natural phone opening line directly in English, no explanation: "
-        f"Hello, this is {owner}'s {persona}; {owner} can't take the call right now, "
-        "how can I help?"
-    )
+    # 与中文侧同理（WIL-91）：真人接起来就是一声「Hello?」，不先自我介绍。
+    return "Say just one word directly in English, no explanation, no introduction: Hello?"

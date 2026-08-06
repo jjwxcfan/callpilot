@@ -323,12 +323,41 @@ def test_outbound_opening_uses_generated_opening_directly():
     assert "我是李明的数字分身" not in text
 
 
-def test_inbound_opening_injects_owner():
+def test_inbound_opening_is_just_hello():
+    """来电开场白只说「喂？」，不做自我介绍（WIL-91 / WIL-85 N4）。
+
+    原开场白宽度 56、实测播完约 5.3 秒（WIL-89 基线），真人约 0.5 秒——
+    这是「一听就是机器人」最早暴露的一处。
+    """
     text = opening_instructions("inbound", "李明", "数字分身", DEFAULT_OUTBOUND_TASK)
-    assert "我是李明的数字分身" in text
-    assert "李明现在不方便接" in text
+    assert "喂" in text
+    # 开场白里不能再有自我介绍——那正是要砍掉的 5 秒
+    assert "我是李明的数字分身" not in text
+    assert "李明现在不方便接" not in text
     # 来电开场白不应带外呼专属措辞
     assert "这次主要是" not in text
+
+
+def test_inbound_opening_is_short_in_english_too():
+    """英文侧必须同步收短，否则两份提示词又漂移（WIL-79 记录的正是这类）。"""
+    text = opening_instructions(
+        "inbound", "李明", "数字分身", DEFAULT_OUTBOUND_TASK, lang="en"
+    )
+    assert "Hello?" in text
+    assert "can't take the call" not in text, "英文开场白也不该再做自我介绍"
+
+
+def test_inbound_identity_moves_into_the_rules():
+    """开场白不报身份了，身份就必须由规则兜住——否则对方可能整通都以为在跟机主讲话。
+
+    这是 WIL-91 砍开场白的**补偿机制**：改成「对方一说明来意就顺势表明」，
+    而不是原来的「被问才说」。没有这一条，缩短开场白就成了误导对方。
+    """
+    text = build_instructions("inbound", "李明", "数字分身", DEFAULT_OUTBOUND_TASK)
+    assert "不要冒充李明本人" in text
+    assert "数字分身" in text
+    # 必须是主动表明，不能只写「被问才说」
+    assert "说明来意" in text or "顺势表明" in text
 
 
 # ---- 无预设任务（空 task）：不塞元指令、强化「你是主叫不是客服」----
