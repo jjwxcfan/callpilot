@@ -276,6 +276,11 @@ class CallSession:
         self._turn_cancel_sent = False
         self._turn_lock = threading.Lock()
         self._max_turn_seconds = 0.0
+        # 媒体死亡看门狗（WIL-100）：累计收到的纯数字静音时长（秒）。
+        self._dead_media_silent_seconds = 0.0
+        self._dead_media_seconds = 0.0
+        self._dead_media_hangup = False
+        self._dead_media_reported = False
         # 最近一次 Agent 音频采样率，供收尾兜底计算丢弃时长。
         self._agent_output_rate = 24000
 
@@ -819,6 +824,23 @@ class CallSession:
             ) < self._hangover_seconds
 
             pcm_8k = bridge.read_modem_chunk()
+            if self._dead_media_expired(pcm_8k, now) and not self._dead_media_reported:
+                # 检测**总是**落事件；是否据此挂断另有开关（见 _dead_media_expired）。
+                self._dead_media_reported = True
+                logger.warning(
+                    "上行已连续收到 %.0f 秒纯数字静音（仍在出帧）——媒体可能已死；"
+                    "本次%s收尾",
+                    self._dead_media_silent_seconds,
+                    "" if self._dead_media_hangup else "不",
+                )
+                if record is not None:
+                    record.log_event(
+                        "dead_media_detected",
+                        silent_seconds=round(self._dead_media_silent_seconds, 1),
+                        hangup=self._dead_media_hangup,
+                    )
+                if self._dead_media_hangup:
+                    break
             if pcm_8k:
                 # 录音不受半双工屏蔽影响（内存追加，非磁盘 IO）。
                 if record is not None:
@@ -1005,6 +1027,10 @@ class CallSession:
         """每通会话开始时重读可调参数，支持不重启改参。"""
         self._hangover_seconds = config.get_float("HALF_DUPLEX_HANGOVER_SECONDS")
         self._max_turn_seconds = config.get_float("AGENT_MAX_TURN_SECONDS")
+        self._dead_media_seconds = config.get_float("DEAD_MEDIA_TIMEOUT_SECONDS")
+        self._dead_media_hangup = config.get_bool("DEAD_MEDIA_HANGUP")
+        self._dead_media_silent_seconds = 0.0
+        self._dead_media_reported = False
         self._hangup_delay_seconds = config.get_float("HANGUP_TOOL_DELAY_SECONDS")
 
     def _begin_record(self, direction: str, number: str | None) -> CallRecord | None:
@@ -2039,6 +2065,48 @@ class CallSession:
     # 一轮之内 provider 是突发写音频的（分块几乎连着到），轮次之间才有真空档。
     # 用这个空档判定「新的一轮开始了」，就不必依赖各 provider 的 response 事件。
     _TURN_GAP_SECONDS = 1.5
+
+    def _dead_media_expired(self, pcm_8k: bytes, now: float) -> bool:
+        """上行还在出帧、内容却是**纯数字静音** → 对端早已挂断（WIL-100）。
+
+        为什么需要这条，而不是靠已有的两道保护：
+
+        - ``NO CARRIER`` / ``+CEND:``：串口抖动时会被吞掉（`modem.py:225`
+          记的 2026-07-08 事故就是这个）。
+        - CLCC 消失判定（`modem.py:_process_clcc_response`）：前提是模组自己
+          知道通话没了。2026-08-06 19:09 那通，两道都没触发——按 CLCC 失败
+          路径最多 60 秒就会收尾，实际僵尸了十分钟，**只能推断模组一直报着
+          有活跃通话**，即模组自己也没察觉对端挂断。
+
+        此时唯一还能判的就是媒体本身。三种状态的签名互不相同：
+
+        ==========================  ========  ==========
+        状态                        frames    peak
+        ==========================  ========  ==========
+        通话中，AI 在说             0（半双工屏蔽）  0
+        通话中，对方在说            >0        439~591
+        僵尸（对端已走）            >0        **0**
+        ==========================  ========  ==========
+
+        真实电话音频始终带底噪（实测 RMS 45~56），**出帧却精确为 0** 不是真
+        音频。所以判据是「有帧 + 峰值恒为 0」持续足够久，而不是「安静」。
+
+        阈值取得保守：误挂断比晚挂断严重得多。
+        """
+        if self._dead_media_seconds <= 0:
+            return False
+        if not pcm_8k:
+            # 没帧不代表对端走了——半双工屏蔽期间本来就没帧，不能据此计时。
+            return False
+        if any(pcm_8k):
+            # 任意非零字节即视为有真实音频（含底噪），重新计时。
+            self._dead_media_silent_seconds = 0.0
+            return False
+        # 累计的是**收到的静音音频时长**，不是墙上时钟（2026-08-06 Codex 评审 P1）。
+        # 按墙上时钟算的话，「静音 50 秒 + 半双工屏蔽无帧 20 秒 + 一块静音」就会
+        # 立刻越过 60 秒阈值——而实际只收到 50 秒静音，与注释说的语义自相矛盾。
+        self._dead_media_silent_seconds += len(pcm_8k) / (MODEM_RATE * 2)
+        return self._dead_media_silent_seconds >= self._dead_media_seconds
 
     def _check_turn_length(
         self, pcm_agent: bytes, agent: VoiceAgent, record: CallRecord | None
