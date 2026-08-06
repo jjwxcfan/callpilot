@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 import os
@@ -612,7 +613,19 @@ class CallSession:
             # 重则护窗一旦长过 _TURN_GAP_SECONDS，下一块就被当成新一轮而清零计数，
             # 跑飞的长轮次就此绕过闸门。而这恰恰是 IVR 路径——模型边按键边说话
             # 正是 WIL-49 记录在案的行为。
-            self._check_turn_length(pcm_agent, agent, record)
+            if self._check_turn_length(pcm_agent, agent, record):
+                # 本轮已超上限：**丢掉后续下行**。这才是真正的闸门。
+                #
+                # 2026-08-06 真机验证（拨 10086）证明「靠 response.cancel 掐生成」
+                # 完全无效：OpenAI 把整轮音频以突发写完的速度，快过我们按字节
+                # 累计到阈值——事件记了 turn_length_capped、日志写了「打断本轮」，
+                # 而 provider 回的是 response_cancel_not_active（响应早就结束了），
+                # 队列照常放完，对端把 14.4s 和 29.6s 的两轮整段听完了。
+                #
+                # 要限制的是**对端听到多久**，就必须在「送进下行队列」这一步拦，
+                # 不能指望上游停止生成。DTMF 双音走 _send_dtmf_raw 单独入队，
+                # 不经过这里，所以 WIL-49 的按键不受影响。
+                return
             # 按键护窗：DTMF 期间丢弃 Agent 下行，别让语音和双音挤在同一段上行。
             # 真机 2026-08-03 拨 10086：模型一边说「这边先按一下对应的键」一边按，
             # 4 次本机 success、IVR 菜单一次没推进（见 #45 评论）。
@@ -2029,8 +2042,8 @@ class CallSession:
 
     def _check_turn_length(
         self, pcm_agent: bytes, agent: VoiceAgent, record: CallRecord | None
-    ) -> None:
-        """单轮长度闸门（WIL-90 / WIL-85 N2）：一轮生成过长就打断生成。
+    ) -> bool:
+        """单轮长度闸门（WIL-90 / WIL-85 N2）。返回 True 表示**这块下行要丢掉**。
 
         为什么必须有这个闸门，而不能只在提示词里写「说短点」：WIL-83 已实测
         证明模型**不可靠地遵守**提示词里的禁令——受限话术明令禁止「说会转告」，
@@ -2039,52 +2052,53 @@ class CallSession:
         分工：提示词负责把中位数压下来，这里只兜住跑飞的长尾
         （WIL-89 基线：中位 6.8s、p90 17.8s、最长 36.6s；默认阈值 20s）。
 
-        掐生成不掐播放——已排队的音频照常播完，对端听到的是完整播出的一段，
-        而不是被硬切掉半个字。
+        **截断靠丢弃下行，不靠 provider 停止生成。** 2026-08-06 真机验证推翻了
+        原设计：OpenAI 把整轮音频以突发写完的速度快过我们累计到阈值，等闸门
+        触发时响应早已结束，response.cancel 直接返回 response_cancel_not_active，
+        队列照常放完——对端把 14.4s 和 29.6s 的两轮整段听完了，而事件流里却记着
+        turn_length_capped。所以限制必须落在「送不送进下行队列」这一步。
+
+        代价要说清：这是**硬切**，被截的那一轮结尾会突兀。默认阈值取在实测
+        p90 之上就是为了让它只在明显跑飞时才触发。
         """
         if self._max_turn_seconds <= 0 or not pcm_agent:
-            return
+            return False
         rate = getattr(agent, "output_rate", 0) or self._agent_output_rate
         if rate <= 0:
-            return
+            return False
         now = time.monotonic()
         with self._turn_lock:
             if now - self._turn_last_chunk_at > self._TURN_GAP_SECONDS:
-                # 空档 → 新的一轮，计数与「已打断」标志一起重置。
+                # 空档 → 新的一轮，计数与「已超限」标志一起重置。
                 self._turn_audio_bytes = 0
                 self._turn_cancel_sent = False
             self._turn_last_chunk_at = now
+            if self._turn_cancel_sent:
+                return True  # 本轮已超限，后续分块一律丢弃
             self._turn_audio_bytes += len(pcm_agent)
             seconds = self._turn_audio_bytes / (rate * 2)
-            if seconds <= self._max_turn_seconds or self._turn_cancel_sent:
-                return
-
-        # 先确认打断真的派发出去了，再置「已打断」标志、再落事件。
-        # 反过来（先置标志再派发）的话，事件流会显示「已掐断」而实际什么都没发生，
-        # 且这一轮之后再也不会重试——又是一次静默失效（2026-08-05 Codex 评审 P2）。
-        loop = self._loop
-        if loop is None or not loop.is_running():
-            logger.warning(
-                "单轮生成超过 %.1fs，但事件循环不可用，本轮无法打断",
-                self._max_turn_seconds,
-            )
-            return
-        try:
-            asyncio.run_coroutine_threadsafe(self._cancel_agent_turn(agent), loop)
-        except RuntimeError as exc:
-            logger.warning("派发打断失败: %s", exc)
-            return
-
-        with self._turn_lock:
-            # 一轮只打断一次：cancel 之后余下的分块还会到，不设标志会反复下发。
+            if seconds <= self._max_turn_seconds:
+                return False
             self._turn_cancel_sent = True
-        logger.info("单轮生成超过 %.1fs，打断本轮", self._max_turn_seconds)
+
+        # 闸门本身**已经生效**（调用方会丢掉这块及之后的下行）。下面再顺手请
+        # provider 停止生成，纯属省 token / 省时延——**不是**限制生效的手段。
+        #
+        # 2026-08-06 真机验证：靠 response.cancel 掐生成完全无效，OpenAI 早在
+        # 我们累计到阈值之前就把整轮生成完了，回的是 response_cancel_not_active。
+        # 所以这里不再因为它失败而告警——那是预期内的常态，不是故障。
+        logger.info("单轮已达 %.1fs 上限，截断本轮剩余下行", self._max_turn_seconds)
         if record is not None:
             record.log_event(
                 "turn_length_capped",
                 seconds=round(seconds, 1),
                 limit=self._max_turn_seconds,
             )
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            with contextlib.suppress(RuntimeError):
+                asyncio.run_coroutine_threadsafe(self._cancel_agent_turn(agent), loop)
+        return True
 
     async def _cancel_agent_turn(self, agent: VoiceAgent) -> None:
         """把打断真正下发给 provider，并记录它到底有没有生效。
@@ -2098,9 +2112,8 @@ class CallSession:
             logger.warning("打断本轮回复异常: error_type=%s", type(exc).__name__)
             return
         if not delivered:
-            logger.warning(
-                "单轮长度闸门未生效：当前 provider 不支持打断，长轮次不会被掐断"
-            )
+            # 只是没省下这点生成而已；截断由调用方丢弃下行完成，不受影响。
+            logger.debug("本 provider 未接受打断请求（不影响截断生效）")
 
     def _flush_dtmf_guard_drop(self, record: CallRecord | None, rate: int) -> None:
         """护窗结束后落一条「丢了多少 Agent 语音」的事件。

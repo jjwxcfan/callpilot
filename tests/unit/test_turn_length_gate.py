@@ -233,21 +233,31 @@ def test_extra_chunks_do_not_dispatch_more_cancels():
     assert asyncio.run(scenario()).cancel_calls == 1
 
 
-def test_no_running_loop_warns_and_does_not_mark_capped(caplog):
-    """没有可用事件循环时，不能假装掐断了。
+def test_truncation_works_without_an_event_loop():
+    """没有事件循环也照样截断。
 
-    先置标志再派发的话，事件流显示「已掐断」而实际什么都没发生，且这一轮之后
-    再也不会重试——静默失效。
+    截断是靠**丢弃下行**完成的，与能不能给 provider 发 cancel 无关。
+    2026-08-06 真机验证正是这一条：cancel 被 provider 拒了
+    （response_cancel_not_active），若截断依赖它，闸门就完全失效。
     """
     session = make_session(limit=3.0)
     session._loop = None
     agent, record = RecordingAgent(), Events()
-    with caplog.at_level("WARNING"):
-        feed(session, agent, record, agent.output_rate, seconds=6.0)
 
-    assert session._turn_cancel_sent is False, "没派发出去就不能标成已打断"
-    assert record.capped() == [], "没真的打断就不该落 turn_length_capped"
-    assert any("无法打断" in r.getMessage() for r in caplog.records)
+    dropped = []
+    remaining = 6.0
+    while remaining > 1e-9:
+        step = min(0.5, remaining)
+        dropped.append(
+            session._check_turn_length(
+                seconds_of(agent.output_rate, step), agent, record
+            )
+        )
+        remaining -= step
+
+    assert any(dropped), "超限后必须开始丢弃下行"
+    assert session._turn_cancel_sent is True
+    assert record.capped(), "截断已发生，事件必须落"
 
 
 # ---- 护窗期内生成的音频也要计入（Codex 评审 P1）----
@@ -280,26 +290,34 @@ def test_audio_generated_during_dtmf_guard_still_counts():
 # ---- 静默失效防护（WIL-75 的形态）----
 
 
-def test_unsupported_provider_is_warned_not_silent(caplog):
-    """provider 不支持打断时必须**大声说出来**。
+def test_truncation_is_independent_of_cancel_being_accepted():
+    """provider 拒绝 cancel 时，截断仍然必须生效。
 
-    豆包就没有实现这条能力。不区分「已下发」与「不支持」，闸门就会变成
-    又一次静默失效——事件照落、日志照打、实际什么都没发生。
+    这是 2026-08-06 真机验证的核心教训：OpenAI 回 response_cancel_not_active，
+    而原实现把截断寄托在 cancel 上，于是事件记了 turn_length_capped、对端却把
+    14.4s 和 29.6s 的两轮整段听完了。
     """
+    session = make_session(limit=3.0)
+    agent, record = RecordingAgent(delivered=False), Events()
+
+    dropped = [
+        session._check_turn_length(
+            seconds_of(agent.output_rate, 0.5), agent, record
+        )
+        for _ in range(12)
+    ]
+    assert any(dropped), "provider 不接受 cancel 时，截断依然要靠丢弃下行生效"
+    assert record.capped()
+
+
+def test_cancel_rejection_is_not_a_warning(caplog):
+    """cancel 被拒是**常态**不是故障：闸门不依赖它，不该刷 WARNING。"""
     session = make_session(limit=5.0)
     agent = RecordingAgent(delivered=False)
     with caplog.at_level("WARNING"):
         asyncio.run(session._cancel_agent_turn(agent))
     assert agent.cancel_calls == 1
-    assert any("不支持打断" in r.getMessage() for r in caplog.records)
-
-
-def test_delivered_cancel_is_quiet(caplog):
-    session = make_session(limit=5.0)
-    agent = RecordingAgent(delivered=True)
-    with caplog.at_level("WARNING"):
-        asyncio.run(session._cancel_agent_turn(agent))
-    assert not [r for r in caplog.records if "不支持打断" in r.getMessage()]
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
 
 
 def test_cancel_exception_does_not_escape():
