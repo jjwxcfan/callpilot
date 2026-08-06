@@ -323,10 +323,10 @@ def test_outbound_opening_uses_generated_opening_directly():
     assert "我是李明的数字分身" not in text
 
 
-def test_inbound_opening_is_just_hello():
-    """来电开场白只说「喂？」，不做自我介绍（WIL-91 / WIL-85 N4）。
+def test_inbound_opening_is_short_without_self_intro():
+    """来电开场白短，且不做自我介绍（WIL-91 / WIL-85 N4）。
 
-    原开场白宽度 56、实测播完约 5.3 秒（WIL-89 基线），真人约 0.5 秒——
+    原开场白宽度 56、实测播完约 5.3 秒（WIL-89 基线），真人约 1 秒——
     这是「一听就是机器人」最早暴露的一处。
     """
     text = opening_instructions("inbound", "李明", "数字分身", DEFAULT_OUTBOUND_TASK)
@@ -343,8 +343,40 @@ def test_inbound_opening_is_short_in_english_too():
     text = opening_instructions(
         "inbound", "李明", "数字分身", DEFAULT_OUTBOUND_TASK, lang="en"
     )
-    assert "Hello?" in text
+    assert "Hello" in text
     assert "can't take the call" not in text, "英文开场白也不该再做自我介绍"
+
+
+def test_inbound_opening_is_not_ultra_short():
+    """不能缩到只剩两个字（WIL-99）。
+
+    2026-08-06 真机：开场白只说「喂？」时下行峰值仅 36（正常语音约 2 万），
+    是直流拖尾而非语音，对端听到一秒多静默——比原来的长开场白更糟。
+    极短话语 realtime 模型渲染不出来。
+    """
+    for lang, floor in (("zh", 4), ("en", 12)):
+        text = opening_instructions(
+            "inbound", "李明", "数字分身", DEFAULT_OUTBOUND_TASK, lang=lang
+        )
+        spoken = text.split("：")[-1] if lang == "zh" else text.split(": ")[-1]
+        assert len(spoken.strip()) >= floor, (
+            f"[{lang}] 开场白「{spoken}」太短，模型可能渲染不出音频（WIL-99）"
+        )
+
+
+def test_inbound_rules_do_not_quote_the_greeting():
+    """规则里不能引用开场白原文（WIL-99）。
+
+    曾写成「开场只说「喂？」」，模型把那两个字当成可复用话术，通话中途又说了
+    一遍「喂？我是…」，把刚砍掉的长开场白原样拼回来（真机 4.95 秒连续块）。
+    """
+    zh = build_instructions("inbound", "李明", "数字分身", DEFAULT_OUTBOUND_TASK)
+    assert "开场只说" not in zh
+    assert "「喂" not in zh, "规则里出现了可照抄的问候语原文"
+    en = build_instructions(
+        "inbound", "李明", "数字分身", DEFAULT_OUTBOUND_TASK, lang="en"
+    )
+    assert 'Open with just' not in en
 
 
 def test_inbound_identity_moves_into_the_rules():
