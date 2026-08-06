@@ -10,9 +10,16 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 
 from . import config
+
+logger = logging.getLogger(__name__)
+
+# 已告警过的 (机主, 人设) 组合。agent_persona() 每通要被调用四五次，
+# 不去重会让同一条配置问题在每通话里刷四遍。
+_warned_persona_conflicts: set[tuple[str, str]] = set()
 
 _OWNER_FALLBACK = {"zh": "机主", "en": "the owner"}
 _PERSONA_FALLBACK = {"zh": "AI 助理", "en": "AI assistant"}
@@ -66,8 +73,39 @@ def owner_name(lang: str = "zh") -> str:
 
 
 def agent_persona(lang: str = "zh") -> str:
-    """AI 人设称谓；AGENT_PERSONA 未设置时用当前语言的中性称谓。"""
-    return config.get_str("AGENT_PERSONA").strip() or _PERSONA_FALLBACK[normalize_lang(lang)]
+    """AI 人设称谓；未设置**或与机主同名**时用当前语言的中性称谓。
+
+    「与机主同名」必须和「没填」一样兜底（WIL-98）。真机 2026-08-06 13:21：
+    `OWNER_NAME` 与 `AGENT_PERSONA` 都是「罗源」，提示词里到处是
+    ``f"{owner}的{persona}"``，AI 就真的说「我是罗源的罗源」，对端直接反问
+    「你是罗原的罗原什么意思?」——话本身不成立。
+
+    更要紧的是它让 `prompts.py` 的「不要冒充{owner}本人」自相矛盾：AI 每次
+    自我介绍都在用机主的名字称呼自己。不是模型不听话，是配置让规则打架。
+
+    不做「启动即拒绝」：这是 7×24 接电话的服务，为一个称谓拒绝启动代价太大。
+    回退 + 告警既让通话继续可用，又让问题可见。
+    """
+    persona = config.get_str("AGENT_PERSONA").strip()
+    fallback = _PERSONA_FALLBACK[normalize_lang(lang)]
+    if not persona:
+        return fallback
+    owner = config.get_str("OWNER_NAME").strip()
+    if owner and persona.casefold() == owner.casefold():
+        # 不能静默：用户得知道自己配的值没生效，否则只会觉得 AI 说话很怪。
+        # 但本函数每通要被调四五次，同一条配置问题只提醒一次。
+        key = (owner.casefold(), persona.casefold())
+        if key not in _warned_persona_conflicts:
+            _warned_persona_conflicts.add(key)
+            logger.warning(
+                "AGENT_PERSONA 与 OWNER_NAME 同名，会让 AI 自称「%s的%s」；"
+                "已回退为「%s」。请把 AGENT_PERSONA 改成助理的称谓。",
+                owner,
+                persona,
+                fallback,
+            )
+        return fallback
+    return persona
 
 
 def default_outbound_task(lang: str = "zh") -> str:
@@ -225,7 +263,16 @@ def _build_zh(
         f"来电任务：自然接待，了解对方是谁、找{owner}什么事、急不急、"
         f"是否需要{owner}回拨，并记下要点转告{owner}。\n"
         "来电规则：\n"
-        f"1. 不要冒充{owner}本人；被问身份时说你是{owner}的{persona}。\n"
+        # 开场白只说「喂?」之后，主动表明身份就成了必需（WIL-91）：靠「被问才说」
+        # 的话，对方可能整通都以为在跟{owner}本人讲话。所以改成一有自然时机就说，
+        # 而不是等对方开口问。绝不冒充本人这条不变。
+        # 这里**不要引用开场白的原文**（WIL-99）：曾写成「开场只说「喂？」」，
+        # 模型把那两个字当成可复用的话术，在通话中途又说了一遍「喂？我是…」，
+        # 把刚砍掉的长开场白原样拼了回来（真机实测 4.95 秒连续块）。
+        # 描述行为，不给它可照抄的词。
+        f"1. 不要冒充{owner}本人。开场白已经说过，不要再重复问候；对方一说明来意，"
+        f"就顺势表明你是{owner}的{persona}、{owner}现在不方便接；"
+        "被直接问身份时如实回答。\n"
         f"2. 不要暗示是{owner}主动联系对方。\n"
         f"3. 不承诺回拨时间、不替{owner}做决定；只说会转告{owner}。\n"
         "4. 对方明显是广告、骚扰、诈骗或机器人话术时，问一两句确认后礼貌收束并记录。\n"
@@ -269,11 +316,19 @@ def _opening_zh(direction: str, owner: str, persona: str, task: str) -> str:
             "请直接用中文说一句简短自然的电话开场白，只说这一句、别超过 25 字、不要解释："
             f"你好，我是{owner}的{persona}，{purpose}。"
         )
-    return (
-        "请直接用中文说一句自然电话开场白，不要解释："
-        f"喂，你好，我是{owner}的{persona}，"
-        f"{owner}现在不方便接，你说。"
-    )
+    # 来电开场白：真人接起来就是一句「喂，你好。」，不会先做自我介绍
+    # （WIL-91 / WIL-85 N4）。原开场白宽度 56、实测播完约 5.3 秒
+    # （WIL-89 基线，6 通来电样本），而真人约 1 秒——这是「一听就是机器人」
+    # 最早、也最容易察觉的一处。
+    #
+    # ⚠️ 不要再缩到「喂？」两个字（WIL-99）：2026-08-06 真机实测，那样下行
+    # 峰值只有 36（正常语音约 2 万），是一段直流拖尾而非语音波形，对端听到的
+    # 是一秒多静默——比原来的长开场白更糟。极短话语 realtime 模型渲染不出来，
+    # 原来 5.3 秒的长开场白只是把这个问题掩盖住了。
+    #
+    # 代价：不再主动报身份。补偿见来电规则第 1 条——改成「对方一说明来意就
+    # 顺势表明自己是{persona}」，而不是等被问才说。绝不冒充本人这条不变。
+    return "请直接用中文说一句简短的电话开场白，不要解释、不要自我介绍：喂，你好。"
 
 
 # ---- English ----
@@ -396,8 +451,12 @@ def _build_en(
         f"need {owner} for, how urgent it is, and whether {owner} should call back; "
         f"note the key points to pass on to {owner}.\n"
         "Incoming-call rules:\n"
-        f"1. Never impersonate {owner} in person; when asked, say you are {owner}'s "
-        f"{persona}.\n"
+        # 与中文侧同步（WIL-91 / WIL-99）：身份主动说；且不要引用开场白原文，
+        # 否则模型会把它当成可复用话术，中途再问候一次。
+        f"1. Never impersonate {owner} in person. The greeting has already been "
+        "said — do not greet again; as soon as the caller states what they want, "
+        f"say naturally that you are {owner}'s {persona} and {owner} can't take the "
+        "call right now. Answer truthfully if asked directly.\n"
         f"2. Don't imply that {owner} initiated contact.\n"
         f"3. Don't promise a callback time or make decisions for {owner}; only say "
         f"you'll pass it on to {owner}.\n"
@@ -417,8 +476,8 @@ def _opening_en(direction: str, owner: str, persona: str, task: str) -> str:
             "no explanation: "
             f"Hi, this is {owner}'s {persona}, {purpose}."
         )
+    # 与中文侧同理（WIL-91 / WIL-99）：短，但不能短到模型渲染不出音频。
     return (
-        "Say one natural phone opening line directly in English, no explanation: "
-        f"Hello, this is {owner}'s {persona}; {owner} can't take the call right now, "
-        "how can I help?"
+        "Say one short phone opening line directly in English, no explanation, "
+        "no introduction: Hello, hi there."
     )

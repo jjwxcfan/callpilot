@@ -295,6 +295,36 @@ def test_overlap_survives_short_peer_pause(tmp_path):
     assert metrics.interruption_count >= 1, "对方停顿后又压着 AI 说，这次重叠不能漏掉"
 
 
+def test_near_silent_agent_turn_is_not_mistaken_for_a_tone(tmp_path):
+    """近乎静音的一段不能被当成 DTMF 剔除——那会让缺陷本身「消失」。
+
+    2026-08-06 真机：开场白只说「喂」时下行峰值仅 36（正常语音约 2 万），
+    频谱同样高度集中，于是被判为纯音整段丢掉，工具把**自我介绍**报成了开场白，
+    opening_ms 从真实的 0.4s 变成 3.95s——方向完全相反，会把一个真实缺陷
+    读成「开场白还是太长」。
+    """
+    quiet_blip = (_speechlike(400) // 200).astype("<i2")  # 峰值降到几十
+    agent = np.concatenate([
+        quiet_blip, np.zeros(int(SAMPLE_RATE * 2), dtype="<i2"), _speechlike(3000),
+    ])
+    metrics = analyze_call(
+        _write_call(tmp_path, "20260806-1-inbound-400100", agent, _quiet(6000))
+    )
+    assert metrics is not None
+    # 开场白必须仍然是那段近乎静音的首轮，不能变成后面的长段
+    assert metrics.opening_ms is not None and metrics.opening_ms < 1000, (
+        f"近乎静音的首轮被丢掉了，opening_ms={metrics.opening_ms}"
+    )
+    assert any("异常静音" in n for n in metrics.notes), "静音段必须被显式报出来"
+
+
+def test_real_dtmf_is_still_filtered(tmp_path):
+    """幅度下限不能把真正的 DTMF 放进来——它是正常幅度的。"""
+    from agentcall.naturalness import is_pure_tone
+
+    assert is_pure_tone(_dtmf(300)), "正常幅度的双音仍必须被判为纯音"
+
+
 def test_high_duty_cycle_peer_is_flagged(tmp_path):
     """对方几乎不停口时，噪声基底估计失效——要标注，不要给一个看着正常的假数。"""
     metrics = analyze_call(
