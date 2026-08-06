@@ -96,6 +96,9 @@ _OUTCOME_TEXT_CHARS = 80
 # 按键后等待对端反应的窗口，与 scripts/regression_call.py 的 8s 观察窗一致。
 # 超窗即「按键后无反应」——那本身就是证据，必须落，不能悄悄丢。
 _OUTCOME_WINDOW_SECONDS = 8.0
+# 超窗之后仍愿意与对端下一句配对的上限；超过它只记「没观察到」，不再配对
+# （防止几分钟后的无关话语凑成假证据）。实测 10086 有 9207ms 的应答。
+_OUTCOME_LATE_GRACE_SECONDS = 30.0
 
 
 AudioBridge = ModemAudioBridge | SerialPcmAudioBridge | FfmpegAudioBridge
@@ -2218,8 +2221,18 @@ class CallSession:
             }
 
     def _emit_dtmf_outcome(
-        self, record: CallRecord, pending: dict, text: str, *, expired: bool
+        self, record: CallRecord, pending: dict, text: str, *, status: str
     ) -> None:
+        """落一条按键推进证据。``status`` 三态，**不是布尔**（WIL-97）。
+
+        - ``observed``：窗口内拿到了对端下一句，证据有效。
+        - ``unobserved``：窗口内对端没说话。**这不等于按键没生效**——只是我们
+          停止观察了。2026-08-06 拨 10086：按 1 之后菜单确实推进了，对端 9207ms
+          才应答，而窗口是 8000ms，于是被记成 expired。一个用来纠正假阳性的
+          机制，自己产生了假阴性。
+        - ``late``：超窗之后才等到对端说话。专门用来攒「窗口到底该多长」的数据，
+          而不是拍脑袋改阈值。
+        """
         try:
             record.log_event(
                 "dtmf_outcome",
@@ -2227,7 +2240,8 @@ class CallSession:
                 menu_before=pending["menu_before"],
                 remote_after=text[:_OUTCOME_TEXT_CHARS],
                 latency_ms=round((time.monotonic() - pending["pressed_at"]) * 1000),
-                expired=expired,
+                status=status,
+                window_ms=round(_OUTCOME_WINDOW_SECONDS * 1000),
             )
         except Exception as exc:  # noqa: BLE001 - 记账失败不该影响通话
             logger.warning(
@@ -2248,7 +2262,7 @@ class CallSession:
                 return
             self._pending_dtmf_outcome = None
         if record is not None:
-            self._emit_dtmf_outcome(record, pending, "", expired=True)
+            self._emit_dtmf_outcome(record, pending, "", status="unobserved")
 
     def _settle_dtmf_outcome(self, record: CallRecord | None, text: str) -> None:
         """把「按键 → 对端下一句」配成一条 dtmf_outcome 事件。
@@ -2274,16 +2288,25 @@ class CallSession:
             if pending is None:
                 return
             self._pending_dtmf_outcome = None
-            # 超窗的挂起不再与这句配对：否则被无视的那次按键会跟几分钟后的无关
-            # 话语凑成一条假证据（Codex 评审 P1）。
-            stale = (
-                time.monotonic() - pending["pressed_at"] >= _OUTCOME_WINDOW_SECONDS
-            )
+            elapsed = time.monotonic() - pending["pressed_at"]
         if record is None:
             return
-        self._emit_dtmf_outcome(
-            record, pending, "" if stale else text, expired=stale
-        )
+        if elapsed >= _OUTCOME_LATE_GRACE_SECONDS:
+            # 几分钟后的无关话语不能配对——被无视的那次按键会跟它凑成假证据
+            # （Codex 评审 P1，原有保护）。这种情况下只如实记「没观察到」。
+            self._emit_dtmf_outcome(record, pending, "", status="unobserved")
+            return
+        # 窗口内 = observed；超窗但仍在宽限期内 = late。
+        #
+        # late 是本次修的核心（WIL-97）：真机 2026-08-06 拨 10086，按 1 之后菜单
+        # **确实推进**了（对端「回廣東一零零八六,請稍候」），只是 9207ms 才应答，
+        # 而窗口是 8000ms。原实现在这里把文本丢掉、记成超时，于是一个用来纠正
+        # 假阳性的机制自己产出了假阴性，会让按键有效率被系统性低估。
+        #
+        # 现在保留对端原话与真实时延——这正是「窗口该开多长」所需的样本，
+        # 而不是拍脑袋把 8 秒改成 15 秒（本票明确要求先扩样本）。
+        status = "observed" if elapsed < _OUTCOME_WINDOW_SECONDS else "late"
+        self._emit_dtmf_outcome(record, pending, text, status=status)
 
     def _record_dtmf_action(self, digits: str, source: str) -> None:
         public_source = {
