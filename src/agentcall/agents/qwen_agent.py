@@ -96,6 +96,10 @@ def prewarm_connection(timeout: float | None = None) -> float | None:
     started = time.monotonic()
     try:
         context = ssl.create_default_context()
+        # 显式钉死下限。create_default_context() 本身已经是安全默认（当前 Python
+        # 不会协商 TLS 1.0/1.1），写出来是为了不随运行环境的 openssl 策略漂移，
+        # 同时让 CodeQL 的 py/insecure-protocol 有据可依（WIL-87）。
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
         with socket.create_connection((host, port), timeout=timeout) as raw_sock:
             with context.wrap_socket(raw_sock, server_hostname=host):
                 pass

@@ -230,12 +230,22 @@ async def _asset(request: web.Request) -> web.StreamResponse:
     }
     if filename not in allowed:
         raise web.HTTPNotFound()
+    # 白名单已经足够，这里再解析一次绝对路径并确认落在 STATIC_DIR 之内。
+    # 一是防「白名单没错、STATIC_DIR 被换掉」这类未来回归；二是 CodeQL 不把
+    # 集合成员判断建模成路径消毒器，这一处长期报 py/path-injection，把真告警
+    # 淹在噪音里（WIL-87）。
+    try:
+        static_root = STATIC_DIR.resolve()
+        target = static_root.joinpath(filename).resolve()
+        target.relative_to(static_root)
+    except (ValueError, OSError, RuntimeError):
+        raise web.HTTPNotFound() from None
     headers = {
         "Cache-Control": "no-cache",
         "X-Content-Type-Options": "nosniff",
         "Referrer-Policy": "no-referrer",
     }
-    return web.FileResponse(STATIC_DIR / filename, headers=headers)
+    return web.FileResponse(target, headers=headers)
 
 
 async def _device(request: web.Request) -> web.Response:
