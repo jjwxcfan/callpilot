@@ -10,9 +10,16 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 
 from . import config
+
+logger = logging.getLogger(__name__)
+
+# 已告警过的 (机主, 人设) 组合。agent_persona() 每通要被调用四五次，
+# 不去重会让同一条配置问题在每通话里刷四遍。
+_warned_persona_conflicts: set[tuple[str, str]] = set()
 
 _OWNER_FALLBACK = {"zh": "机主", "en": "the owner"}
 _PERSONA_FALLBACK = {"zh": "AI 助理", "en": "AI assistant"}
@@ -66,8 +73,39 @@ def owner_name(lang: str = "zh") -> str:
 
 
 def agent_persona(lang: str = "zh") -> str:
-    """AI 人设称谓；AGENT_PERSONA 未设置时用当前语言的中性称谓。"""
-    return config.get_str("AGENT_PERSONA").strip() or _PERSONA_FALLBACK[normalize_lang(lang)]
+    """AI 人设称谓；未设置**或与机主同名**时用当前语言的中性称谓。
+
+    「与机主同名」必须和「没填」一样兜底（WIL-98）。真机 2026-08-06 13:21：
+    `OWNER_NAME` 与 `AGENT_PERSONA` 都是「罗源」，提示词里到处是
+    ``f"{owner}的{persona}"``，AI 就真的说「我是罗源的罗源」，对端直接反问
+    「你是罗原的罗原什么意思?」——话本身不成立。
+
+    更要紧的是它让 `prompts.py` 的「不要冒充{owner}本人」自相矛盾：AI 每次
+    自我介绍都在用机主的名字称呼自己。不是模型不听话，是配置让规则打架。
+
+    不做「启动即拒绝」：这是 7×24 接电话的服务，为一个称谓拒绝启动代价太大。
+    回退 + 告警既让通话继续可用，又让问题可见。
+    """
+    persona = config.get_str("AGENT_PERSONA").strip()
+    fallback = _PERSONA_FALLBACK[normalize_lang(lang)]
+    if not persona:
+        return fallback
+    owner = config.get_str("OWNER_NAME").strip()
+    if owner and persona.casefold() == owner.casefold():
+        # 不能静默：用户得知道自己配的值没生效，否则只会觉得 AI 说话很怪。
+        # 但本函数每通要被调四五次，同一条配置问题只提醒一次。
+        key = (owner.casefold(), persona.casefold())
+        if key not in _warned_persona_conflicts:
+            _warned_persona_conflicts.add(key)
+            logger.warning(
+                "AGENT_PERSONA 与 OWNER_NAME 同名，会让 AI 自称「%s的%s」；"
+                "已回退为「%s」。请把 AGENT_PERSONA 改成助理的称谓。",
+                owner,
+                persona,
+                fallback,
+            )
+        return fallback
+    return persona
 
 
 def default_outbound_task(lang: str = "zh") -> str:
