@@ -66,6 +66,13 @@ _ONSET_MERGE_GAP_MS = 150
 _TONE_TOP_BINS = 6
 _TONE_ENERGY_RATIO = 0.5
 _TONE_MIN_SAMPLES = 256
+# 低于此峰值不参与纯音判定：近乎静音的段频谱也高度集中，会被误剔（见 is_pure_tone）。
+# 实测真实语音峰值约 2 万、DTMF 双音同量级；异常静音段峰值仅几十。
+_TONE_MIN_PEAK = 500
+
+# AI 发声段峰值低于此值即视为「异常静音」——本该出声却几乎没有声音。
+# 2026-08-06 真机：开场白只说「喂」时下行峰值仅 36，对端根本听不见。
+_SILENT_SEGMENT_PEAK = 500
 
 # 应答时延只在这个窗口内配对；超过就认为不是对这句的回应。
 _RESPONSE_WINDOW_MS = 8000
@@ -151,8 +158,16 @@ def is_pure_tone(samples: np.ndarray) -> bool:
     """这一段是纯音（DTMF 双音）还是语音？
 
     语音是宽带的，能量散布在很多频点；DTMF 是两个正弦叠加，能量高度集中。
+
+    ⚠️ 必须先过幅度下限：近乎静音的一段（直流拖尾、极轻的残留）频谱同样高度
+    集中，会被误判成双音而**被整段丢掉**。2026-08-06 真机就踩到了——那通
+    开场白只有峰值 36（正常语音约 2 万），被当成 DTMF 剔除后，工具把**自我
+    介绍**报成了开场白，`opening_ms` 从真实的 0.4s 变成 3.95s，方向完全相反。
     """
     if samples.size < _TONE_MIN_SAMPLES:
+        return False
+    if np.abs(samples).max() < _TONE_MIN_PEAK:
+        # 近乎静音：不是双音，也不是语音。交给调用方按「异常段」处理。
         return False
     window = np.hanning(samples.size)
     spectrum = np.abs(np.fft.rfft(samples.astype(np.float64) * window)) ** 2
@@ -433,6 +448,21 @@ def analyze_call(call_dir: Path) -> CallMetrics | None:
         metrics.notes.append("无 agent transcript 事件，字数指标不可用")
     if not peers:
         metrics.notes.append("未检出对方发声，应答时延与打断指标不可用")
+
+    # 异常静音的 AI 轮次：本该出声却几乎没有声音，对端根本听不见。
+    # 必须显式报出来——否则它只是让某一轮「消失」，而消失的那一轮恰恰是缺陷本身
+    # （2026-08-06 真机：开场白峰值仅 36，工具却把下一轮报成了开场白）。
+    silent = [
+        seg
+        for seg in _tidy(_runs(agent_pcm != 0))
+        if np.abs(agent_pcm[seg.start : seg.end]).max() < _SILENT_SEGMENT_PEAK
+    ]
+    if silent:
+        peak = int(np.abs(agent_pcm[silent[0].start : silent[0].end]).max())
+        metrics.notes.append(
+            f"检出 {len(silent)} 段异常静音的 AI 下行（首段 "
+            f"{silent[0].duration_ms:.0f}ms，峰值 {peak}）——本该出声却几乎无声"
+        )
 
     # 噪声基底估计的前提是本通有足够的安静帧；不成立时说出来，别给假数。
     dyn = peer_dynamic_range(peer_pcm)
