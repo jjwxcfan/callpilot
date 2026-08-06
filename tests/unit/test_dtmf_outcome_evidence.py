@@ -313,7 +313,9 @@ def test_silence_after_a_press_is_recorded_as_evidence(monkeypatch):
     """沉默本身就是证据 —— 只在「有下一句」时才落事件，会把这类失败整个抹掉。"""
     import agentcall.call_agent as module
 
-    monkeypatch.setattr(module, "_OUTCOME_WINDOW_SECONDS", 0.0)
+    # 判死用的是宽限期而不是证据窗口（WIL-101）：按窗口判死会把 9207ms 那类
+    # 真实应答在对端开口之前就记成沉默，正好把 WIL-97 修好的假阴性造回来。
+    monkeypatch.setattr(module, "_OUTCOME_LATE_GRACE_SECONDS", 0.0)
     session = make_session()
     record = SpyRecord()
 
@@ -393,3 +395,57 @@ def test_one_press_emits_exactly_one_event():
     session._settle_dtmf_outcome(record, "回廣東一零零八六")  # type: ignore[arg-type]
     session._settle_dtmf_outcome(record, "又说了一句")  # type: ignore[arg-type]
     assert len(outcomes(record)) == 1
+
+
+# ---- 接线：超窗判定必须在生产路径上真的跑（WIL-101）----
+#
+# 此前 _expire_dtmf_outcome 只有测试直接调，生产上没有任何调用者，于是
+# 「按键后一片沉默」这类证据一条都没落过——而它恰恰是按键失败最典型的表现。
+# 单测全绿、功能是死的，与 WIL-72④、WIL-90 同一形态。
+
+
+def test_expiry_is_wired_into_the_call_loop():
+    """主循环里必须真的调它，否则这个功能在生产上不存在。"""
+    import inspect
+
+    from agentcall.call_agent import CallSession
+
+    source = inspect.getsource(CallSession._run_agent_loop)
+    assert "_expire_dtmf_outcome" in source, (
+        "通话主循环没有调用 _expire_dtmf_outcome —— 沉默证据永远不会被记录"
+    )
+
+
+def test_press_still_emits_exactly_one_event_with_expiry_wired():
+    """接上超窗判定后，仍必须「一次按键一条事件」。
+
+    若判死用证据窗口（8s）而不是宽限期（30s），9207ms 那类真实应答会先被记成
+    沉默、对端开口时再记一条，下游计数就会重复计（Codex 评审 P1）。
+    """
+    import time as _t
+
+    session, record = make_session(), SpyRecord()
+    press(session, record)
+    # 9.2 秒：超过证据窗口，但仍在宽限期内
+    session._pending_dtmf_outcome["pressed_at"] = _t.monotonic() - 9.2  # type: ignore[index]
+
+    session._expire_dtmf_outcome(record)  # type: ignore[arg-type]
+    assert outcomes(record) == [], "宽限期内不该判死——那会把真实应答记成沉默"
+
+    session._settle_dtmf_outcome(record, "回廣東一零零八六,請稍候")  # type: ignore[arg-type]
+    got = outcomes(record)
+    assert len(got) == 1, f"一次按键落了 {len(got)} 条事件"
+    assert got[0]["status"] == "late"
+
+
+def test_silence_beyond_grace_is_recorded_once():
+    import time as _t
+
+    session, record = make_session(), SpyRecord()
+    press(session, record)
+    session._pending_dtmf_outcome["pressed_at"] = _t.monotonic() - 31.0  # type: ignore[index]
+
+    session._expire_dtmf_outcome(record)  # type: ignore[arg-type]
+    session._expire_dtmf_outcome(record)  # 再调不该重复落
+    got = outcomes(record)
+    assert len(got) == 1 and got[0]["status"] == "unobserved"

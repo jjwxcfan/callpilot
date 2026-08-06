@@ -774,6 +774,17 @@ class CallSession:
                         max_seconds=inbound_max_seconds,
                     )
                 break
+            # 按键后对端一直不吭声 —— 超窗就把「沉默」本身记下来（WIL-101）。
+            #
+            # 这个检查此前**在生产上没有任何调用者**，只有单测直接调它，于是
+            # 它想记录的那类证据一条都没落过。而「对端毫无反应」恰恰是按键失败
+            # 最典型的表现，缺了它，按键有效率会被系统性高估——WIL-72④ 立项
+            # 的理由本就是本机 result:success 不可信。
+            #
+            # 挂在主循环而不是另起 Timer：循环本来就在跑，不用管定时器的生命
+            # 周期（跨通清理、世代作废），也就不会引入新的串味风险。
+            self._expire_dtmf_outcome(record)
+
             # ① 外呼硬时限兜底
             if (
                 outbound_max_seconds > 0
@@ -2249,15 +2260,23 @@ class CallSession:
             )
 
     def _expire_dtmf_outcome(self, record: CallRecord | None) -> None:
-        """超窗仍无对端话语——把「按键后一片沉默」本身记下来。
+        """按键后对端始终没开口——把「沉默」本身记下来（WIL-101）。
 
         沉默是有意义的证据：IVR 不理会一次按键时，往往就是什么都不说。若只在
         「有下一句」时才落事件，这类失败会整个消失，而它恰恰是最该被找出来的。
+
+        **判死用的是宽限期而不是证据窗口**，这一点很关键（WIL-97 + WIL-101）：
+        按证据窗口（8s）判死的话，真机那例 9207ms 的应答会在对端开口之前就被
+        记成「沉默」，正好把 WIL-97 刚修好的假阴性又造回来。所以这里等到宽限期
+        （30s）——窗口只用来区分 observed / late，宽限期才是「不再等了」的界线。
+
+        由此也保住了「一次按键只落一条事件」：宽限期内开口走
+        ``_settle_dtmf_outcome``，超过宽限期才由这里落 unobserved，两者互斥。
         """
         with self._outcome_lock:
             pending = self._pending_dtmf_outcome
             if pending is None or (
-                time.monotonic() - pending["pressed_at"] < _OUTCOME_WINDOW_SECONDS
+                time.monotonic() - pending["pressed_at"] < _OUTCOME_LATE_GRACE_SECONDS
             ):
                 return
             self._pending_dtmf_outcome = None
