@@ -96,6 +96,9 @@ _OUTCOME_TEXT_CHARS = 80
 # 按键后等待对端反应的窗口，与 scripts/regression_call.py 的 8s 观察窗一致。
 # 超窗即「按键后无反应」——那本身就是证据，必须落，不能悄悄丢。
 _OUTCOME_WINDOW_SECONDS = 8.0
+# 超窗之后仍愿意与对端下一句配对的上限；超过它只记「没观察到」，不再配对
+# （防止几分钟后的无关话语凑成假证据）。实测 10086 有 9207ms 的应答。
+_OUTCOME_LATE_GRACE_SECONDS = 30.0
 
 
 AudioBridge = ModemAudioBridge | SerialPcmAudioBridge | FfmpegAudioBridge
@@ -276,6 +279,11 @@ class CallSession:
         self._turn_cancel_sent = False
         self._turn_lock = threading.Lock()
         self._max_turn_seconds = 0.0
+        # 媒体死亡看门狗（WIL-100）：累计收到的纯数字静音时长（秒）。
+        self._dead_media_silent_seconds = 0.0
+        self._dead_media_seconds = 0.0
+        self._dead_media_hangup = False
+        self._dead_media_reported = False
         # 最近一次 Agent 音频采样率，供收尾兜底计算丢弃时长。
         self._agent_output_rate = 24000
 
@@ -766,6 +774,17 @@ class CallSession:
                         max_seconds=inbound_max_seconds,
                     )
                 break
+            # 按键后对端一直不吭声 —— 超窗就把「沉默」本身记下来（WIL-101）。
+            #
+            # 这个检查此前**在生产上没有任何调用者**，只有单测直接调它，于是
+            # 它想记录的那类证据一条都没落过。而「对端毫无反应」恰恰是按键失败
+            # 最典型的表现，缺了它，按键有效率会被系统性高估——WIL-72④ 立项
+            # 的理由本就是本机 result:success 不可信。
+            #
+            # 挂在主循环而不是另起 Timer：循环本来就在跑，不用管定时器的生命
+            # 周期（跨通清理、世代作废），也就不会引入新的串味风险。
+            self._expire_dtmf_outcome(record)
+
             # ① 外呼硬时限兜底
             if (
                 outbound_max_seconds > 0
@@ -819,6 +838,23 @@ class CallSession:
             ) < self._hangover_seconds
 
             pcm_8k = bridge.read_modem_chunk()
+            if self._dead_media_expired(pcm_8k, now) and not self._dead_media_reported:
+                # 检测**总是**落事件；是否据此挂断另有开关（见 _dead_media_expired）。
+                self._dead_media_reported = True
+                logger.warning(
+                    "上行已连续收到 %.0f 秒纯数字静音（仍在出帧）——媒体可能已死；"
+                    "本次%s收尾",
+                    self._dead_media_silent_seconds,
+                    "" if self._dead_media_hangup else "不",
+                )
+                if record is not None:
+                    record.log_event(
+                        "dead_media_detected",
+                        silent_seconds=round(self._dead_media_silent_seconds, 1),
+                        hangup=self._dead_media_hangup,
+                    )
+                if self._dead_media_hangup:
+                    break
             if pcm_8k:
                 # 录音不受半双工屏蔽影响（内存追加，非磁盘 IO）。
                 if record is not None:
@@ -1005,6 +1041,10 @@ class CallSession:
         """每通会话开始时重读可调参数，支持不重启改参。"""
         self._hangover_seconds = config.get_float("HALF_DUPLEX_HANGOVER_SECONDS")
         self._max_turn_seconds = config.get_float("AGENT_MAX_TURN_SECONDS")
+        self._dead_media_seconds = config.get_float("DEAD_MEDIA_TIMEOUT_SECONDS")
+        self._dead_media_hangup = config.get_bool("DEAD_MEDIA_HANGUP")
+        self._dead_media_silent_seconds = 0.0
+        self._dead_media_reported = False
         self._hangup_delay_seconds = config.get_float("HANGUP_TOOL_DELAY_SECONDS")
 
     def _begin_record(self, direction: str, number: str | None) -> CallRecord | None:
@@ -2040,6 +2080,48 @@ class CallSession:
     # 用这个空档判定「新的一轮开始了」，就不必依赖各 provider 的 response 事件。
     _TURN_GAP_SECONDS = 1.5
 
+    def _dead_media_expired(self, pcm_8k: bytes, now: float) -> bool:
+        """上行还在出帧、内容却是**纯数字静音** → 对端早已挂断（WIL-100）。
+
+        为什么需要这条，而不是靠已有的两道保护：
+
+        - ``NO CARRIER`` / ``+CEND:``：串口抖动时会被吞掉（`modem.py:225`
+          记的 2026-07-08 事故就是这个）。
+        - CLCC 消失判定（`modem.py:_process_clcc_response`）：前提是模组自己
+          知道通话没了。2026-08-06 19:09 那通，两道都没触发——按 CLCC 失败
+          路径最多 60 秒就会收尾，实际僵尸了十分钟，**只能推断模组一直报着
+          有活跃通话**，即模组自己也没察觉对端挂断。
+
+        此时唯一还能判的就是媒体本身。三种状态的签名互不相同：
+
+        ==========================  ========  ==========
+        状态                        frames    peak
+        ==========================  ========  ==========
+        通话中，AI 在说             0（半双工屏蔽）  0
+        通话中，对方在说            >0        439~591
+        僵尸（对端已走）            >0        **0**
+        ==========================  ========  ==========
+
+        真实电话音频始终带底噪（实测 RMS 45~56），**出帧却精确为 0** 不是真
+        音频。所以判据是「有帧 + 峰值恒为 0」持续足够久，而不是「安静」。
+
+        阈值取得保守：误挂断比晚挂断严重得多。
+        """
+        if self._dead_media_seconds <= 0:
+            return False
+        if not pcm_8k:
+            # 没帧不代表对端走了——半双工屏蔽期间本来就没帧，不能据此计时。
+            return False
+        if any(pcm_8k):
+            # 任意非零字节即视为有真实音频（含底噪），重新计时。
+            self._dead_media_silent_seconds = 0.0
+            return False
+        # 累计的是**收到的静音音频时长**，不是墙上时钟（2026-08-06 Codex 评审 P1）。
+        # 按墙上时钟算的话，「静音 50 秒 + 半双工屏蔽无帧 20 秒 + 一块静音」就会
+        # 立刻越过 60 秒阈值——而实际只收到 50 秒静音，与注释说的语义自相矛盾。
+        self._dead_media_silent_seconds += len(pcm_8k) / (MODEM_RATE * 2)
+        return self._dead_media_silent_seconds >= self._dead_media_seconds
+
     def _check_turn_length(
         self, pcm_agent: bytes, agent: VoiceAgent, record: CallRecord | None
     ) -> bool:
@@ -2150,8 +2232,18 @@ class CallSession:
             }
 
     def _emit_dtmf_outcome(
-        self, record: CallRecord, pending: dict, text: str, *, expired: bool
+        self, record: CallRecord, pending: dict, text: str, *, status: str
     ) -> None:
+        """落一条按键推进证据。``status`` 三态，**不是布尔**（WIL-97）。
+
+        - ``observed``：窗口内拿到了对端下一句，证据有效。
+        - ``unobserved``：窗口内对端没说话。**这不等于按键没生效**——只是我们
+          停止观察了。2026-08-06 拨 10086：按 1 之后菜单确实推进了，对端 9207ms
+          才应答，而窗口是 8000ms，于是被记成 expired。一个用来纠正假阳性的
+          机制，自己产生了假阴性。
+        - ``late``：超窗之后才等到对端说话。专门用来攒「窗口到底该多长」的数据，
+          而不是拍脑袋改阈值。
+        """
         try:
             record.log_event(
                 "dtmf_outcome",
@@ -2159,7 +2251,8 @@ class CallSession:
                 menu_before=pending["menu_before"],
                 remote_after=text[:_OUTCOME_TEXT_CHARS],
                 latency_ms=round((time.monotonic() - pending["pressed_at"]) * 1000),
-                expired=expired,
+                status=status,
+                window_ms=round(_OUTCOME_WINDOW_SECONDS * 1000),
             )
         except Exception as exc:  # noqa: BLE001 - 记账失败不该影响通话
             logger.warning(
@@ -2167,20 +2260,28 @@ class CallSession:
             )
 
     def _expire_dtmf_outcome(self, record: CallRecord | None) -> None:
-        """超窗仍无对端话语——把「按键后一片沉默」本身记下来。
+        """按键后对端始终没开口——把「沉默」本身记下来（WIL-101）。
 
         沉默是有意义的证据：IVR 不理会一次按键时，往往就是什么都不说。若只在
         「有下一句」时才落事件，这类失败会整个消失，而它恰恰是最该被找出来的。
+
+        **判死用的是宽限期而不是证据窗口**，这一点很关键（WIL-97 + WIL-101）：
+        按证据窗口（8s）判死的话，真机那例 9207ms 的应答会在对端开口之前就被
+        记成「沉默」，正好把 WIL-97 刚修好的假阴性又造回来。所以这里等到宽限期
+        （30s）——窗口只用来区分 observed / late，宽限期才是「不再等了」的界线。
+
+        由此也保住了「一次按键只落一条事件」：宽限期内开口走
+        ``_settle_dtmf_outcome``，超过宽限期才由这里落 unobserved，两者互斥。
         """
         with self._outcome_lock:
             pending = self._pending_dtmf_outcome
             if pending is None or (
-                time.monotonic() - pending["pressed_at"] < _OUTCOME_WINDOW_SECONDS
+                time.monotonic() - pending["pressed_at"] < _OUTCOME_LATE_GRACE_SECONDS
             ):
                 return
             self._pending_dtmf_outcome = None
         if record is not None:
-            self._emit_dtmf_outcome(record, pending, "", expired=True)
+            self._emit_dtmf_outcome(record, pending, "", status="unobserved")
 
     def _settle_dtmf_outcome(self, record: CallRecord | None, text: str) -> None:
         """把「按键 → 对端下一句」配成一条 dtmf_outcome 事件。
@@ -2206,16 +2307,25 @@ class CallSession:
             if pending is None:
                 return
             self._pending_dtmf_outcome = None
-            # 超窗的挂起不再与这句配对：否则被无视的那次按键会跟几分钟后的无关
-            # 话语凑成一条假证据（Codex 评审 P1）。
-            stale = (
-                time.monotonic() - pending["pressed_at"] >= _OUTCOME_WINDOW_SECONDS
-            )
+            elapsed = time.monotonic() - pending["pressed_at"]
         if record is None:
             return
-        self._emit_dtmf_outcome(
-            record, pending, "" if stale else text, expired=stale
-        )
+        if elapsed >= _OUTCOME_LATE_GRACE_SECONDS:
+            # 几分钟后的无关话语不能配对——被无视的那次按键会跟它凑成假证据
+            # （Codex 评审 P1，原有保护）。这种情况下只如实记「没观察到」。
+            self._emit_dtmf_outcome(record, pending, "", status="unobserved")
+            return
+        # 窗口内 = observed；超窗但仍在宽限期内 = late。
+        #
+        # late 是本次修的核心（WIL-97）：真机 2026-08-06 拨 10086，按 1 之后菜单
+        # **确实推进**了（对端「回廣東一零零八六,請稍候」），只是 9207ms 才应答，
+        # 而窗口是 8000ms。原实现在这里把文本丢掉、记成超时，于是一个用来纠正
+        # 假阳性的机制自己产出了假阴性，会让按键有效率被系统性低估。
+        #
+        # 现在保留对端原话与真实时延——这正是「窗口该开多长」所需的样本，
+        # 而不是拍脑袋把 8 秒改成 15 秒（本票明确要求先扩样本）。
+        status = "observed" if elapsed < _OUTCOME_WINDOW_SECONDS else "late"
+        self._emit_dtmf_outcome(record, pending, text, status=status)
 
     def _record_dtmf_action(self, digits: str, source: str) -> None:
         public_source = {

@@ -293,6 +293,11 @@ def test_stale_press_is_not_paired_with_a_much_later_utterance(monkeypatch):
     import agentcall.call_agent as module
 
     monkeypatch.setattr(module, "_OUTCOME_WINDOW_SECONDS", 0.0)
+    # 宽限期一并归零：本用例模拟的是「几分钟后」，即已超出任何配对余地。
+    # 不归零的话它模拟的其实是「刚超窗」，那属于 late（WIL-97 新增的一态），
+    # 与用例名描述的场景不是同一件事。真正的「几分钟后」见
+    # test_much_later_speech_still_never_pairs（用 300 秒真实时延）。
+    monkeypatch.setattr(module, "_OUTCOME_LATE_GRACE_SECONDS", 0.0)
     session = make_session()
     record = SpyRecord()
 
@@ -300,7 +305,7 @@ def test_stale_press_is_not_paired_with_a_much_later_utterance(monkeypatch):
     session._settle_dtmf_outcome(record, "几分钟后的无关话语")  # type: ignore[arg-type]
 
     got = outcomes(record)[0]
-    assert got["expired"] is True
+    assert got["status"] == "unobserved"
     assert got["remote_after"] == "", "超窗后不得把无关话语当成按键的反应"
 
 
@@ -308,7 +313,9 @@ def test_silence_after_a_press_is_recorded_as_evidence(monkeypatch):
     """沉默本身就是证据 —— 只在「有下一句」时才落事件，会把这类失败整个抹掉。"""
     import agentcall.call_agent as module
 
-    monkeypatch.setattr(module, "_OUTCOME_WINDOW_SECONDS", 0.0)
+    # 判死用的是宽限期而不是证据窗口（WIL-101）：按窗口判死会把 9207ms 那类
+    # 真实应答在对端开口之前就记成沉默，正好把 WIL-97 修好的假阴性造回来。
+    monkeypatch.setattr(module, "_OUTCOME_LATE_GRACE_SECONDS", 0.0)
     session = make_session()
     record = SpyRecord()
 
@@ -316,7 +323,7 @@ def test_silence_after_a_press_is_recorded_as_evidence(monkeypatch):
     session._expire_dtmf_outcome(record)  # type: ignore[arg-type]
 
     got = outcomes(record)
-    assert len(got) == 1 and got[0]["expired"] is True
+    assert len(got) == 1 and got[0]["status"] == "unobserved"
     assert got[0]["remote_after"] == ""
 
 
@@ -326,3 +333,119 @@ def test_expire_is_a_noop_before_the_window_elapses():
     press(session, record)
     session._expire_dtmf_outcome(record)  # type: ignore[arg-type]
     assert outcomes(record) == [], "窗口内不该提前落超时证据"
+
+
+# ---- 三态：判不出 ≠ 没生效（WIL-97）----
+#
+# 真机 2026-08-06 拨 10086：按 1 之后菜单**确实推进**了（对端「回廣東一零零八六,
+# 請稍候」），但对端 9207ms 才应答，而窗口是 8000ms，于是被记成超时且丢掉原话。
+# 一个用来纠正假阳性的机制，自己产生了假阴性，会让按键有效率被系统性低估。
+
+
+def test_observed_when_peer_answers_in_window():
+    session, record = make_session(), SpyRecord()
+    press(session, record)
+    session._settle_dtmf_outcome(record, "回廣東一零零八六,請稍候")  # type: ignore[arg-type]
+    got = outcomes(record)
+    assert len(got) == 1
+    assert got[0]["status"] == "observed"
+    assert got[0]["window_ms"] == 8000
+
+
+def test_late_answer_keeps_the_text_and_latency():
+    """复刻真机那一例：9207ms > 8000ms 窗口，但对端确实回了。
+
+    必须记成 late 并**保留原话与真实时延**——这正是「窗口该开多长」所需的样本。
+    原实现在这里丢掉文本、记成超时，等于把一次成功的按键记成失败。
+    """
+    import time as _t
+
+    session, record = make_session(), SpyRecord()
+    press(session, record)
+    session._pending_dtmf_outcome["pressed_at"] = _t.monotonic() - 9.207  # type: ignore[index]
+    session._settle_dtmf_outcome(record, "回廣東一零零八六,請稍候")  # type: ignore[arg-type]
+
+    got = outcomes(record)[-1]
+    assert got["status"] == "late", f"超窗应答被记成了 {got['status']}"
+    assert "廣東" in got["remote_after"], "late 必须保留对端原话，否则证据没了"
+    assert got["latency_ms"] >= 9000, "要留真实时延，才知道窗口该开多长"
+
+
+def test_much_later_speech_still_never_pairs():
+    """既有保护不能被削弱：几分钟后的无关话语不得配成证据（原 Codex P1）。"""
+    import time as _t
+
+    session, record = make_session(), SpyRecord()
+    press(session, record)
+    session._pending_dtmf_outcome["pressed_at"] = _t.monotonic() - 300.0  # type: ignore[index]
+    session._settle_dtmf_outcome(record, "完全无关的一句")  # type: ignore[arg-type]
+
+    got = outcomes(record)[-1]
+    assert got["status"] == "unobserved"
+    assert got["remote_after"] == "", "超出宽限期不能把无关话语记成证据"
+
+
+def test_one_press_emits_exactly_one_event():
+    """一次按键只产出一条事件——否则下游计数会重复计（Codex 评审 P1）。"""
+    import time as _t
+
+    session, record = make_session(), SpyRecord()
+    press(session, record)
+    session._pending_dtmf_outcome["pressed_at"] = _t.monotonic() - 9.2  # type: ignore[index]
+    session._settle_dtmf_outcome(record, "回廣東一零零八六")  # type: ignore[arg-type]
+    session._settle_dtmf_outcome(record, "又说了一句")  # type: ignore[arg-type]
+    assert len(outcomes(record)) == 1
+
+
+# ---- 接线：超窗判定必须在生产路径上真的跑（WIL-101）----
+#
+# 此前 _expire_dtmf_outcome 只有测试直接调，生产上没有任何调用者，于是
+# 「按键后一片沉默」这类证据一条都没落过——而它恰恰是按键失败最典型的表现。
+# 单测全绿、功能是死的，与 WIL-72④、WIL-90 同一形态。
+
+
+def test_expiry_is_wired_into_the_call_loop():
+    """主循环里必须真的调它，否则这个功能在生产上不存在。"""
+    import inspect
+
+    from agentcall.call_agent import CallSession
+
+    source = inspect.getsource(CallSession._run_agent_loop)
+    assert "_expire_dtmf_outcome" in source, (
+        "通话主循环没有调用 _expire_dtmf_outcome —— 沉默证据永远不会被记录"
+    )
+
+
+def test_press_still_emits_exactly_one_event_with_expiry_wired():
+    """接上超窗判定后，仍必须「一次按键一条事件」。
+
+    若判死用证据窗口（8s）而不是宽限期（30s），9207ms 那类真实应答会先被记成
+    沉默、对端开口时再记一条，下游计数就会重复计（Codex 评审 P1）。
+    """
+    import time as _t
+
+    session, record = make_session(), SpyRecord()
+    press(session, record)
+    # 9.2 秒：超过证据窗口，但仍在宽限期内
+    session._pending_dtmf_outcome["pressed_at"] = _t.monotonic() - 9.2  # type: ignore[index]
+
+    session._expire_dtmf_outcome(record)  # type: ignore[arg-type]
+    assert outcomes(record) == [], "宽限期内不该判死——那会把真实应答记成沉默"
+
+    session._settle_dtmf_outcome(record, "回廣東一零零八六,請稍候")  # type: ignore[arg-type]
+    got = outcomes(record)
+    assert len(got) == 1, f"一次按键落了 {len(got)} 条事件"
+    assert got[0]["status"] == "late"
+
+
+def test_silence_beyond_grace_is_recorded_once():
+    import time as _t
+
+    session, record = make_session(), SpyRecord()
+    press(session, record)
+    session._pending_dtmf_outcome["pressed_at"] = _t.monotonic() - 31.0  # type: ignore[index]
+
+    session._expire_dtmf_outcome(record)  # type: ignore[arg-type]
+    session._expire_dtmf_outcome(record)  # 再调不该重复落
+    got = outcomes(record)
+    assert len(got) == 1 and got[0]["status"] == "unobserved"

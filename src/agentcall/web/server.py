@@ -6,6 +6,7 @@ import asyncio
 import io
 import json
 import logging
+import os
 import re
 import secrets
 import subprocess
@@ -47,6 +48,40 @@ _REMOTE_DIALER_CSP = (
 # 通话 ID 白名单字符（call_log 生成的目录名），防路径穿越。
 _CALL_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _REMOTE_DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
+
+
+def _call_artifact_path(base_dir: str | Path, call_id: str, *parts: str) -> Path | None:
+    """拼通话产物路径，并**确认结果确实落在 base_dir 之内**；越界返回 None。
+
+    调用方已经用 `_CALL_ID_RE` 过了一遍（字符集不含 `/` 与 `.`，穿越构造不出来），
+    这里是第二道：真正解析出绝对路径再比对归属，防的是「正则没错、拼接写错」
+    这类未来回归——例如有人把 base_dir 换成可配置项、或多拼了一段用户输入。
+
+    顺带让 CodeQL 认得出这是消毒（WIL-87）：它不把 `re.fullmatch` 建模成路径
+    消毒器，于是这三处一直报 py/path-injection，把真告警淹在噪音里。
+    """
+    # base 的解析也要在异常边界内：base_dir 不可读、文件系统状态异常、
+    # 或符号链接成环时 resolve() 会抛，放在 try 外会把 404 变成 500
+    # （2026-08-07 Codex 评审 P2）。部分 Python 版本用 RuntimeError 报环。
+    try:
+        # 第一道：normpath + 前缀比对。**这一道是给 CodeQL 看的**——实测它不把
+        # pathlib 的 relative_to() 建模成消毒器（WIL-87 第一版就是这么写的，
+        # 告警原样保留，只是行号挪到了新代码上），只认 os.path 这套形态。
+        #
+        # 必须拼上分隔符再比前缀：否则 `/base` 会把 `/base-evil` 也判成在内。
+        base_text = os.path.normpath(os.path.abspath(os.fspath(base_dir)))
+        candidate_text = os.path.normpath(os.path.join(base_text, call_id, *parts))
+        if not candidate_text.startswith(base_text + os.sep):
+            return None
+        # 第二道：解析符号链接后再比一次归属。normpath **不解析符号链接**，
+        # 只做它会让「call_id 字符集完全合法、但目录是指向外部的软链」漏过去。
+        # 两道都留着：第一道让静态分析认得出，第二道才是真正挡得住的那道。
+        base = Path(base_text).resolve()
+        candidate = Path(candidate_text).resolve()
+        candidate.relative_to(base)
+    except (ValueError, OSError, RuntimeError):
+        return None
+    return candidate
 
 
 def _ensure_setup_sms_token(app: web.Application) -> str | None:
@@ -929,8 +964,10 @@ async def _history_events(request: web.Request) -> web.Response:
     if not _CALL_ID_RE.fullmatch(call_id):
         return web.json_response({"ok": False, "error": "非法的通话 ID"}, status=400)
 
-    events_path = Path(service.call_logger.base_dir) / call_id / "events.jsonl"
-    if not events_path.is_file():
+    events_path = _call_artifact_path(
+        service.call_logger.base_dir, call_id, "events.jsonl"
+    )
+    if events_path is None or not events_path.is_file():
         return web.json_response({"ok": False, "error": "通话记录不存在"}, status=404)
 
     def read_events() -> list[dict]:
@@ -969,8 +1006,10 @@ async def _history_audio(request: web.Request) -> web.StreamResponse:
         return web.json_response(
             {"ok": False, "error": "track 只能是 downlink/uplink/mixed"}, status=400
         )
-    wav_path = Path(service.call_logger.base_dir) / call_id / f"{track}.wav"
-    if not wav_path.is_file():
+    wav_path = _call_artifact_path(
+        service.call_logger.base_dir, call_id, f"{track}.wav"
+    )
+    if wav_path is None or not wav_path.is_file():
         return web.json_response({"ok": False, "error": "录音不存在"}, status=404)
     # 上行（对方）模组采集电平极低（原始 RMS 仅几十），回放前放大到可闻；
     # 下行本身够响，原样发。放大量沿用监听增益 MONITOR_UPLINK_GAIN。

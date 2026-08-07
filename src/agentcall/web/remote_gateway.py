@@ -6,6 +6,7 @@ import asyncio
 import ipaddress
 import json
 import logging
+import os
 import secrets
 import time
 from collections import OrderedDict, deque
@@ -230,12 +231,28 @@ async def _asset(request: web.Request) -> web.StreamResponse:
     }
     if filename not in allowed:
         raise web.HTTPNotFound()
+    # 白名单已经足够，这里再解析一次绝对路径并确认落在 STATIC_DIR 之内。
+    # 一是防「白名单没错、STATIC_DIR 被换掉」这类未来回归；二是 CodeQL 不把
+    # 集合成员判断建模成路径消毒器，这一处长期报 py/path-injection，把真告警
+    # 淹在噪音里（WIL-87）。
+    try:
+        # 第一道用 os.path：CodeQL 不认 pathlib 的 relative_to（WIL-87 实测）。
+        # 拼分隔符再比前缀，否则 `/static` 会把 `/static-evil` 也判成在内。
+        root_text = os.path.normpath(os.path.abspath(os.fspath(STATIC_DIR)))
+        target_text = os.path.normpath(os.path.join(root_text, filename))
+        if not target_text.startswith(root_text + os.sep):
+            raise web.HTTPNotFound()
+        # 第二道解析符号链接——normpath 不解析，只用它挡不住软链外指。
+        target = Path(target_text).resolve()
+        target.relative_to(Path(root_text).resolve())
+    except (ValueError, OSError, RuntimeError):
+        raise web.HTTPNotFound() from None
     headers = {
         "Cache-Control": "no-cache",
         "X-Content-Type-Options": "nosniff",
         "Referrer-Policy": "no-referrer",
     }
-    return web.FileResponse(STATIC_DIR / filename, headers=headers)
+    return web.FileResponse(target, headers=headers)
 
 
 async def _device(request: web.Request) -> web.Response:
