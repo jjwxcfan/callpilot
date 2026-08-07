@@ -6,6 +6,7 @@ import asyncio
 import io
 import json
 import logging
+import os
 import re
 import secrets
 import subprocess
@@ -63,8 +64,20 @@ def _call_artifact_path(base_dir: str | Path, call_id: str, *parts: str) -> Path
     # 或符号链接成环时 resolve() 会抛，放在 try 外会把 404 变成 500
     # （2026-08-07 Codex 评审 P2）。部分 Python 版本用 RuntimeError 报环。
     try:
-        base = Path(base_dir).resolve()
-        candidate = base.joinpath(call_id, *parts).resolve()
+        # 第一道：normpath + 前缀比对。**这一道是给 CodeQL 看的**——实测它不把
+        # pathlib 的 relative_to() 建模成消毒器（WIL-87 第一版就是这么写的，
+        # 告警原样保留，只是行号挪到了新代码上），只认 os.path 这套形态。
+        #
+        # 必须拼上分隔符再比前缀：否则 `/base` 会把 `/base-evil` 也判成在内。
+        base_text = os.path.normpath(os.path.abspath(os.fspath(base_dir)))
+        candidate_text = os.path.normpath(os.path.join(base_text, call_id, *parts))
+        if not candidate_text.startswith(base_text + os.sep):
+            return None
+        # 第二道：解析符号链接后再比一次归属。normpath **不解析符号链接**，
+        # 只做它会让「call_id 字符集完全合法、但目录是指向外部的软链」漏过去。
+        # 两道都留着：第一道让静态分析认得出，第二道才是真正挡得住的那道。
+        base = Path(base_text).resolve()
+        candidate = Path(candidate_text).resolve()
         candidate.relative_to(base)
     except (ValueError, OSError, RuntimeError):
         return None
