@@ -36,6 +36,76 @@ def test_create_modem_unknown_vendor_falls_back_to_quectel(caplog):
     assert "回退 quectel" in caplog.text
 
 
+def test_create_modem_simcom_returns_sim7600():
+    from agentcall.modem import Sim7600Modem, create_modem
+
+    for vendor in ("simcom", "sim7600", "SIM7600G"):
+        modem = create_modem("/dev/null-not-used", vendor=vendor)
+        assert isinstance(modem, Sim7600Modem), vendor
+
+
+# ---- Sim7600Modem 厂商钩子 ----
+
+def make_sim7600():
+    from agentcall.modem import Sim7600Modem
+
+    return Sim7600Modem(port="/dev/null-not-used")
+
+
+def test_sim7600_initialize_for_voice_enables_cpcmreg(monkeypatch, caplog):
+    modem = make_sim7600()
+    sent = []
+    monkeypatch.setattr(modem, "_send", lambda cmd: sent.append(cmd) or "OK")
+    with caplog.at_level(logging.INFO):
+        modem.initialize_for_voice("nmea")
+    assert sent == ["AT+CPCMREG=1"]
+    assert "AT+CPCMREG=1" in caplog.text
+
+
+def test_sim7600_initialize_for_voice_tolerates_no_active_call(monkeypatch):
+    """无活跃通话时 AT+CPCMREG=1 返回 ERROR，不得抛异常（否则 supervisor 误判失败）。"""
+    modem = make_sim7600()
+    monkeypatch.setattr(modem, "_send", lambda cmd: "ERROR")
+    modem.initialize_for_voice("nmea")  # 不抛即通过
+
+
+def test_sim7600_disable_voice_channel_sends_cpcmreg_off(monkeypatch):
+    modem = make_sim7600()
+    sent = []
+    monkeypatch.setattr(modem, "_send", lambda cmd: sent.append(cmd) or "OK")
+    modem._disable_voice_channel()
+    assert sent == ["AT+CPCMREG=0"]
+
+
+def test_sim7600_dtmf_uses_vts(monkeypatch):
+    modem = make_sim7600()
+    sent = []
+    monkeypatch.setattr(modem, "_send", lambda cmd: sent.append(cmd) or "OK")
+    monkeypatch.setattr("agentcall.modem.time.sleep", lambda s: None)
+    assert modem.send_dtmf("2") is True
+    assert sent == ["AT+VTS=2"]
+
+
+def test_sim7600_dtmf_falls_back_to_quoted_vts(monkeypatch):
+    modem = make_sim7600()
+    sent = []
+
+    def fake_send(cmd):
+        sent.append(cmd)
+        return "OK" if '"' in cmd else "ERROR"
+
+    monkeypatch.setattr(modem, "_send", fake_send)
+    monkeypatch.setattr("agentcall.modem.time.sleep", lambda s: None)
+    assert modem.send_dtmf("5") is True
+    assert sent == ["AT+VTS=5", 'AT+VTS="5"']
+
+
+def test_sim7600_pcm_ready_defaults_true():
+    """SIM7600 无 +QPCMV 带内流控 URC，继承基类 no-op，pcm_ready 恒 True。"""
+    modem = make_sim7600()
+    assert modem.pcm_ready() is True
+
+
 # ---- SMS PDU 解码 ----
 
 # SMS-DELIVER：发件 +8613800000000，UCS2 正文"你好"，时间 26/07/07,12:30:00

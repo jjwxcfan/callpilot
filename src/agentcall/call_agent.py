@@ -2780,9 +2780,10 @@ class CallAgentService:
         modem: SerialModem | None = None,
         call_logger: CallLogger | None = None,
         sms_email_forwarder: SmsEmailForwarder | None = None,
+        vendor: str = "quectel",
     ) -> None:
         # modem/call_logger 参数供测试注入；默认按串口/环境配置自建。
-        self.modem = modem or create_modem(modem_port, baudrate)
+        self.modem = modem or create_modem(modem_port, baudrate, vendor)
         self.audio_keyword = audio_keyword
         self.provider = provider
         self.audio_mode = audio_mode

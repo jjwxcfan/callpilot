@@ -1159,15 +1159,59 @@ class Eg25Modem(SerialModem):
                 self._pcm_ready_event.clear()
 
 
+class Sim7600Modem(SerialModem):
+    """SIMCom SIM7600 变体：``AT+CPCMREG`` PCM-over-USB 语音、``AT+VTS`` DTMF。
+
+    与 Quectel 的关键差异（Phase 0 真机实测，SIM7600G/固件 SIM7600M21-A_V2.0.2）：
+
+    - **音频不走 UAC 声卡**，走 USB 接口 4 的 bulk 端点带内 PCM（8kHz/16-bit/mono）。
+      该接口由 USB→PTY 桥暴露成串口，宿主侧用 ``nmea`` 音频模式的
+      ``SerialPcmAudioBridge`` 直接读写——故 SIM7600 无需 UAC 声卡逻辑。
+    - **``AT+CPCMREG=1`` 只在通话 active 后有效**，无活跃通话时发返回 ERROR。
+      ``initialize_for_voice`` 因此不把非 OK 当致命：``_modem_supervisor`` 会在
+      连接后（无呼叫时）调一次，那次预期 ERROR，真正使能发生在每通接通后的
+      per-call 调用（见 ``call_agent`` 应答/接通之后）。
+    - **无 ``+QPCMV`` 式带内流控 URC**，继承基类 ``_scan_pcm_flow`` no-op，
+      ``pcm_ready`` 恒 True。
+    """
+
+    def initialize_for_voice(self, audio_mode: str = "nmea") -> None:
+        """使能 PCM-over-USB 语音通道（``AT+CPCMREG=1``）。
+
+        SIM7600 仅此一条 USB 音频路径，与 ``audio_mode`` 取值无关（宿主侧桥的
+        选择由 ``MODEM_AUDIO_MODE`` 单独决定，SIM7600 须用 ``nmea``）。通话外调用
+        会 ERROR，属预期，不抛异常——否则 supervisor 会误判连接失败无限重试。
+        """
+        response = self._send("AT+CPCMREG=1")
+        if "OK" in response:
+            logger.info("PCM-over-USB 语音通道已启用 (AT+CPCMREG=1)")
+        else:
+            logger.info("AT+CPCMREG=1 暂未生效（通常因当前无活跃通话），接通后由 per-call 重试")
+
+    def _send_dtmf_digit(self, ch: str) -> bool:
+        # SIM7600 用标准 3GPP AT+VTS；不同固件对引号宽容度不一，先无引号再回退带引号。
+        # （DTMF 具体形态随固件差异，真机 IVR 导航时以实际响应为准复核。）
+        response = self._send(f"AT+VTS={ch}")
+        if "OK" not in response:
+            response = self._send(f'AT+VTS="{ch}"')
+        return "OK" in response
+
+    def _disable_voice_channel(self) -> None:
+        self._send("AT+CPCMREG=0")
+
+
 def create_modem(
     port: str, baudrate: int = 115200, vendor: str = "quectel"
 ) -> SerialModem:
     """按厂商创建 modem 实例。
 
-    当前支持 ``quectel``（EC20/EG25，默认）。未识别的 vendor 回退 quectel 并告警，
-    保证现网行为不变；SIM7600 等其他厂商变体在后续批次接入。
+    支持 ``quectel``（EC20/EG25，默认）与 ``simcom``（SIM7600）。未识别的 vendor
+    回退 quectel 并告警，保证现网行为不变。
     """
     normalized = (vendor or "quectel").strip().lower()
-    if normalized not in ("quectel", "ec20", "eg25"):
-        logger.warning("MODEM_VENDOR=%r 暂未支持，回退 quectel", vendor)
+    if normalized in ("quectel", "ec20", "eg25"):
+        return Eg25Modem(port, baudrate)
+    if normalized in ("simcom", "sim7600", "sim7600g"):
+        return Sim7600Modem(port, baudrate)
+    logger.warning("MODEM_VENDOR=%r 暂未支持，回退 quectel", vendor)
     return Eg25Modem(port, baudrate)
