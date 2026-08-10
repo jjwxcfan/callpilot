@@ -36,7 +36,7 @@ from .dtmf import dtmf_tone
 from .dtmf_followup import extract_spoken_dtmf
 from .dtmf_judge import DtmfActionLedger, DtmfJudge, WindowMode
 from .events import EventHub
-from .modem import Eg25Modem
+from .modem import SerialModem, create_modem
 from .monitor_playback import MonitorPlayback
 from .number_profiles import lookup_profile, lookup_profile_by_id
 from .pcm_stats import PcmFlowStats
@@ -143,7 +143,7 @@ class _CallSessionMediaRouter:
 class CallSession:
     def __init__(
         self,
-        modem: Eg25Modem,
+        modem: SerialModem,
         audio_keyword: str,
         provider: str | None,
         audio_mode: str,
@@ -2777,12 +2777,12 @@ class CallAgentService:
         pcm_baudrate: int = 921600,
         tx_gain: float = 1.0,
         hub: EventHub | None = None,
-        modem: Eg25Modem | None = None,
+        modem: SerialModem | None = None,
         call_logger: CallLogger | None = None,
         sms_email_forwarder: SmsEmailForwarder | None = None,
     ) -> None:
         # modem/call_logger 参数供测试注入；默认按串口/环境配置自建。
-        self.modem = modem or Eg25Modem(modem_port, baudrate)
+        self.modem = modem or create_modem(modem_port, baudrate)
         self.audio_keyword = audio_keyword
         self.provider = provider
         self.audio_mode = audio_mode

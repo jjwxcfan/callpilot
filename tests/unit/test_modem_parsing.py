@@ -16,6 +16,26 @@ def make_modem() -> Eg25Modem:
     return Eg25Modem(port="/dev/null-not-used")
 
 
+# ---- create_modem 厂商工厂 ----
+
+def test_create_modem_defaults_to_quectel():
+    from agentcall.modem import SerialModem, create_modem
+
+    modem = create_modem("/dev/null-not-used")
+    assert isinstance(modem, Eg25Modem)
+    assert isinstance(modem, SerialModem)
+
+
+def test_create_modem_unknown_vendor_falls_back_to_quectel(caplog):
+    """未识别 vendor 回退 quectel 并告警，保证现网行为不变。"""
+    from agentcall.modem import create_modem
+
+    with caplog.at_level(logging.WARNING):
+        modem = create_modem("/dev/null-not-used", vendor="no-such-vendor")
+    assert isinstance(modem, Eg25Modem)
+    assert "回退 quectel" in caplog.text
+
+
 # ---- SMS PDU 解码 ----
 
 # SMS-DELIVER：发件 +8613800000000，UCS2 正文"你好"，时间 26/07/07,12:30:00

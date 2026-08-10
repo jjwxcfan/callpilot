@@ -22,7 +22,7 @@ from .. import config, platforms
 from ..audio_bridge import apply_pcm_gain
 from ..contacts import is_reply_target_allowed
 from ..events import EventHub
-from ..modem import Eg25Modem
+from ..modem import SerialModem
 from ..number_profiles import (
     ProfileConflictError,
     ProfileNotFoundError,
@@ -254,7 +254,7 @@ def _auth_middleware_factory(token: str):
 
 def build_app(
     hub: EventHub,
-    modem: Eg25Modem,
+    modem: SerialModem,
     service=None,
     meta: dict | None = None,
     restart_event=None,
@@ -445,7 +445,7 @@ async def _audio_websocket(request: web.Request) -> web.WebSocketResponse:
 
 async def _send_sms(request: web.Request) -> web.Response:
     hub: EventHub = request.app["hub"]
-    modem: Eg25Modem = request.app["modem"]
+    modem: SerialModem = request.app["modem"]
     data = await read_json(request)
 
     number = (data.get("number") or "").strip()
@@ -1094,7 +1094,7 @@ async def _setup_complete(request: web.Request) -> web.Response:
 async def _setup_test_sms(request: web.Request) -> web.Response:
     """One explicit setup-wizard SMS test, separate from the normal reply-only SMS API."""
     hub: EventHub = request.app["hub"]
-    modem: Eg25Modem = request.app["modem"]
+    modem: SerialModem = request.app["modem"]
     data = await read_json(request)
     if not isinstance(data, dict):
         return web.json_response(
