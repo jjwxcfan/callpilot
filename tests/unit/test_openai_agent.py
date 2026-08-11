@@ -150,7 +150,11 @@ def test_start_sends_session_update_with_expected_fields(monkeypatch):
             assert session["output_modalities"] == ["audio"]
             audio = session["audio"]
             assert audio["output"]["voice"] == "alloy"
-            assert audio["input"]["turn_detection"] == {"type": "server_vad"}
+            # 默认下发注册表里的静默判停窗（OPENAI_VAD_SILENCE_MS=300，电话场景提速）。
+            assert audio["input"]["turn_detection"] == {
+                "type": "server_vad",
+                "silence_duration_ms": 300,
+            }
             assert audio["input"]["format"] == {"type": "audio/pcm", "rate": 24000}
             assert audio["output"]["format"] == {"type": "audio/pcm", "rate": 24000}
             assert audio["input"]["transcription"] == {
@@ -240,7 +244,11 @@ def test_manual_response_control_sets_create_response_false_and_debounces(monkey
         try:
             ws = instances[0]
             turn_detection = ws.sent[0]["session"]["audio"]["input"]["turn_detection"]
-            assert turn_detection == {"type": "server_vad", "create_response": False}
+            assert turn_detection == {
+                "type": "server_vad",
+                "silence_duration_ms": 300,
+                "create_response": False,
+            }
             for text in ("第一段菜单", "第二段菜单", "第三段菜单"):
                 ws.feed(
                     {
@@ -1051,6 +1059,24 @@ def test_speech_started_without_handler_stays_noop(monkeypatch):
             await _drain()
             await asyncio.sleep(0.05)
             assert "response.cancel" not in ws.sent_types()
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
+def test_vad_silence_zero_omits_silence_duration(monkeypatch):
+    """OPENAI_VAD_SILENCE_MS<=0 时不下发 silence_duration_ms，用服务端默认。"""
+    monkeypatch.setenv("OPENAI_VAD_SILENCE_MS", "0")
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            ws = instances[0]
+            turn_detection = ws.sent[0]["session"]["audio"]["input"]["turn_detection"]
+            assert turn_detection == {"type": "server_vad"}
         finally:
             await agent.stop()
 

@@ -180,6 +180,11 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                         "warm", "energetic"),
                choice_labels={"": "（默认·不追加）"},
                help="https://openai.fm"),
+    # server_vad 判定「对方说完了」所需的静默时长（毫秒）。OpenAI 默认 500；
+    # 电话场景往下调可显著缩短「对方说完→AI 开口」的等待（每 100ms 立省 100ms），
+    # 代价是对方句中停顿稍长就会被抢话。真机体感 250~350 较自然。0/负值=不下发，
+    # 用 OpenAI 默认。仅 OpenAI 链路。
+    ConfigSpec("OPENAI_VAD_SILENCE_MS", "OpenAI VAD 静默判停（毫秒）", "int", "300"),
     # 端点覆写（可选）：留空即直连 api.openai.com；仅在用反代/Azure OpenAI，
     # 或所在网络无法直连 OpenAI 时才需要填。
     ConfigSpec("OPENAI_REALTIME_URL", "OpenAI Realtime 端点覆写", "str", "",

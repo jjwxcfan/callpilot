@@ -59,6 +59,11 @@ def _reconnect_max() -> int:
     return config.get_int("OPENAI_RECONNECT_MAX")
 
 
+def _vad_silence_ms() -> int:
+    """server_vad 静默判停窗（注册表 OPENAI_VAD_SILENCE_MS，≤0 表示用服务端默认）。"""
+    return config.get_int("OPENAI_VAD_SILENCE_MS")
+
+
 def _default_instructions() -> str:
     """无外部指令时的默认系统提示词（与 qwen_agent 的默认语义对齐）。"""
     weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
@@ -167,9 +172,17 @@ class OpenAIVoiceAgent(VoiceAgent):
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcm", "rate": self.input_rate},
-                    # 打断事件本轮忽略，半双工由 call_agent 统一管理。
+                    # 打断事件的消费见 _handle_event 的 speech_started 分支
+                    # （barge-in 模式），半双工模式下仍由 call_agent 统一管理。
                     "turn_detection": {
                         "type": "server_vad",
+                        # 电话场景收窄静默判停窗（OpenAI 默认 500ms），显著缩短
+                        # 「对方说完→AI 开口」的等待；0/负值=不下发用服务端默认。
+                        **(
+                            {"silence_duration_ms": _vad_silence_ms()}
+                            if _vad_silence_ms() > 0
+                            else {}
+                        ),
                         **(
                             {"create_response": False}
                             if self._manual_response_enabled
