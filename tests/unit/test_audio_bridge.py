@@ -322,3 +322,43 @@ def test_ffmpeg_bridge_constructs_on_macos(monkeypatch):
 def test_create_audio_bridge_invalid_mode_mentions_macos_constraint():
     with pytest.raises(ValueError, match="仅 macOS"):
         create_audio_bridge("bogus", "Interface", None, 921600)
+
+
+# ---- SerialPcmAudioBridge: macOS PTY 波特率回退 ----
+
+def test_serial_pcm_open_falls_back_to_115200_on_enotty(monkeypatch):
+    """PTY(USB→PTY 桥)不支持自定义波特率 ioctl(ENOTTY)时退回 115200 重开。"""
+    import errno
+
+    from agentcall.audio_bridge import SerialPcmAudioBridge
+
+    tried = []
+
+    class FakeSerial:
+        def __init__(self, port, baudrate, **kw):
+            tried.append(baudrate)
+            if baudrate != 115200:
+                raise OSError(errno.ENOTTY, "Inappropriate ioctl for device")
+            self.is_open = True
+
+    monkeypatch.setattr(audio_bridge.serial, "Serial", FakeSerial)
+    bridge = SerialPcmAudioBridge("/tmp/sim7600-pcm", baudrate=921600)
+    ser = bridge._open_serial()
+    assert tried == [921600, 115200]
+    assert ser.is_open is True
+
+
+def test_serial_pcm_open_reraises_non_enotty(monkeypatch):
+    """非 ENOTTY 的 OSError(如权限/设备不存在)不吞，照常上抛。"""
+    import errno
+
+    from agentcall.audio_bridge import SerialPcmAudioBridge
+
+    def boom(port, baudrate, **kw):
+        raise OSError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(audio_bridge.serial, "Serial", boom)
+    bridge = SerialPcmAudioBridge("/tmp/sim7600-pcm", baudrate=921600)
+    with pytest.raises(OSError) as exc:
+        bridge._open_serial()
+    assert exc.value.errno == errno.EACCES

@@ -62,11 +62,26 @@ def test_sim7600_initialize_for_voice_enables_cpcmreg(monkeypatch, caplog):
     assert "AT+CPCMREG=1" in caplog.text
 
 
-def test_sim7600_initialize_for_voice_tolerates_no_active_call(monkeypatch):
-    """无活跃通话时 AT+CPCMREG=1 返回 ERROR，不得抛异常（否则 supervisor 误判失败）。"""
-    modem = make_sim7600()
-    monkeypatch.setattr(modem, "_send", lambda cmd: "ERROR")
+def test_sim7600_initialize_for_voice_no_active_call_single_attempt(monkeypatch):
+    """无活跃通话时（supervisor 启动期）只试一次，ERROR 不抛（否则 supervisor 误判失败）。"""
+    modem = make_sim7600()  # 未 set _call_connected_event → 无活跃通话
+    sent = []
+    monkeypatch.setattr(modem, "_send", lambda cmd: sent.append(cmd) or "ERROR")
+    monkeypatch.setattr("agentcall.modem.time.sleep", lambda s: None)
     modem.initialize_for_voice("nmea")  # 不抛即通过
+    assert sent == ["AT+CPCMREG=1"]  # 无活跃通话不重试
+
+
+def test_sim7600_initialize_for_voice_retries_until_enabled_while_active(monkeypatch):
+    """通话中 CPCMREG=1 偶发未就绪，须重试到 OK（否则音频桥写 PCM 会拖垮 USB 桥）。"""
+    modem = make_sim7600()
+    modem._call_connected_event.set()  # 模拟通话 active
+    responses = iter(["ERROR", "ERROR", "OK"])
+    sent = []
+    monkeypatch.setattr(modem, "_send", lambda cmd: sent.append(cmd) or next(responses))
+    monkeypatch.setattr("agentcall.modem.time.sleep", lambda s: None)
+    modem.initialize_for_voice("nmea")
+    assert sent == ["AT+CPCMREG=1", "AT+CPCMREG=1", "AT+CPCMREG=1"]
 
 
 def test_sim7600_disable_voice_channel_sends_cpcmreg_off(monkeypatch):

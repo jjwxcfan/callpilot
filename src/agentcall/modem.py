@@ -1175,18 +1175,31 @@ class Sim7600Modem(SerialModem):
       ``pcm_ready`` 恒 True。
     """
 
+    # 刚接通瞬间 CPCMREG=1 偶发未就绪（真机实测：同样接通，有时首发 OK、有时 ERROR）。
+    # 音频桥一旦 start() 就持续往 iface4 写 PCM，若此刻 CPCMREG 未生效、模组不排空该
+    # bulk 端点 → USB 写超时 → 整个 USB 桥被判定掉线拆桥（连 AT 口一起塌）。故通话中
+    # 必须重试到真正启用，确保写 PCM 前 iface4 已进入 PCM 模式。
+    _CPCMREG_ENABLE_ATTEMPTS = 6
+    _CPCMREG_ENABLE_RETRY_DELAY = 0.3
+
     def initialize_for_voice(self, audio_mode: str = "nmea") -> None:
         """使能 PCM-over-USB 语音通道（``AT+CPCMREG=1``）。
 
         SIM7600 仅此一条 USB 音频路径，与 ``audio_mode`` 取值无关（宿主侧桥的
-        选择由 ``MODEM_AUDIO_MODE`` 单独决定，SIM7600 须用 ``nmea``）。通话外调用
-        会 ERROR，属预期，不抛异常——否则 supervisor 会误判连接失败无限重试。
+        选择由 ``MODEM_AUDIO_MODE`` 单独决定，SIM7600 须用 ``nmea``）。
+
+        通话 active 时重试至真正启用（回读判据 OK）；无活跃通话时（supervisor
+        启动期）只试一次，ERROR 属预期，不抛异常——否则 supervisor 会误判连接
+        失败无限重试。
         """
-        response = self._send("AT+CPCMREG=1")
-        if "OK" in response:
-            logger.info("PCM-over-USB 语音通道已启用 (AT+CPCMREG=1)")
-        else:
-            logger.info("AT+CPCMREG=1 暂未生效（通常因当前无活跃通话），接通后由 per-call 重试")
+        attempts = self._CPCMREG_ENABLE_ATTEMPTS if self.is_call_connected() else 1
+        for i in range(attempts):
+            if "OK" in self._send("AT+CPCMREG=1"):
+                logger.info("PCM-over-USB 语音通道已启用 (AT+CPCMREG=1)")
+                return
+            if i < attempts - 1:
+                time.sleep(self._CPCMREG_ENABLE_RETRY_DELAY)
+        logger.info("AT+CPCMREG=1 未启用（无活跃通话属正常，接通后由 per-call 启用）")
 
     def _send_dtmf_digit(self, ch: str) -> bool:
         # SIM7600 用标准 3GPP AT+VTS；不同固件对引号宽容度不一，先无引号再回退带引号。

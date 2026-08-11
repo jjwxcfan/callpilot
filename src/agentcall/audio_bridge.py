@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import re
@@ -162,12 +163,7 @@ class SerialPcmAudioBridge:
         self._write_timeouts = 0
 
     def start(self) -> None:
-        self._ser = serial.Serial(
-            port=self.port,
-            baudrate=self.baudrate,
-            timeout=0.02,
-            write_timeout=0.2,
-        )
+        self._ser = self._open_serial()
         self._ser.reset_input_buffer()
         self._ser.reset_output_buffer()
         self._running = True
@@ -182,6 +178,30 @@ class SerialPcmAudioBridge:
             self.port,
             self.tx_gain,
         )
+
+    def _open_serial(self) -> serial.Serial:
+        """打开 PCM 数据串口；macOS 的 USB→PTY 桥不支持自定义波特率 ioctl 时回退。
+
+        SIM7600(simcom) 在 macOS 上，PCM 口是 ``sim7600_usb_pty`` 桥出来的伪终端
+        (PTY)。pyserial 为非标准波特率(如 921600)走 macOS ``IOSSIOSPEED`` ioctl，
+        PTY 不支持会抛 ``ENOTTY``；而 PTY 上波特率本无意义(字节按桥的 USB 泵速流动)。
+        故 ENOTTY 时退回标准 115200(与 AT 口同、PTY 可接受)重开。真串口(Windows/
+        Linux 的 Quectel NMEA 口)波特率有效，正常路径不触发回退。
+        """
+        try:
+            return serial.Serial(
+                port=self.port, baudrate=self.baudrate, timeout=0.02, write_timeout=0.2,
+            )
+        except OSError as exc:
+            if exc.errno != errno.ENOTTY:
+                raise
+            logger.info(
+                "PCM 口 %s 为 PTY，自定义波特率 %d 不适用(ENOTTY)，回退 115200 打开",
+                self.port, self.baudrate,
+            )
+            return serial.Serial(
+                port=self.port, baudrate=115200, timeout=0.02, write_timeout=0.2,
+            )
 
     def stop(self) -> None:
         self._running = False
