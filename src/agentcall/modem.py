@@ -165,8 +165,14 @@ def _looks_like_pdu(body: str) -> bool:
     return len(compact) >= 20 and bool(re.fullmatch(r"[0-9A-Fa-f]+", compact))
 
 
-class Eg25Modem:
-    """通过串口控制 EG25 模组：监听来电、接听、挂断、启用 UAC 音频。"""
+class SerialModem:
+    """串口 AT 模组基类：来电监听、接听、挂断、收发短信、SIM 身份等厂商无关逻辑。
+
+    接打电话/短信走标准 3GPP 指令（``ATA``/``ATD``/``AT+CLCC``/``AT+CMG*``/``AT+CIMI``）。
+    厂商专有行为以钩子方法暴露、由子类覆写：语音通道启用 ``initialize_for_voice``、
+    单个 DTMF 按键 ``_send_dtmf_digit``、语音通道关闭 ``_disable_voice_channel``、
+    带内 PCM 流控 URC 解析 ``_scan_pcm_flow``。Quectel EC20/EG25 见 ``Eg25Modem``。
+    """
 
     def __init__(self, port: str, baudrate: int = 115200) -> None:
         self.port = port
@@ -518,21 +524,8 @@ class Eg25Modem:
         return entries
 
     def initialize_for_voice(self, audio_mode: str = "uac") -> None:
-        """启用 EG25 语音 PCM 通道。"""
-        selected = audio_mode.lower()
-        # uac_ffmpeg 只是宿主侧换 ffmpeg 实现，模组侧同 UAC（AT+QPCMV=1,2）。
-        if selected in ("uac", "uac_ffmpeg"):
-            self._send('AT+QCFG="USBCFG",0x2C7C,0x0125,1,1,1,1,1,1,1')
-            self._send("AT+QPCMV=1,2")
-            logger.info("UAC 语音通道已启用 (AT+QPCMV=1,2)")
-            return
-        if selected == "nmea":
-            self._send("AT+QAUDMOD=3")
-            self._send('AT+QGPSCFG="outport","none"')
-            self._send("AT+QPCMV=1,0")
-            logger.info("NMEA PCM 语音通道已启用 (AT+QPCMV=1,0)")
-            return
-        raise ValueError("audio_mode 只能是 uac、uac_ffmpeg（仅 macOS）或 nmea")
+        """启用语音 PCM 通道（厂商钩子，子类按各自 AT 指令实现）。"""
+        raise NotImplementedError("initialize_for_voice 需由厂商子类实现")
 
     def on_ring(self, callback: Callable[[str | None], None]) -> None:
         self._on_ring = callback
@@ -657,24 +650,32 @@ class Eg25Modem:
             logger.warning("DTMF 输入无效: count=%d, result=failure", len(digits))
             return False
         for ch in digits:
-            # Quectel EC20/EG25 用 AT+QVTS（部分固件也接受 AT+VTS）。
-            response = self._send(f'AT+QVTS="{ch}"')
-            if "OK" not in response:
-                response = self._send(f'AT+VTS="{ch}"')
-            if "OK" not in response:
+            if not self._send_dtmf_digit(ch):
                 logger.warning("DTMF 发送失败: count=%d, result=failure", len(digits))
                 return False
             time.sleep(0.15)  # 位间间隔，防止连音被 IVR 吞掉
         logger.info("DTMF 发送完成: count=%d, result=success", len(digits))
         return True
 
+    def _send_dtmf_digit(self, ch: str) -> bool:
+        """发送单个 DTMF 按键（厂商钩子，子类按各自 AT 指令实现）；成功返回 True。"""
+        raise NotImplementedError("_send_dtmf_digit 需由厂商子类实现")
+
+    def _disable_voice_channel(self) -> None:
+        """挂断时关闭语音 PCM 通道（厂商钩子，子类按各自 AT 指令实现）。"""
+        raise NotImplementedError("_disable_voice_channel 需由厂商子类实现")
+
+    def _hangup_command(self) -> str:
+        """挂断用的 AT 指令（厂商钩子）；默认 ``ATH``。语音挂断不认 ATH 的模组覆写。"""
+        return "ATH"
+
     def hangup(self) -> None:
-        # 两条指令与状态清理须原子：否则 CLCC 轮询线程可能插进 ATH 与
-        # AT+QPCMV=0 之间，扰乱指令/响应配对。_pcm_ready_event.set() 只置位
+        # 挂断与关闭语音通道及状态清理须原子：否则 CLCC 轮询线程可能插进挂断与
+        # 关闭语音通道之间，扰乱指令/响应配对。_pcm_ready_event.set() 只置位
         # 不等待，持锁调用无死锁风险。
         with self._serial_lock:
-            self._send("ATH")
-            self._send("AT+QPCMV=0")
+            self._send(self._hangup_command())
+            self._disable_voice_channel()
             self._pcm_ready_event.set()
             self._call_connected_event.clear()
             self._connected_call_ids.clear()
@@ -817,21 +818,12 @@ class Eg25Modem:
     def pcm_ready(self) -> bool:
         return self._pcm_ready_event.is_set()
 
-    def _scan_qpcmv(self, text: str) -> None:
-        for match in QPCMV_PATTERN.finditer(text):
-            enable, mode = match.group(1), match.group(2)
-            # +QPCMV: 1,0 => 模组就绪可继续发送；+QPCMV: 0,0 => 模组忙需暂停。
-            if enable == "1":
-                if not self._pcm_ready_event.is_set():
-                    logger.info("模组上行就绪 (+QPCMV: %s,%s)", enable, mode)
-                self._pcm_ready_event.set()
-            elif enable == "0" and mode == "0":
-                if self._pcm_ready_event.is_set():
-                    logger.warning("模组上行忙，暂停发送 (+QPCMV: 0,0)")
-                self._pcm_ready_event.clear()
+    def _scan_pcm_flow(self, text: str) -> None:
+        """厂商带内 PCM 上行流控 URC 解析钩子；基类默认无（无带内流控的模组不覆写，
+        ``_pcm_ready_event`` 保持初始置位，``pcm_ready`` 恒为 True）。"""
 
     def _process_response_urcs(self, text: str) -> None:
-        self._scan_qpcmv(text)
+        self._scan_pcm_flow(text)
         if self._processing_response_cmti:
             return
         matches = list(CMTI_PATTERN.finditer(text))
@@ -845,7 +837,7 @@ class Eg25Modem:
             self._processing_response_cmti = False
 
     def _process_buffer(self) -> None:
-        self._scan_qpcmv(self._buffer)
+        self._scan_pcm_flow(self._buffer)
         self._process_sim_urcs()
         while True:
             clip = CLIP_PATTERN.search(self._buffer)
@@ -1125,3 +1117,128 @@ class Eg25Modem:
             except (ValueError, UnicodeDecodeError):
                 return body
         return body
+
+
+class Eg25Modem(SerialModem):
+    """Quectel EC20/EG25 变体：UAC/NMEA 语音通道、``AT+QVTS`` DTMF、``+QPCMV`` 流控。"""
+
+    def initialize_for_voice(self, audio_mode: str = "uac") -> None:
+        """启用 EG25 语音 PCM 通道。"""
+        selected = audio_mode.lower()
+        # uac_ffmpeg 只是宿主侧换 ffmpeg 实现，模组侧同 UAC（AT+QPCMV=1,2）。
+        if selected in ("uac", "uac_ffmpeg"):
+            self._send('AT+QCFG="USBCFG",0x2C7C,0x0125,1,1,1,1,1,1,1')
+            self._send("AT+QPCMV=1,2")
+            logger.info("UAC 语音通道已启用 (AT+QPCMV=1,2)")
+            return
+        if selected == "nmea":
+            self._send("AT+QAUDMOD=3")
+            self._send('AT+QGPSCFG="outport","none"')
+            self._send("AT+QPCMV=1,0")
+            logger.info("NMEA PCM 语音通道已启用 (AT+QPCMV=1,0)")
+            return
+        raise ValueError("audio_mode 只能是 uac、uac_ffmpeg（仅 macOS）或 nmea")
+
+    def _send_dtmf_digit(self, ch: str) -> bool:
+        # Quectel EC20/EG25 用 AT+QVTS（部分固件也接受 AT+VTS）。
+        response = self._send(f'AT+QVTS="{ch}"')
+        if "OK" not in response:
+            response = self._send(f'AT+VTS="{ch}"')
+        return "OK" in response
+
+    def _disable_voice_channel(self) -> None:
+        self._send("AT+QPCMV=0")
+
+    def _scan_pcm_flow(self, text: str) -> None:
+        for match in QPCMV_PATTERN.finditer(text):
+            enable, mode = match.group(1), match.group(2)
+            # +QPCMV: 1,0 => 模组就绪可继续发送；+QPCMV: 0,0 => 模组忙需暂停。
+            if enable == "1":
+                if not self._pcm_ready_event.is_set():
+                    logger.info("模组上行就绪 (+QPCMV: %s,%s)", enable, mode)
+                self._pcm_ready_event.set()
+            elif enable == "0" and mode == "0":
+                if self._pcm_ready_event.is_set():
+                    logger.warning("模组上行忙，暂停发送 (+QPCMV: 0,0)")
+                self._pcm_ready_event.clear()
+
+
+class Sim7600Modem(SerialModem):
+    """SIMCom SIM7600 变体：``AT+CPCMREG`` PCM-over-USB 语音、``AT+VTS`` DTMF。
+
+    与 Quectel 的关键差异（Phase 0 真机实测，SIM7600G/固件 SIM7600M21-A_V2.0.2）：
+
+    - **音频不走 UAC 声卡**，走 USB 接口 4 的 bulk 端点带内 PCM（8kHz/16-bit/mono）。
+      该接口由 USB→PTY 桥暴露成串口，宿主侧用 ``nmea`` 音频模式的
+      ``SerialPcmAudioBridge`` 直接读写——故 SIM7600 无需 UAC 声卡逻辑。
+    - **``AT+CPCMREG=1`` 只在通话 active 后有效**，无活跃通话时发返回 ERROR。
+      ``initialize_for_voice`` 因此不把非 OK 当致命：``_modem_supervisor`` 会在
+      连接后（无呼叫时）调一次，那次预期 ERROR，真正使能发生在每通接通后的
+      per-call 调用（见 ``call_agent`` 应答/接通之后）。
+    - **无 ``+QPCMV`` 式带内流控 URC**，继承基类 ``_scan_pcm_flow`` no-op，
+      ``pcm_ready`` 恒 True。
+    """
+
+    # 刚接通瞬间 CPCMREG=1 偶发未就绪（真机实测：同样接通，有时首发 OK、有时 ERROR）。
+    # 音频桥一旦 start() 就持续往 iface4 写 PCM，若此刻 CPCMREG 未生效、模组不排空该
+    # bulk 端点 → USB 写超时 → 整个 USB 桥被判定掉线拆桥（连 AT 口一起塌）。故通话中
+    # 必须重试到真正启用，确保写 PCM 前 iface4 已进入 PCM 模式。
+    _CPCMREG_ENABLE_ATTEMPTS = 6
+    _CPCMREG_ENABLE_RETRY_DELAY = 0.3
+
+    def initialize_for_voice(self, audio_mode: str = "nmea") -> None:
+        """使能 PCM-over-USB 语音通道（``AT+CPCMREG=1``）。
+
+        SIM7600 仅此一条 USB 音频路径，与 ``audio_mode`` 取值无关（宿主侧桥的
+        选择由 ``MODEM_AUDIO_MODE`` 单独决定，SIM7600 须用 ``nmea``）。
+
+        有界重试至启用（``OK`` 即成）——**不**依赖 ``is_call_connected``：主叫链路
+        上接通事件与本调用存在时序竞态（真机实测该标志会短暂读到 False），一旦漏判
+        就只发一次而启用失败→下行写 iface4 全超时被丢→对端听不到 AI。无活跃通话时
+        （supervisor 启动期）几次都 ERROR，属正常，不抛异常（否则 supervisor 误判连
+        接失败无限重试）；``AT+CPCMREG=1`` 返回 OK 本身即证明有活跃通话。
+        """
+        # RX 输出音量降到 2：出厂 CLVL=4 时上行 PCM 严重削波（真机 2026-08-11：
+        # peak 恒 32768、RMS ~19000，对端语音送到 provider 也识别不出），降为 2
+        # 消削波。每次调用都设，重插/换模组后仍生效；失败不致命（_send 不抛）。
+        self._send("AT+CLVL=2")
+        for i in range(self._CPCMREG_ENABLE_ATTEMPTS):
+            if "OK" in self._send("AT+CPCMREG=1"):
+                logger.info("PCM-over-USB 语音通道已启用 (AT+CPCMREG=1)")
+                return
+            if i < self._CPCMREG_ENABLE_ATTEMPTS - 1:
+                time.sleep(self._CPCMREG_ENABLE_RETRY_DELAY)
+        logger.info("AT+CPCMREG=1 未启用（无活跃通话时属正常，接通后 per-call 会再试）")
+
+    def _send_dtmf_digit(self, ch: str) -> bool:
+        # SIM7600 用标准 3GPP AT+VTS；不同固件对引号宽容度不一，先无引号再回退带引号。
+        # （DTMF 具体形态随固件差异，真机 IVR 导航时以实际响应为准复核。）
+        response = self._send(f"AT+VTS={ch}")
+        if "OK" not in response:
+            response = self._send(f'AT+VTS="{ch}"')
+        return "OK" in response
+
+    def _disable_voice_channel(self) -> None:
+        self._send("AT+CPCMREG=0")
+
+    def _hangup_command(self) -> str:
+        # SIM7600 语音通话 ATH 不可靠（真机：ATH 返回 OK 但 CLCC 仍显示 active，
+        # 电话不挂）；SIMCom 语音挂断用 AT+CHUP（挂断所有通话）。
+        return "AT+CHUP"
+
+
+def create_modem(
+    port: str, baudrate: int = 115200, vendor: str = "quectel"
+) -> SerialModem:
+    """按厂商创建 modem 实例。
+
+    支持 ``quectel``（EC20/EG25，默认）与 ``simcom``（SIM7600）。未识别的 vendor
+    回退 quectel 并告警，保证现网行为不变。
+    """
+    normalized = (vendor or "quectel").strip().lower()
+    if normalized in ("quectel", "ec20", "eg25"):
+        return Eg25Modem(port, baudrate)
+    if normalized in ("simcom", "sim7600", "sim7600g"):
+        return Sim7600Modem(port, baudrate)
+    logger.warning("MODEM_VENDOR=%r 暂未支持，回退 quectel", vendor)
+    return Eg25Modem(port, baudrate)

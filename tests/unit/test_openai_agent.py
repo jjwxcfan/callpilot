@@ -150,7 +150,11 @@ def test_start_sends_session_update_with_expected_fields(monkeypatch):
             assert session["output_modalities"] == ["audio"]
             audio = session["audio"]
             assert audio["output"]["voice"] == "alloy"
-            assert audio["input"]["turn_detection"] == {"type": "server_vad"}
+            # 默认下发注册表里的静默判停窗（OPENAI_VAD_SILENCE_MS=300，电话场景提速）。
+            assert audio["input"]["turn_detection"] == {
+                "type": "server_vad",
+                "silence_duration_ms": 300,
+            }
             assert audio["input"]["format"] == {"type": "audio/pcm", "rate": 24000}
             assert audio["output"]["format"] == {"type": "audio/pcm", "rate": 24000}
             assert audio["input"]["transcription"] == {
@@ -240,7 +244,11 @@ def test_manual_response_control_sets_create_response_false_and_debounces(monkey
         try:
             ws = instances[0]
             turn_detection = ws.sent[0]["session"]["audio"]["input"]["turn_detection"]
-            assert turn_detection == {"type": "server_vad", "create_response": False}
+            assert turn_detection == {
+                "type": "server_vad",
+                "silence_duration_ms": 300,
+                "create_response": False,
+            }
             for text in ("第一段菜单", "第二段菜单", "第三段菜单"):
                 ws.feed(
                     {
@@ -987,3 +995,124 @@ def test_factory_unknown_provider_mentions_openai():
     with pytest.raises(ValueError) as excinfo:
         factory.create_agent("gpt")
     assert "openai" in str(excinfo.value)
+
+
+# ---- barge-in：speech_started 打断 ----
+
+def test_barge_in_speech_started_cancels_and_fires_interrupt(monkeypatch):
+    """注册了打断回调时：对端开口 → 发 response.cancel（仅回复生成中）+ 触发回调。"""
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+    interrupts: list[int] = []
+    agent.set_user_interrupt_handler(lambda: interrupts.append(1))
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            ws = instances[0]
+            ws.feed({"type": "response.created", "response": {"id": "r1"}})
+            ws.feed({"type": "input_audio_buffer.speech_started"})
+            await _drain()
+            await _wait_for_sent_count(ws, "response.cancel", 1)
+            assert interrupts
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
+def test_barge_in_no_active_response_skips_cancel_but_fires_interrupt(monkeypatch):
+    """回复已结束（response.done 后）对端开口：不发 cancel（避免无谓 error），仍清积压。"""
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+    interrupts: list[int] = []
+    agent.set_user_interrupt_handler(lambda: interrupts.append(1))
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            ws = instances[0]
+            ws.feed({"type": "response.created", "response": {"id": "r1"}})
+            ws.feed({"type": "response.done", "response": {"id": "r1"}})
+            ws.feed({"type": "input_audio_buffer.speech_started"})
+            await _drain()
+            await asyncio.sleep(0.05)
+            assert "response.cancel" not in ws.sent_types()
+            assert interrupts
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
+def test_speech_started_without_handler_stays_noop(monkeypatch):
+    """未注册回调（半双工模式）：speech_started 维持原忽略行为，不发 cancel。"""
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            ws = instances[0]
+            ws.feed({"type": "response.created", "response": {"id": "r1"}})
+            ws.feed({"type": "input_audio_buffer.speech_started"})
+            await _drain()
+            await asyncio.sleep(0.05)
+            assert "response.cancel" not in ws.sent_types()
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
+def test_vad_silence_zero_omits_silence_duration(monkeypatch):
+    """OPENAI_VAD_SILENCE_MS<=0 时不下发 silence_duration_ms，用服务端默认。"""
+    monkeypatch.setenv("OPENAI_VAD_SILENCE_MS", "0")
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            ws = instances[0]
+            turn_detection = ws.sent[0]["session"]["audio"]["input"]["turn_detection"]
+            assert turn_detection == {"type": "server_vad"}
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
+def test_turn_latency_logged_between_speech_stopped_and_first_audio(monkeypatch, caplog):
+    """逐轮延迟度量：speech_stopped → 首个音频增量，打一条 latency 日志后复位。"""
+    import logging as _logging
+
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            ws = instances[0]
+            with caplog.at_level(_logging.INFO):
+                ws.feed({"type": "input_audio_buffer.speech_stopped"})
+                ws.feed(
+                    {
+                        "type": "response.output_audio.delta",
+                        "response": {"id": "r1"},
+                        "delta": base64.b64encode(b"\x00\x00").decode(),
+                    }
+                )
+                ws.feed(  # 第二个增量不应再打延迟日志
+                    {
+                        "type": "response.output_audio.delta",
+                        "response": {"id": "r1"},
+                        "delta": base64.b64encode(b"\x00\x00").decode(),
+                    }
+                )
+                await _drain()
+            assert caplog.text.count("轮次响应延迟") == 1
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())

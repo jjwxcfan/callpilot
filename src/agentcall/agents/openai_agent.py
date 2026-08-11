@@ -59,6 +59,11 @@ def _reconnect_max() -> int:
     return config.get_int("OPENAI_RECONNECT_MAX")
 
 
+def _vad_silence_ms() -> int:
+    """server_vad 静默判停窗（注册表 OPENAI_VAD_SILENCE_MS，≤0 表示用服务端默认）。"""
+    return config.get_int("OPENAI_VAD_SILENCE_MS")
+
+
 def _default_instructions() -> str:
     """无外部指令时的默认系统提示词（与 qwen_agent 的默认语义对齐）。"""
     weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
@@ -104,6 +109,13 @@ class OpenAIVoiceAgent(VoiceAgent):
         )
         self._running = False
         self._handled_tool_calls: set[str] = set()
+        # 当前是否有回复轮次在生成（response.created→True / response.done→False）。
+        # barge-in 用：对端开口时仅在生成中才发 response.cancel，避免无回复时
+        # cancel 引来一条无谓的 error 事件。
+        self._response_active = False
+        # 最近一次 VAD 判停时刻（speech_stopped），用于逐轮响应延迟度量；
+        # 首个音频增量到达时消费并置回 None。
+        self._speech_stopped_at: float | None = None
         self._instructions: str | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._manual_response_enabled = False
@@ -163,9 +175,17 @@ class OpenAIVoiceAgent(VoiceAgent):
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcm", "rate": self.input_rate},
-                    # 打断事件本轮忽略，半双工由 call_agent 统一管理。
+                    # 打断事件的消费见 _handle_event 的 speech_started 分支
+                    # （barge-in 模式），半双工模式下仍由 call_agent 统一管理。
                     "turn_detection": {
                         "type": "server_vad",
+                        # 电话场景收窄静默判停窗（OpenAI 默认 500ms），显著缩短
+                        # 「对方说完→AI 开口」的等待；0/负值=不下发用服务端默认。
+                        **(
+                            {"silence_duration_ms": _vad_silence_ms()}
+                            if _vad_silence_ms() > 0
+                            else {}
+                        ),
                         **(
                             {"create_response": False}
                             if self._manual_response_enabled
@@ -634,9 +654,18 @@ class OpenAIVoiceAgent(VoiceAgent):
             # beta 与 GA 两代事件名的下行音频增量
             delta = event.get("delta", "")
             if delta:
+                # 逐轮响应延迟（WIL-104 度量）：VAD 判停（speech_stopped，已含
+                # 静默窗）→ 本轮首个音频增量到达。到对端耳朵还要加播出+蜂窝
+                # 链路 ~0.5s（固定，不在此计）。
+                if self._speech_stopped_at is not None:
+                    latency_ms = (time.monotonic() - self._speech_stopped_at) * 1000
+                    self._speech_stopped_at = None
+                    logger.info("轮次响应延迟(判停→首音频): %.0fms", latency_ms)
                 self._audio_gate.push_audio(
                     _response_id(event), base64.b64decode(delta)
                 )
+        elif event_type == "input_audio_buffer.speech_stopped":
+            self._speech_stopped_at = time.monotonic()
         elif event_type == "conversation.item.input_audio_transcription.completed":
             transcript = (event.get("transcript") or "").strip()
             if transcript:
@@ -667,11 +696,18 @@ class OpenAIVoiceAgent(VoiceAgent):
                     self._dispatch_tool_call(name, call_id, arguments, self._ws)
                 )
         elif event_type == "response.created":
+            self._response_active = True
             self._on_response_created()
         elif event_type == "input_audio_buffer.speech_started":
-            # server_vad 的打断事件本轮忽略（半双工由 call_agent 管理）。
-            pass
+            # barge-in：对端在 AI 说话期间开口 → 掐当前生成 + 让 call_agent 清
+            # 本地未播积压（回调做），AI 立即闭嘴听对方说完。未注册回调
+            # （半双工模式，BARGE_IN_ENABLED=false）时维持原行为：事件忽略。
+            if self._on_user_interrupt is not None:
+                if self._response_active:
+                    asyncio.get_running_loop().create_task(self.cancel_response())
+                self._emit_user_interrupt()
         elif event_type == "response.done":
+            self._response_active = False
             status = (event.get("response") or {}).get("status")
             if status in ("failed", "incomplete"):
                 # 轮次异常结束（内容审核/额度/服务端错误）：连接还活着，

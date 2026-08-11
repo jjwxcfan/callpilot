@@ -16,6 +16,12 @@ from agentcall.call_agent import CallAgentService
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="EG25 来电 AI Agent 服务")
     parser.add_argument("--port", default=config.get_str("MODEM_PORT"))
+    parser.add_argument(
+        "--vendor",
+        choices=config.get_spec("MODEM_VENDOR").choices,
+        default=config.get_str("MODEM_VENDOR"),
+        help="模组厂商：quectel=EC20/EG25，simcom=SIM7600",
+    )
     parser.add_argument("--baud", type=int, default=config.get_int("MODEM_BAUD"))
     parser.add_argument(
         "--audio-keyword",
@@ -77,6 +83,7 @@ def main() -> None:
         pcm_port=args.pcm_port,
         pcm_baudrate=args.pcm_baud,
         tx_gain=args.tx_gain,
+        vendor=args.vendor,
     )
     service.run()
 

@@ -180,6 +180,11 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                         "warm", "energetic"),
                choice_labels={"": "（默认·不追加）"},
                help="https://openai.fm"),
+    # server_vad 判定「对方说完了」所需的静默时长（毫秒）。OpenAI 默认 500；
+    # 电话场景往下调可显著缩短「对方说完→AI 开口」的等待（每 100ms 立省 100ms），
+    # 代价是对方句中停顿稍长就会被抢话。真机体感 250~350 较自然。0/负值=不下发，
+    # 用 OpenAI 默认。仅 OpenAI 链路。
+    ConfigSpec("OPENAI_VAD_SILENCE_MS", "OpenAI VAD 静默判停（毫秒）", "int", "300"),
     # 端点覆写（可选）：留空即直连 api.openai.com；仅在用反代/Azure OpenAI，
     # 或所在网络无法直连 OpenAI 时才需要填。
     ConfigSpec("OPENAI_REALTIME_URL", "OpenAI Realtime 端点覆写", "str", "",
@@ -246,6 +251,11 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("LOCAL_MODELS_DIR", "三段式模型目录", "str", "",
                editable=False, hidden=True, requires_restart=True),
     ConfigSpec("MANUAL_RESPONSE_CONTROL", "手动应答控制", "bool", "false"),
+    # barge-in：对端开口即打断 AI（掐生成+清积压），代替半双工丢上行。开启前提：
+    # 模组无下行→上行回采（SIM7600 CPCMREG 实测互相关 r=0.009，干净；Quectel UAC
+    # 路线未验证，保持默认 false 走半双工）。
+    ConfigSpec("BARGE_IN_ENABLED", "对端插话打断 AI", "bool", "false",
+               requires_restart=True),
     ConfigSpec("MANUAL_RESPONSE_SILENCE_MS", "手动应答静默窗口（毫秒）", "int", "1000"),
     ConfigSpec("MANUAL_RESPONSE_MAX_WAIT_MS", "手动应答最长等待（毫秒）", "int", "8000"),
     # 文本判官本批仅实现旁观模式；enforce 不进 choices，配置写回会在边界拒绝。
@@ -253,6 +263,10 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                choices=("off", "shadow")),
     ConfigSpec("DTMF_JUDGE_MODEL", "DTMF 判官文本模型", "str", ""),
     # ---- 模组 ----
+    # 模组厂商：quectel=EC20/EG25（UAC/QPCMV 音频）；simcom=SIM7600（CPCMREG
+    # PCM-over-USB 音频，须配 MODEM_AUDIO_MODE=nmea 走串口 PCM 桥）。
+    ConfigSpec("MODEM_VENDOR", "模组厂商", "select", "quectel",
+               choices=("quectel", "simcom"), requires_restart=True),
     # 默认值按当前平台在模块加载时定死（Windows 为 auto 哨兵，连接时扫描）。
     ConfigSpec("MODEM_PORT", "模组 AT 串口", "str", platforms.default_modem_port(),
                requires_restart=True),

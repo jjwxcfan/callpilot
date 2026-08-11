@@ -25,7 +25,7 @@ from .rate_limit import acquire_sms_send_slot
 if TYPE_CHECKING:
     from .call_log import CallRecord
     from .events import EventHub
-    from .modem import Eg25Modem
+    from .modem import SerialModem
 
 DtmfSender = Callable[[str], tuple[bool, str]]
 
@@ -41,7 +41,7 @@ class CallTools:
 
     def __init__(
         self,
-        modem: "Eg25Modem",
+        modem: "SerialModem",
         *,
         hub: "EventHub | None",
         get_caller: Callable[[], str | None],

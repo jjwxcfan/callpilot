@@ -210,6 +210,7 @@ def main() -> None:
         pcm_baudrate=config.get_int("MODEM_PCM_BAUD"),
         tx_gain=config.get_float("MODEM_TX_GAIN"),
         hub=hub,
+        vendor=config.get_str("MODEM_VENDOR"),
     )
 
     # provider -> 模型显示名的注册表 key（未知 provider 回落 qwen 显示名）。

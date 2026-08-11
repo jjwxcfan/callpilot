@@ -20,6 +20,7 @@ class VoiceAgent(ABC):
     _on_transcript: "Callable[[str, str], None] | None" = None
     _on_repeat_stuck: "Callable[[str], None] | None" = None
     _on_status: "Callable[[str], None] | None" = None
+    _on_user_interrupt: "Callable[[], None] | None" = None
     _tools: "ToolRegistry | None" = None
     _session_instructions: str | None = None
 
@@ -77,6 +78,22 @@ class VoiceAgent(ABC):
     def set_status_handler(self, handler: "Callable[[str], None] | None") -> None:
         """注册面向用户的状态提示回调（如首启下载模型的进度）；多数实现无需用。"""
         self._on_status = handler
+
+    def set_user_interrupt_handler(
+        self, handler: "Callable[[], None] | None"
+    ) -> None:
+        """注册对端开口打断（barge-in）回调：provider 侧 VAD 检测到对端在 AI
+        说话期间开口时触发；调用方在回调里清掉本地未播完的下行积压，让 AI 立即
+        闭嘴。仅在 barge-in 模式（BARGE_IN_ENABLED）下由 call_agent 注册；
+        不支持打断事件的 provider 不触发即可。"""
+        self._on_user_interrupt = handler
+
+    def _emit_user_interrupt(self) -> None:
+        if self._on_user_interrupt:
+            try:
+                self._on_user_interrupt()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _emit_status(self, text: str) -> None:
         if self._on_status and text:

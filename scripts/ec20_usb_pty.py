@@ -8,6 +8,7 @@ endpoints with libusb/PyUSB and presents a pseudo terminal for pyserial.
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import logging
 import os
@@ -30,6 +31,9 @@ logger = logging.getLogger("ec20_usb_pty")
 
 VID = 0x2C7C
 PID = 0x0125
+
+# 连续写超时容忍上限：≤此值视作瞬时忙丢帧继续，超过判定设备掉线拆桥重连。
+PTY_WRITE_TIMEOUT_TOLERANCE = 3
 
 LOCK_PATH = Path("/tmp/ec20-usb-pty.lock")
 
@@ -113,9 +117,9 @@ class BridgeHandle:
             path.unlink()
 
 
-def find_device() -> usb.core.Device:
+def find_device(vid: int = VID, pid: int = PID) -> usb.core.Device:
     try:
-        dev = usb.core.find(idVendor=VID, idProduct=PID, backend=libusb_backend())
+        dev = usb.core.find(idVendor=vid, idProduct=pid, backend=libusb_backend())
     except usb.core.NoBackendError:
         # pyusb 是纯 Python 包，真正的 USB 访问依赖系统 libusb；
         # 干净的 Mac 上没有它，裸 traceback 会劝退第一次跑桥的用户。
@@ -125,7 +129,7 @@ def find_device() -> usb.core.Device:
             "               sudo apt install libusb-1.0-0   (Debian/Ubuntu)"
         ) from None
     if dev is None:
-        raise RuntimeError("未找到 Quectel EC20/EG25 USB 设备 (2c7c:0125)")
+        raise RuntimeError(f"未找到 USB 设备 ({vid:04x}:{pid:04x})")
     return dev
 
 
@@ -259,6 +263,7 @@ def bridge_port(
                     return
 
     def pty_to_usb() -> None:
+        consecutive_timeouts = 0
         while not stop.is_set():
             try:
                 ready, _, _ = select.select([master_fd], [], [], 0.1)
@@ -273,7 +278,24 @@ def bridge_port(
             if data:
                 try:
                     dev.write(port.bulk_out, data, timeout=1000)
-                except Exception as exc:  # noqa: BLE001
+                    consecutive_timeouts = 0
+                except usb.core.USBError as exc:
+                    if isinstance(exc, usb.core.USBTimeoutError) or exc.errno == errno.ETIMEDOUT:
+                        # 瞬时写超时（模组侧忙/端点暂 NAK）：丢帧继续，不因单帧超时拆桥
+                        # （否则连累同桥 AT 口，通话中掉线）。但持续超时=设备可能已掉线/
+                        # 重启，需拆桥触发外层重连，否则会永远空转丢帧连不回来。
+                        consecutive_timeouts += 1
+                        if consecutive_timeouts <= PTY_WRITE_TIMEOUT_TOLERANCE:
+                            if not stop.is_set():
+                                logger.warning("interface %d USB 写超时，丢帧继续", port.interface)
+                            continue
+                        if not stop.is_set():
+                            logger.error(
+                                "interface %d 连续写超时 %d 次，判定掉线，触发重连",
+                                port.interface, consecutive_timeouts,
+                            )
+                        stop.set()
+                        return
                     if not stop.is_set():
                         logger.error("interface %d USB write failed: %s", port.interface, exc)
                     stop.set()
@@ -295,15 +317,20 @@ def parse_map(value: str) -> tuple[int, str]:
     return iface, link
 
 
-def wait_for_device(stop: threading.Event, poll_seconds: float = 2.0) -> usb.core.Device | None:
-    """阻塞等待 EC20 出现（模组重插场景）；stop 置位时返回 None。"""
+def wait_for_device(
+    stop: threading.Event,
+    poll_seconds: float = 2.0,
+    vid: int = VID,
+    pid: int = PID,
+) -> usb.core.Device | None:
+    """阻塞等待设备出现（模组重插/通话重枚举场景）；stop 置位时返回 None。"""
     announced = False
     while not stop.is_set():
         try:
-            return find_device()
+            return find_device(vid, pid)
         except RuntimeError:
             if not announced:
-                logger.warning("未检测到 EC20 (2c7c:0125)，等待设备接入…")
+                logger.warning("未检测到 USB 设备 (%04x:%04x)，等待设备接入…", vid, pid)
                 announced = True
             stop.wait(poll_seconds)
     return None
@@ -343,10 +370,25 @@ def run_bridges_once(
         usb.util.dispose_resources(dev)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="EC20 USB vendor serial PTY bridge for macOS")
+def main(
+    default_vid: int = VID,
+    default_pid: int = PID,
+    default_maps: list[str] | None = None,
+    prog: str | None = None,
+    description: str = "EC20 USB vendor serial PTY bridge for macOS",
+    reset_on_start: bool = False,
+) -> int:
+    parser = argparse.ArgumentParser(prog=prog, description=description)
     parser.add_argument("--list", action="store_true", help="列出 USB bulk 接口后退出")
     parser.add_argument("--probe", action="store_true", help="对每个 bulk 接口发送 AT 探测后退出")
+    parser.add_argument(
+        "--vid", type=lambda s: int(s, 0), default=default_vid,
+        help=f"USB Vendor ID（默认 0x{default_vid:04x}）",
+    )
+    parser.add_argument(
+        "--pid", type=lambda s: int(s, 0), default=default_pid,
+        help=f"USB Product ID（默认 0x{default_pid:04x}）",
+    )
     parser.add_argument(
         "--map",
         action="append",
@@ -359,8 +401,17 @@ def main() -> int:
         "--once", action="store_true",
         help="桥断开（设备拔出）后直接退出，不等待重插自动重连",
     )
+    parser.add_argument(
+        "--reset-on-start", action="store_true",
+        help="首次桥接前先 dev.reset() 清除 stall 端点（SIM7600 对 USB 故障敏感，推荐开）",
+    )
     parser.add_argument("--log-file", help="同时把日志写入指定文件")
     args = parser.parse_args()
+    reset_on_start = reset_on_start or args.reset_on_start
+
+    # 未显式给 --map 时用厂商默认映射（Quectel 默认为空，仍要求显式 --map）。
+    if not args.map and default_maps:
+        args.map = [parse_map(m) for m in default_maps]
 
     handlers: list[logging.Handler] = [logging.StreamHandler()]
     if args.log_file:
@@ -374,7 +425,7 @@ def main() -> int:
     _lock = acquire_instance_lock()  # noqa: F841  # 持有到进程退出
 
     if args.list or args.probe:
-        dev = find_device()
+        dev = find_device(args.vid, args.pid)
         ports = discover_ports(dev)
         if args.list:
             for port in ports.values():
@@ -408,13 +459,16 @@ def main() -> int:
     consecutive_fast_fail = 0
     fail_threshold = int(os.environ.get("EC20_BRIDGE_FAIL_THRESHOLD", "6"))
     backoff = 1.0
+    first_run = True
     while not stop.is_set():
-        dev = wait_for_device(stop)
+        dev = wait_for_device(stop, vid=args.vid, pid=args.pid)
         if dev is None:
             break
         started_at = time.monotonic()
-        # 非首轮（重连）先复位设备，清除重枚举后的 stall 端点。
-        reset_first = consecutive_fast_fail > 0
+        # 非首轮（重连）先复位设备清 stall 端点；reset_on_start 时首轮也复位
+        # （SIM7600 对 USB 故障敏感，残留 stall 会让首次桥接直接 EIO）。
+        reset_first = consecutive_fast_fail > 0 or (first_run and reset_on_start)
+        first_run = False
         try:
             run_bridges_once(dev, args.map, stop, reset_first=reset_first)
         except (RuntimeError, usb.core.USBError) as exc:
