@@ -113,6 +113,9 @@ class OpenAIVoiceAgent(VoiceAgent):
         # barge-in 用：对端开口时仅在生成中才发 response.cancel，避免无回复时
         # cancel 引来一条无谓的 error 事件。
         self._response_active = False
+        # 最近一次 VAD 判停时刻（speech_stopped），用于逐轮响应延迟度量；
+        # 首个音频增量到达时消费并置回 None。
+        self._speech_stopped_at: float | None = None
         self._instructions: str | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._manual_response_enabled = False
@@ -651,9 +654,18 @@ class OpenAIVoiceAgent(VoiceAgent):
             # beta 与 GA 两代事件名的下行音频增量
             delta = event.get("delta", "")
             if delta:
+                # 逐轮响应延迟（WIL-104 度量）：VAD 判停（speech_stopped，已含
+                # 静默窗）→ 本轮首个音频增量到达。到对端耳朵还要加播出+蜂窝
+                # 链路 ~0.5s（固定，不在此计）。
+                if self._speech_stopped_at is not None:
+                    latency_ms = (time.monotonic() - self._speech_stopped_at) * 1000
+                    self._speech_stopped_at = None
+                    logger.info("轮次响应延迟(判停→首音频): %.0fms", latency_ms)
                 self._audio_gate.push_audio(
                     _response_id(event), base64.b64decode(delta)
                 )
+        elif event_type == "input_audio_buffer.speech_stopped":
+            self._speech_stopped_at = time.monotonic()
         elif event_type == "conversation.item.input_audio_transcription.completed":
             transcript = (event.get("transcript") or "").strip()
             if transcript:

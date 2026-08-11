@@ -1081,3 +1081,38 @@ def test_vad_silence_zero_omits_silence_duration(monkeypatch):
             await agent.stop()
 
     asyncio.run(scenario())
+
+
+def test_turn_latency_logged_between_speech_stopped_and_first_audio(monkeypatch, caplog):
+    """逐轮延迟度量：speech_stopped → 首个音频增量，打一条 latency 日志后复位。"""
+    import logging as _logging
+
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            ws = instances[0]
+            with caplog.at_level(_logging.INFO):
+                ws.feed({"type": "input_audio_buffer.speech_stopped"})
+                ws.feed(
+                    {
+                        "type": "response.output_audio.delta",
+                        "response": {"id": "r1"},
+                        "delta": base64.b64encode(b"\x00\x00").decode(),
+                    }
+                )
+                ws.feed(  # 第二个增量不应再打延迟日志
+                    {
+                        "type": "response.output_audio.delta",
+                        "response": {"id": "r1"},
+                        "delta": base64.b64encode(b"\x00\x00").decode(),
+                    }
+                )
+                await _drain()
+            assert caplog.text.count("轮次响应延迟") == 1
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
