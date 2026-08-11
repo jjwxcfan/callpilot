@@ -62,26 +62,25 @@ def test_sim7600_initialize_for_voice_enables_cpcmreg(monkeypatch, caplog):
     assert "AT+CPCMREG=1" in caplog.text
 
 
-def test_sim7600_initialize_for_voice_no_active_call_single_attempt(monkeypatch):
-    """无活跃通话时（supervisor 启动期）只试一次，ERROR 不抛（否则 supervisor 误判失败）。"""
-    modem = make_sim7600()  # 未 set _call_connected_event → 无活跃通话
+def test_sim7600_initialize_for_voice_all_error_does_not_raise(monkeypatch):
+    """全 ERROR（无活跃通话，supervisor 启动期）有界尝试后放弃、不抛（否则误判连接失败）。"""
+    modem = make_sim7600()
     sent = []
     monkeypatch.setattr(modem, "_send", lambda cmd: sent.append(cmd) or "ERROR")
     monkeypatch.setattr("agentcall.modem.time.sleep", lambda s: None)
     modem.initialize_for_voice("nmea")  # 不抛即通过
-    assert sent == ["AT+CPCMREG=1"]  # 无活跃通话不重试
+    assert sent == ["AT+CPCMREG=1"] * modem._CPCMREG_ENABLE_ATTEMPTS
 
 
-def test_sim7600_initialize_for_voice_retries_until_enabled_while_active(monkeypatch):
-    """通话中 CPCMREG=1 偶发未就绪，须重试到 OK（否则音频桥写 PCM 会拖垮 USB 桥）。"""
-    modem = make_sim7600()
-    modem._call_connected_event.set()  # 模拟通话 active
-    responses = iter(["ERROR", "ERROR", "OK"])
+def test_sim7600_initialize_for_voice_retries_until_enabled(monkeypatch):
+    """不依赖 is_call_connected（接通事件有竞态）：ERROR 时重试到 OK 即停。"""
+    modem = make_sim7600()  # 不 set 接通事件，证明启用不依赖它
+    responses = iter(["ERROR", "ERROR", "OK", "OK"])
     sent = []
     monkeypatch.setattr(modem, "_send", lambda cmd: sent.append(cmd) or next(responses))
     monkeypatch.setattr("agentcall.modem.time.sleep", lambda s: None)
     modem.initialize_for_voice("nmea")
-    assert sent == ["AT+CPCMREG=1", "AT+CPCMREG=1", "AT+CPCMREG=1"]
+    assert sent == ["AT+CPCMREG=1", "AT+CPCMREG=1", "AT+CPCMREG=1"]  # 到 OK 即停
 
 
 def test_sim7600_disable_voice_channel_sends_cpcmreg_off(monkeypatch):
@@ -119,6 +118,24 @@ def test_sim7600_pcm_ready_defaults_true():
     """SIM7600 无 +QPCMV 带内流控 URC，继承基类 no-op，pcm_ready 恒 True。"""
     modem = make_sim7600()
     assert modem.pcm_ready() is True
+
+
+def test_sim7600_hangup_uses_chup(monkeypatch):
+    """SIM7600 语音挂断用 AT+CHUP（ATH 不可靠），随后关 PCM 通道。"""
+    modem = make_sim7600()
+    sent = []
+    monkeypatch.setattr(modem, "_send", lambda cmd: sent.append(cmd) or "OK")
+    modem.hangup()
+    assert sent == ["AT+CHUP", "AT+CPCMREG=0"]
+
+
+def test_eg25_hangup_still_uses_ath(monkeypatch):
+    """回归：Quectel 挂断仍用 ATH（默认钩子不变）。"""
+    modem = make_modem()
+    sent = []
+    monkeypatch.setattr(modem, "_send", lambda cmd: sent.append(cmd) or "OK")
+    modem.hangup()
+    assert sent == ["ATH", "AT+QPCMV=0"]
 
 
 # ---- SMS PDU 解码 ----

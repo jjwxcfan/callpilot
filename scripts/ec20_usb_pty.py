@@ -8,6 +8,7 @@ endpoints with libusb/PyUSB and presents a pseudo terminal for pyserial.
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import logging
 import os
@@ -30,6 +31,9 @@ logger = logging.getLogger("ec20_usb_pty")
 
 VID = 0x2C7C
 PID = 0x0125
+
+# 连续写超时容忍上限：≤此值视作瞬时忙丢帧继续，超过判定设备掉线拆桥重连。
+PTY_WRITE_TIMEOUT_TOLERANCE = 3
 
 LOCK_PATH = Path("/tmp/ec20-usb-pty.lock")
 
@@ -259,6 +263,7 @@ def bridge_port(
                     return
 
     def pty_to_usb() -> None:
+        consecutive_timeouts = 0
         while not stop.is_set():
             try:
                 ready, _, _ = select.select([master_fd], [], [], 0.1)
@@ -273,7 +278,24 @@ def bridge_port(
             if data:
                 try:
                     dev.write(port.bulk_out, data, timeout=1000)
-                except Exception as exc:  # noqa: BLE001
+                    consecutive_timeouts = 0
+                except usb.core.USBError as exc:
+                    if isinstance(exc, usb.core.USBTimeoutError) or exc.errno == errno.ETIMEDOUT:
+                        # 瞬时写超时（模组侧忙/端点暂 NAK）：丢帧继续，不因单帧超时拆桥
+                        # （否则连累同桥 AT 口，通话中掉线）。但持续超时=设备可能已掉线/
+                        # 重启，需拆桥触发外层重连，否则会永远空转丢帧连不回来。
+                        consecutive_timeouts += 1
+                        if consecutive_timeouts <= PTY_WRITE_TIMEOUT_TOLERANCE:
+                            if not stop.is_set():
+                                logger.warning("interface %d USB 写超时，丢帧继续", port.interface)
+                            continue
+                        if not stop.is_set():
+                            logger.error(
+                                "interface %d 连续写超时 %d 次，判定掉线，触发重连",
+                                port.interface, consecutive_timeouts,
+                            )
+                        stop.set()
+                        return
                     if not stop.is_set():
                         logger.error("interface %d USB write failed: %s", port.interface, exc)
                     stop.set()

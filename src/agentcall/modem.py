@@ -665,12 +665,16 @@ class SerialModem:
         """挂断时关闭语音 PCM 通道（厂商钩子，子类按各自 AT 指令实现）。"""
         raise NotImplementedError("_disable_voice_channel 需由厂商子类实现")
 
+    def _hangup_command(self) -> str:
+        """挂断用的 AT 指令（厂商钩子）；默认 ``ATH``。语音挂断不认 ATH 的模组覆写。"""
+        return "ATH"
+
     def hangup(self) -> None:
-        # 挂断与关闭语音通道及状态清理须原子：否则 CLCC 轮询线程可能插进 ATH 与
+        # 挂断与关闭语音通道及状态清理须原子：否则 CLCC 轮询线程可能插进挂断与
         # 关闭语音通道之间，扰乱指令/响应配对。_pcm_ready_event.set() 只置位
         # 不等待，持锁调用无死锁风险。
         with self._serial_lock:
-            self._send("ATH")
+            self._send(self._hangup_command())
             self._disable_voice_channel()
             self._pcm_ready_event.set()
             self._call_connected_event.clear()
@@ -1188,18 +1192,19 @@ class Sim7600Modem(SerialModem):
         SIM7600 仅此一条 USB 音频路径，与 ``audio_mode`` 取值无关（宿主侧桥的
         选择由 ``MODEM_AUDIO_MODE`` 单独决定，SIM7600 须用 ``nmea``）。
 
-        通话 active 时重试至真正启用（回读判据 OK）；无活跃通话时（supervisor
-        启动期）只试一次，ERROR 属预期，不抛异常——否则 supervisor 会误判连接
-        失败无限重试。
+        有界重试至启用（``OK`` 即成）——**不**依赖 ``is_call_connected``：主叫链路
+        上接通事件与本调用存在时序竞态（真机实测该标志会短暂读到 False），一旦漏判
+        就只发一次而启用失败→下行写 iface4 全超时被丢→对端听不到 AI。无活跃通话时
+        （supervisor 启动期）几次都 ERROR，属正常，不抛异常（否则 supervisor 误判连
+        接失败无限重试）；``AT+CPCMREG=1`` 返回 OK 本身即证明有活跃通话。
         """
-        attempts = self._CPCMREG_ENABLE_ATTEMPTS if self.is_call_connected() else 1
-        for i in range(attempts):
+        for i in range(self._CPCMREG_ENABLE_ATTEMPTS):
             if "OK" in self._send("AT+CPCMREG=1"):
                 logger.info("PCM-over-USB 语音通道已启用 (AT+CPCMREG=1)")
                 return
-            if i < attempts - 1:
+            if i < self._CPCMREG_ENABLE_ATTEMPTS - 1:
                 time.sleep(self._CPCMREG_ENABLE_RETRY_DELAY)
-        logger.info("AT+CPCMREG=1 未启用（无活跃通话属正常，接通后由 per-call 启用）")
+        logger.info("AT+CPCMREG=1 未启用（无活跃通话时属正常，接通后 per-call 会再试）")
 
     def _send_dtmf_digit(self, ch: str) -> bool:
         # SIM7600 用标准 3GPP AT+VTS；不同固件对引号宽容度不一，先无引号再回退带引号。
@@ -1211,6 +1216,11 @@ class Sim7600Modem(SerialModem):
 
     def _disable_voice_channel(self) -> None:
         self._send("AT+CPCMREG=0")
+
+    def _hangup_command(self) -> str:
+        # SIM7600 语音通话 ATH 不可靠（真机：ATH 返回 OK 但 CLCC 仍显示 active，
+        # 电话不挂）；SIMCom 语音挂断用 AT+CHUP（挂断所有通话）。
+        return "AT+CHUP"
 
 
 def create_modem(

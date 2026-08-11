@@ -28,6 +28,12 @@ MODEM_BLOCK_MS = 20
 NMEA_READ_SIZE = 640
 NMEA_WRITE_SIZE = 1600
 NMEA_WRITE_INTERVAL_SECONDS = 0.1
+# 经串口/PTY 的带内 PCM 下行（SIM7600 CPCMREG over USB→PTY 桥）用更小的帧稳定
+# 进送：100ms 大帧会让模组播放缓冲在帧间饿死——真机实测对端听到断续（连续音变
+# “嘟嘟嘟”）、语音直接听不清。20ms 小帧≈连续喂，缓冲不饿死。仅 SerialPcmAudioBridge
+# 用，ffmpeg/UAC(Quectel) 路径仍用上面的 NMEA_WRITE_SIZE。
+SERIAL_PCM_WRITE_SIZE = 640  # 40ms @ 8kHz/16-bit mono
+SERIAL_PCM_WRITE_INTERVAL_SECONDS = 0.04
 
 
 def find_device_index(keyword: str, kind: str | None = None) -> int | None:
@@ -147,10 +153,23 @@ class ModemAudioBridge:
 class SerialPcmAudioBridge:
     """通过 EG25 USB NMEA 口传输 Voice over USB PCM。"""
 
-    def __init__(self, port: str, baudrate: int = 921600, tx_gain: float = 1.0) -> None:
+    def __init__(
+        self,
+        port: str,
+        baudrate: int = 921600,
+        tx_gain: float = 1.0,
+        write_size: int = SERIAL_PCM_WRITE_SIZE,
+        write_interval: float = SERIAL_PCM_WRITE_INTERVAL_SECONDS,
+    ) -> None:
         self.port = port
         self.baudrate = baudrate
         self.tx_gain = tx_gain
+        # 下行帧大小/节流：小帧稳定进送，避免模组播放缓冲在帧间饿死（真机调参点）。
+        self._write_size = write_size
+        self._write_interval = write_interval
+        # 上行读 carry：串口/PTY 单次 read 可能返回奇数字节（16-bit 采样被拆到两次
+        # 读），直接喂 np.frombuffer(int16) 会 ValueError 崩掉整通。留 1 字节到下次。
+        self._rx_carry = b""
         self._ready_check: "Callable[[], bool] | None" = None
         self._ser: serial.Serial | None = None
         self._tx_buffer = bytearray()
@@ -164,6 +183,7 @@ class SerialPcmAudioBridge:
 
     def start(self) -> None:
         self._ser = self._open_serial()
+        self._rx_carry = b""
         self._ser.reset_input_buffer()
         self._ser.reset_output_buffer()
         self._running = True
@@ -216,7 +236,13 @@ class SerialPcmAudioBridge:
     def read_modem_chunk(self) -> bytes:
         if not self._ser:
             return b""
-        return self._ser.read(NMEA_READ_SIZE)
+        # carry + 本次读，保证返回偶数字节（16-bit 对齐）；奇出的 1 字节留到下次。
+        data = self._rx_carry + self._ser.read(NMEA_READ_SIZE)
+        if len(data) % 2:
+            self._rx_carry = data[-1:]
+            return data[:-1]
+        self._rx_carry = b""
+        return data
 
     def pending_output_bytes(self) -> int:
         with self._tx_lock:
@@ -241,7 +267,7 @@ class SerialPcmAudioBridge:
 
     def _write_loop(self) -> None:
         next_write_at = time.monotonic()
-        silence = b"\x00" * NMEA_WRITE_SIZE
+        silence = b"\x00" * self._write_size
         while self._running:
             now = time.monotonic()
             if now < next_write_at:
@@ -250,7 +276,7 @@ class SerialPcmAudioBridge:
 
             if self._ready_check is not None and not self._ready_check():
                 # 模组上报忙 (+QPCMV:0,0)，本帧不发送，等待就绪。
-                next_write_at += NMEA_WRITE_INTERVAL_SECONDS
+                next_write_at += self._write_interval
                 continue
 
             payload = self._next_write_payload(silence)
@@ -278,18 +304,18 @@ class SerialPcmAudioBridge:
                 self._running = False
                 break
 
-            next_write_at += NMEA_WRITE_INTERVAL_SECONDS
+            next_write_at += self._write_interval
 
     def _next_write_payload(self, silence: bytes) -> bytes:
         with self._tx_lock:
-            if len(self._tx_buffer) >= NMEA_WRITE_SIZE:
-                payload = bytes(self._tx_buffer[:NMEA_WRITE_SIZE])
-                del self._tx_buffer[:NMEA_WRITE_SIZE]
+            if len(self._tx_buffer) >= self._write_size:
+                payload = bytes(self._tx_buffer[: self._write_size])
+                del self._tx_buffer[: self._write_size]
                 return payload
             if self._tx_buffer:
                 payload = bytes(self._tx_buffer)
                 self._tx_buffer.clear()
-                return payload + silence[: NMEA_WRITE_SIZE - len(payload)]
+                return payload + silence[: self._write_size - len(payload)]
         return silence
 
     def _log_write_stats(self) -> None:

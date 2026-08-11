@@ -362,3 +362,25 @@ def test_serial_pcm_open_reraises_non_enotty(monkeypatch):
     with pytest.raises(OSError) as exc:
         bridge._open_serial()
     assert exc.value.errno == errno.EACCES
+
+
+def test_serial_pcm_read_chunk_even_aligned_with_carry(monkeypatch):
+    """串口读可能返回奇数字节；read_modem_chunk 须始终返回偶数（16-bit 对齐），
+    奇出的 1 字节 carry 到下次——否则 np.frombuffer(int16) 崩掉整通。"""
+    from agentcall.audio_bridge import SerialPcmAudioBridge
+
+    bridge = SerialPcmAudioBridge("/tmp/sim7600-pcm")
+
+    class FakeSer:
+        def __init__(self):
+            self._chunks = iter([b"\x01\x02\x03", b"\x04\x05", b""])
+
+        def read(self, n):
+            return next(self._chunks, b"")
+
+    bridge._ser = FakeSer()
+    r1 = bridge.read_modem_chunk()  # 3B -> 返回 2B，carry 1B
+    r2 = bridge.read_modem_chunk()  # carry(1)+2 = 3B -> 返回 2B，carry 1B
+    assert len(r1) % 2 == 0 and len(r2) % 2 == 0
+    assert r1 == b"\x01\x02"
+    assert r2 == b"\x03\x04"  # carry 保证不丢字节、不错位
