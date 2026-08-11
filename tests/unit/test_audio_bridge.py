@@ -384,3 +384,16 @@ def test_serial_pcm_read_chunk_even_aligned_with_carry(monkeypatch):
     assert len(r1) % 2 == 0 and len(r2) % 2 == 0
     assert r1 == b"\x01\x02"
     assert r2 == b"\x03\x04"  # carry 保证不丢字节、不错位
+
+
+def test_serial_pcm_discard_pending_output_clears_backlog():
+    """barge-in 打断：一次性丢弃未播积压并返回字节数，缓冲清零。"""
+    from agentcall.audio_bridge import SerialPcmAudioBridge
+
+    bridge = SerialPcmAudioBridge("/tmp/sim7600-pcm")
+    bridge._ser = object()  # write_modem_chunks 只要求非 None
+    bridge.write_modem_chunks([b"\x00" * 3200, b"\x00" * 1600])
+    assert bridge.pending_output_bytes() == 4800
+    assert bridge.discard_pending_output() == 4800
+    assert bridge.pending_output_bytes() == 0
+    assert bridge.discard_pending_output() == 0  # 幂等

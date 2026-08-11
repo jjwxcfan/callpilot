@@ -248,6 +248,17 @@ class SerialPcmAudioBridge:
         with self._tx_lock:
             return len(self._tx_buffer)
 
+    def discard_pending_output(self) -> int:
+        """立即丢弃未播的下行积压（barge-in 打断用），返回丢弃字节数。
+
+        对端开口打断 AI 时，OpenAI 已突发投递的整段音频可能还有十几秒积压在
+        这里慢慢播；不清掉的话「打断」只是不再生成新音频，旧音频仍会播完。
+        """
+        with self._tx_lock:
+            dropped = len(self._tx_buffer)
+            self._tx_buffer.clear()
+        return dropped
+
     def set_ready_check(self, ready_check: Callable[[], bool]) -> None:
         """注入上行流控判断：返回 False 时暂停向模组写 PCM。"""
         self._ready_check = ready_check

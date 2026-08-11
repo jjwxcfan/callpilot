@@ -184,6 +184,9 @@ class CallSession:
         self._active = False
         self._active_lock = threading.Lock()
         self._outgoing_audio: Queue[bytes] = Queue()
+        # barge-in（BARGE_IN_ENABLED）：每通开始时从 config 读取；True 时上行
+        # 不做半双工丢弃、对端开口即打断 AI（见 _run_agent_loop 与打断回调）。
+        self._barge_in = False
         self._record: CallRecord | None = None
         self._summary_thread: threading.Thread | None = None
         # 延迟挂断（hangup 工具）状态：CallSession 跨通复用，上一通排下的
@@ -482,6 +485,28 @@ class CallSession:
             agent.set_tools(tools)
             if isinstance(bridge, SerialPcmAudioBridge):
                 bridge.set_ready_check(self.modem.pcm_ready)
+            self._barge_in = config.get_bool("BARGE_IN_ENABLED")
+            if self._barge_in:
+                # 对端开口（provider VAD speech_started）→ 立即丢弃本地未播积压，
+                # AI 闭嘴听对方说完。掐生成（response.cancel）由 agent 侧同事件触发。
+                def _on_user_interrupt(bridge=bridge) -> None:
+                    dropped = 0
+                    if hasattr(bridge, "discard_pending_output"):
+                        dropped = bridge.discard_pending_output()
+                    cleared = 0
+                    try:
+                        while True:
+                            self._outgoing_audio.get_nowait()
+                            cleared += 1
+                    except Empty:
+                        pass
+                    if dropped or cleared:
+                        logger.info(
+                            "对端开口打断 AI：丢弃未播积压 %d 字节 / 队列 %d 块",
+                            dropped, cleared,
+                        )
+
+                agent.set_user_interrupt_handler(_on_user_interrupt)
             bridge.start()
             mark("bridge_started")
 
@@ -833,9 +858,12 @@ class CallSession:
                 last_play_at = now
             # 半双工防回环：Agent 说话期间（含挂尾窗口）丢弃上行，
             # 避免模组把下行音频回采给千问导致自循环。
-            suppress_uplink = agent_speaking or (
-                now - last_play_at
-            ) < self._hangover_seconds
+            # barge-in 模式下不丢：上行全程送 provider，由其 VAD 触发打断
+            # （前提是模组无回采——SIM7600 CPCMREG 实测干净，见 BARGE_IN_ENABLED）。
+            suppress_uplink = not self._barge_in and (
+                agent_speaking
+                or (now - last_play_at) < self._hangover_seconds
+            )
 
             pcm_8k = bridge.read_modem_chunk()
             if self._dead_media_expired(pcm_8k, now) and not self._dead_media_reported:

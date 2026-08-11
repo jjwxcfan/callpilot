@@ -1198,6 +1198,10 @@ class Sim7600Modem(SerialModem):
         （supervisor 启动期）几次都 ERROR，属正常，不抛异常（否则 supervisor 误判连
         接失败无限重试）；``AT+CPCMREG=1`` 返回 OK 本身即证明有活跃通话。
         """
+        # RX 输出音量降到 2：出厂 CLVL=4 时上行 PCM 严重削波（真机 2026-08-11：
+        # peak 恒 32768、RMS ~19000，对端语音送到 provider 也识别不出），降为 2
+        # 消削波。每次调用都设，重插/换模组后仍生效；失败不致命（_send 不抛）。
+        self._send("AT+CLVL=2")
         for i in range(self._CPCMREG_ENABLE_ATTEMPTS):
             if "OK" in self._send("AT+CPCMREG=1"):
                 logger.info("PCM-over-USB 语音通道已启用 (AT+CPCMREG=1)")

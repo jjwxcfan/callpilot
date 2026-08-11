@@ -104,6 +104,10 @@ class OpenAIVoiceAgent(VoiceAgent):
         )
         self._running = False
         self._handled_tool_calls: set[str] = set()
+        # 当前是否有回复轮次在生成（response.created→True / response.done→False）。
+        # barge-in 用：对端开口时仅在生成中才发 response.cancel，避免无回复时
+        # cancel 引来一条无谓的 error 事件。
+        self._response_active = False
         self._instructions: str | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._manual_response_enabled = False
@@ -667,11 +671,18 @@ class OpenAIVoiceAgent(VoiceAgent):
                     self._dispatch_tool_call(name, call_id, arguments, self._ws)
                 )
         elif event_type == "response.created":
+            self._response_active = True
             self._on_response_created()
         elif event_type == "input_audio_buffer.speech_started":
-            # server_vad 的打断事件本轮忽略（半双工由 call_agent 管理）。
-            pass
+            # barge-in：对端在 AI 说话期间开口 → 掐当前生成 + 让 call_agent 清
+            # 本地未播积压（回调做），AI 立即闭嘴听对方说完。未注册回调
+            # （半双工模式，BARGE_IN_ENABLED=false）时维持原行为：事件忽略。
+            if self._on_user_interrupt is not None:
+                if self._response_active:
+                    asyncio.get_running_loop().create_task(self.cancel_response())
+                self._emit_user_interrupt()
         elif event_type == "response.done":
+            self._response_active = False
             status = (event.get("response") or {}).get("status")
             if status in ("failed", "incomplete"):
                 # 轮次异常结束（内容审核/额度/服务端错误）：连接还活着，
