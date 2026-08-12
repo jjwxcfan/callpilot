@@ -32,6 +32,8 @@ from scripts import ec20_usb_pty  # noqa: E402  # 需先补 sys.path
 
 SIM7600_VID = 0x1E0E
 SIM7600_PID = 0x9001
+# 恢复用的备用 USB 组合（切到它再切回可触发重枚举，等效物理断电重插）。
+SIM7600_ALT_PID = 0x9011
 DEFAULT_MAPS = ["2:/tmp/sim7600-at", "4:/tmp/sim7600-pcm"]
 
 
@@ -43,6 +45,9 @@ def main() -> int:
         prog="sim7600_usb_pty",
         description="SIM7600 USB vendor serial PTY bridge for macOS",
         reset_on_start=True,  # SIM7600 对 USB 故障敏感，首次桥接前先复位清 stall
+        # PCM 子系统卡死时自动切到 9011 组合再切回（真机唯一有效的软件恢复手段，
+        # CRESET/CFUN 均无效，见 WIL-109）。免去人工物理拔插。
+        recover_alt_pid=SIM7600_ALT_PID,
     )
 
 
