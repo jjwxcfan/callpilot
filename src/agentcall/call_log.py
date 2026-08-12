@@ -68,6 +68,32 @@ def _write_wav(path: Path, pcm: bytes) -> None:
         wf.writeframes(pcm[:aligned])
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """先写 .tmp 再 replace：快照专用（同 _update_content_meta 的写法）。
+
+    快照的前提就是「随时可能被重启打断」，就地覆盖等于把要抢救的证据本身
+    置于半写状态——读侧（/api/history/{id}/events）还可能读到截断的文件。
+    """
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    try:
+        temp_path.write_text(text, encoding="utf-8")
+        temp_path.replace(path)
+    except OSError:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def _atomic_write_wav(path: Path, pcm: bytes) -> None:
+    """同 _atomic_write_text：wave 先写 0 帧头再回填，就地写更容易留下坏文件。"""
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    try:
+        _write_wav(temp_path, pcm)
+        temp_path.replace(path)
+    except OSError:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
 def _write_wav_stereo(path: Path, interleaved: bytes) -> None:
     """写立体声 8kHz 16bit WAV（L/R 交错的 PCM）。"""
     frame = SAMPLE_WIDTH * 2
@@ -254,6 +280,82 @@ class CallRecord:
                 self._content_updated_at = time.time()
                 content_updated_at = self._content_updated_at
             self._update_content_meta(content_updated_at, "PENDING")
+
+    def snapshot(self, reason: str) -> None:
+        """把当前录音与事件**先落一份**到盘，不结束记录（可重复调用）。
+
+        录音在 finish() 前全在内存里（write_uplink/write_downlink 是内存追加），
+        所以「会话僵住不收尾」时整通证据都悬在进程内：2026-08-06 那通僵尸十分钟，
+        录音目录直到手动挂断前一直是空的；2026-08-12 01:29 那通同样只能手动收尾。
+        媒体死亡看门狗判死后（WIL-100）默认不挂断，会话可能再挂到
+        INBOUND_MAX_SECONDS（30 分钟）才收尾，期间任何重启都会让这通彻底消失。
+
+        判错也无害：通话继续时录音照常追加，finish() 再以完整版覆盖这几个文件。
+        """
+        with self._lock:
+            if self._finished:
+                return
+            event_lines = list(self._event_lines)
+            # 只在锁内拷贝 chunk 引用（O(n) 指针），join 放到锁外：这把锁是
+            # write_uplink/write_downlink/log_event 每 20ms 都要抢的热路径锁，
+            # 在锁内拼几十 MB 会直接卡住音频回调（本文件 __init__ 处已记过同类
+            # 教训）。finish() 敢这么做是因为通话已经结束，快照是**通话中**跑的。
+            uplink_chunks = list(self._uplink)
+            downlink_chunks = [pcm for _, pcm in self._downlink]
+            answered = self._answered
+        uplink = b"".join(uplink_chunks)
+        downlink = b"".join(downlink_chunks)
+
+        # 与 finish()/set_summary() 共用 _disk_lock，避免和最终落盘交错写同名文件。
+        with self._disk_lock:
+            # 进锁后重查 _finished：上面松开 _lock 到这里之间，finish() 可能已经
+            # 把**完整**录音写完了，此时再写就是用陈旧的半截覆盖它（events.jsonl
+            # 里的 call_finished 也会一起丢）。finish() 必定先置 _finished 再抢
+            # _disk_lock，所以这里重查即可堵死该竞态。
+            with self._lock:
+                if self._finished:
+                    return
+            try:
+                self.path.mkdir(parents=True, exist_ok=True)
+                if event_lines:
+                    _atomic_write_text(
+                        self.path / "events.jsonl", "\n".join(event_lines) + "\n"
+                    )
+                if self.recording_enabled:
+                    _atomic_write_wav(self.path / "uplink.wav", uplink)
+                    _atomic_write_wav(self.path / "downlink.wav", downlink)
+                # 没有 meta.json 的目录 list_calls 直接跳过——重启后运维在 UI 里
+                # 根本看不到这通被抢救的通话，抢救就等于白做。写一份临时的，
+                # finish() 会用最终版覆盖。
+                _atomic_write_text(
+                    self.path / "meta.json",
+                    json.dumps(
+                        {
+                            "id": self.id,
+                            "public_id": self.public_id,
+                            "direction": self.direction,
+                            "number": self.number,
+                            "started_at": self.started_at,
+                            "ended_at": None,
+                            "status": "snapshot",
+                            "answered": answered,
+                            "snapshot_reason": reason,
+                            "recording_enabled": self.recording_enabled,
+                            "uplink_bytes": len(uplink),
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                )
+            except OSError as exc:
+                logger.warning("快照通话记录 %s 失败: %s", self.id, exc)
+                return
+        logger.info(
+            "已快照通话记录 %s: reason=%s, uplink_bytes=%d",
+            self.id,
+            reason,
+            len(uplink),
+        )
 
     def finish(self, status: str) -> None:
         """结束通话：flush 录音为 wav、写 events.jsonl 与 meta.json。幂等。"""
