@@ -6,6 +6,7 @@ import logging
 import re
 import threading
 import time
+from pathlib import Path
 from queue import Queue
 from typing import Callable
 
@@ -1203,12 +1204,22 @@ class Sim7600Modem(SerialModem):
       ``pcm_ready`` 恒 True。
     """
 
+    # 劣化检测信号：健康态 AT+CPCMREG=1 一次就 OK；劣化态要重试多次（每次 _send
+    # 读超时 3s）。真机 2026-08-12 与人耳评价完全对上——好通 2~3s/1 次即成，
+    # 坏通 9~12s/多次重试，无交叉。故「启用需要重试」即判定 PCM 子系统已劣化。
+    _DEGRADED_ENABLE_ATTEMPTS = 2
+    # 通话结束后写这个哨兵文件，由 USB 桥进程读到后执行组合切换自愈（WIL-109）。
+    # 只报告不自己动手：桥才是 USB 设备的持有者。
+    RECOVERY_REQUEST_PATH = "/tmp/sim7600-recover-request"
+
     # 刚接通瞬间 CPCMREG=1 偶发未就绪（真机实测：同样接通，有时首发 OK、有时 ERROR）。
     # 音频桥一旦 start() 就持续往 iface4 写 PCM，若此刻 CPCMREG 未生效、模组不排空该
     # bulk 端点 → USB 写超时 → 整个 USB 桥被判定掉线拆桥（连 AT 口一起塌）。故通话中
     # 必须重试到真正启用，确保写 PCM 前 iface4 已进入 PCM 模式。
     _CPCMREG_ENABLE_ATTEMPTS = 6
     _CPCMREG_ENABLE_RETRY_DELAY = 0.3
+
+    _pcm_degraded = False   # 本通是否判定过劣化（通话结束时据此请求自愈）
 
     def initialize_for_voice(self, audio_mode: str = "nmea") -> None:
         """使能 PCM-over-USB 语音通道（``AT+CPCMREG=1``）。
@@ -1228,7 +1239,17 @@ class Sim7600Modem(SerialModem):
         self._send("AT+CLVL=2")
         for i in range(self._CPCMREG_ENABLE_ATTEMPTS):
             if "OK" in self._send("AT+CPCMREG=1"):
-                logger.info("PCM-over-USB 语音通道已启用 (AT+CPCMREG=1)")
+                attempts = i + 1
+                logger.info(
+                    "PCM-over-USB 语音通道已启用 (AT+CPCMREG=1，第 %d 次)", attempts
+                )
+                if attempts >= self._DEGRADED_ENABLE_ATTEMPTS:
+                    # 启用要重试 = 模组已劣化（对端会听到卡顿），标记待恢复；
+                    # 真正的恢复在通话结束时请求，绝不打断进行中的通话。
+                    self._pcm_degraded = True
+                    logger.warning(
+                        "PCM 启用重试 %d 次，判定模组已劣化，本通结束后请求自愈", attempts
+                    )
                 return
             if i < self._CPCMREG_ENABLE_ATTEMPTS - 1:
                 time.sleep(self._CPCMREG_ENABLE_RETRY_DELAY)
@@ -1244,6 +1265,24 @@ class Sim7600Modem(SerialModem):
 
     def _disable_voice_channel(self) -> None:
         self._send("AT+CPCMREG=0")
+        self._request_recovery_if_degraded()
+
+    def _request_recovery_if_degraded(self) -> None:
+        """通话结束时，若本通判定过劣化就写哨兵文件请求桥执行自愈。
+
+        写文件而非直接动手：USB 设备由桥进程持有，组合切换必须由它来做。
+        写失败不致命（下通若仍劣化会再写），绝不因此影响挂断流程。
+        """
+        if not self._pcm_degraded:
+            return
+        self._pcm_degraded = False
+        try:
+            Path(self.RECOVERY_REQUEST_PATH).write_text(
+                f"degraded at {time.time():.0f}\n", encoding="utf-8"
+            )
+            logger.warning("已请求 USB 桥执行 PCM 自愈: %s", self.RECOVERY_REQUEST_PATH)
+        except OSError as exc:
+            logger.warning("写恢复请求失败（不影响挂断）: %s", exc)
 
     def _hangup_command(self) -> str:
         # SIM7600 语音通话 ATH 不可靠（真机：ATH 返回 OK 但 CLCC 仍显示 active，

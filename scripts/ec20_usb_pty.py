@@ -476,6 +476,7 @@ def run_bridges_once(
     maps: list[tuple[int, str]],
     stop: threading.Event,
     reset_first: bool = False,
+    recovery_request: Path | None = None,
 ) -> bool:
     """建立全部桥并阻塞运行，直到 stop 置位或任一桥断开（如设备被拔出）。
 
@@ -499,9 +500,17 @@ def run_bridges_once(
                 raise RuntimeError(f"接口 {iface} 不存在，可用接口: {sorted(ports)}")
             handles.append(bridge_port(dev, ports[iface], link))
 
+        requested = False
         while not stop.is_set() and all(not handle.stop.is_set() for handle in handles):
+            # app 侧检测到「CPCMREG 启用需重试」= 模组已劣化，通话结束后写此文件请求
+            # 自愈。它覆盖「模组收数据但播放卡」这一形态——那种形态不产生写超时，
+            # 光靠桥自己发现不了（真机 2026-08-12）。
+            if recovery_request is not None and recovery_request.exists():
+                logger.warning("收到 app 的自愈请求（%s），拆桥执行组合切换", recovery_request)
+                requested = True
+                break
             time.sleep(0.2)
-        return any(handle.degraded for handle in handles)
+        return requested or any(handle.degraded for handle in handles)
     finally:
         for handle in handles:
             handle.close()
@@ -516,6 +525,7 @@ def main(
     description: str = "EC20 USB vendor serial PTY bridge for macOS",
     reset_on_start: bool = False,
     recover_alt_pid: int | None = None,
+    recovery_request_path: str | None = None,
 ) -> int:
     parser = argparse.ArgumentParser(prog=prog, description=description)
     parser.add_argument("--list", action="store_true", help="列出 USB bulk 接口后退出")
@@ -554,6 +564,11 @@ def main(
     reset_on_start = reset_on_start or args.reset_on_start
     if args.recover_alt_pid is not None:
         recover_alt_pid = args.recover_alt_pid
+    recovery_request = (
+        Path(recovery_request_path) if recovery_request_path else None
+    )
+    if recovery_request is not None:
+        recovery_request.unlink(missing_ok=True)  # 启动时清掉陈旧请求
 
     # 未显式给 --map 时用厂商默认映射（Quectel 默认为空，仍要求显式 --map）。
     if not args.map and default_maps:
@@ -617,7 +632,10 @@ def main(
         first_run = False
         degraded = False
         try:
-            degraded = run_bridges_once(dev, args.map, stop, reset_first=reset_first)
+            degraded = run_bridges_once(
+                dev, args.map, stop, reset_first=reset_first,
+                recovery_request=recovery_request,
+            )
         except (RuntimeError, usb.core.USBError) as exc:
             # USBError：设备僵死/枚举中时 set_configuration 等处会抛，
             # 不捕获会炸穿进程，launchd 每 10s 重启一次形成崩溃风暴；
@@ -632,6 +650,8 @@ def main(
         # 只有 USB 重新枚举有效（WIL-109）。此时通话已随拆桥结束，恢复不会打断通话。
         if degraded and recover_alt_pid is not None:
             usb_composition_recovery(args.vid, args.pid, recover_alt_pid)
+            if recovery_request is not None:
+                recovery_request.unlink(missing_ok=True)  # 消费掉，避免反复触发
             consecutive_fast_fail = 0
             backoff = 1.0
             continue

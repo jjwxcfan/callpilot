@@ -35,6 +35,8 @@ SIM7600_PID = 0x9001
 # 恢复用的备用 USB 组合（切到它再切回可触发重枚举，等效物理断电重插）。
 SIM7600_ALT_PID = 0x9011
 DEFAULT_MAPS = ["2:/tmp/sim7600-at", "4:/tmp/sim7600-pcm"]
+# 与 agentcall.modem.Sim7600Modem.RECOVERY_REQUEST_PATH 约定一致。
+RECOVERY_REQUEST_PATH = "/tmp/sim7600-recover-request"
 
 
 def main() -> int:
@@ -48,6 +50,8 @@ def main() -> int:
         # PCM 子系统卡死时自动切到 9011 组合再切回（真机唯一有效的软件恢复手段，
         # CRESET/CFUN 均无效，见 WIL-109）。免去人工物理拔插。
         recover_alt_pid=SIM7600_ALT_PID,
+        # app 侧检测到劣化后写此文件请求自愈（覆盖「收数据但播放卡」形态）。
+        recovery_request_path=RECOVERY_REQUEST_PATH,
     )
 
 

@@ -895,3 +895,50 @@ def test_is_connected_reflects_transport_state():
     assert modem.is_connected() is True
     modem._emit_connection_state(False)
     assert modem.is_connected() is False
+
+
+# ---- WIL-109 续：劣化检测 + 自愈请求（覆盖「收数据但播放卡」形态）----
+
+def test_sim7600_marks_degraded_when_enable_needs_retry(monkeypatch, tmp_path, caplog):
+    """CPCMREG 需重试 = 模组已劣化（真机：好通 1 次即成，坏通要重试）。"""
+    modem = make_sim7600()
+    monkeypatch.setattr(modem, "RECOVERY_REQUEST_PATH", str(tmp_path / "req"))
+    responses = iter(["OK", "ERROR", "OK"])       # CLVL、第1次失败、第2次成功
+    monkeypatch.setattr(modem, "_send", lambda cmd: next(responses))
+    monkeypatch.setattr("agentcall.modem.time.sleep", lambda s: None)
+    with caplog.at_level(logging.WARNING):
+        modem.initialize_for_voice("nmea")
+    assert modem._pcm_degraded is True
+    assert "判定模组已劣化" in caplog.text
+
+
+def test_sim7600_first_try_enable_not_degraded(monkeypatch, tmp_path):
+    """一次就 OK（健康态）不得误判劣化——否则每通都触发 ~100s 自愈。"""
+    modem = make_sim7600()
+    monkeypatch.setattr(modem, "RECOVERY_REQUEST_PATH", str(tmp_path / "req"))
+    monkeypatch.setattr(modem, "_send", lambda cmd: "OK")
+    modem.initialize_for_voice("nmea")
+    assert modem._pcm_degraded is False
+    modem._disable_voice_channel()
+    assert not (tmp_path / "req").exists()        # 健康态不写请求
+
+
+def test_sim7600_writes_recovery_request_on_hangup(monkeypatch, tmp_path):
+    """劣化通话结束时写哨兵，由桥进程读到后执行组合切换自愈。"""
+    modem = make_sim7600()
+    req = tmp_path / "req"
+    monkeypatch.setattr(modem, "RECOVERY_REQUEST_PATH", str(req))
+    monkeypatch.setattr(modem, "_send", lambda cmd: "OK")
+    modem._pcm_degraded = True
+    modem._disable_voice_channel()
+    assert req.exists()                            # 已请求自愈
+    assert modem._pcm_degraded is False             # 标志已消费，不重复请求
+
+
+def test_sim7600_recovery_request_failure_does_not_break_hangup(monkeypatch):
+    """写哨兵失败不得影响挂断流程。"""
+    modem = make_sim7600()
+    monkeypatch.setattr(modem, "RECOVERY_REQUEST_PATH", "/nonexistent-dir/req")
+    monkeypatch.setattr(modem, "_send", lambda cmd: "OK")
+    modem._pcm_degraded = True
+    modem._disable_voice_channel()                  # 不抛即通过
