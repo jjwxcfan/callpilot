@@ -961,3 +961,11 @@ def test_reconnect_non_owner_wait_is_bounded(monkeypatch):
         modem._reconnect()
     elapsed = time.monotonic() - start
     assert elapsed < 3.0, f"应有界返回，实际等了 {elapsed:.1f}s"
+
+
+def test_settle_delay_shorter_for_sim7600_than_quectel():
+    """SIM7600 自带重试，不必盲等一整秒；Quectel 维持原 1.0s 不回归（WIL-104）。"""
+    from agentcall.modem import Sim7600Modem
+
+    assert make_modem().POST_ANSWER_SETTLE_SECONDS == 1.0
+    assert Sim7600Modem("/dev/null-not-used").POST_ANSWER_SETTLE_SECONDS < 0.5

@@ -455,7 +455,11 @@ class CallSession:
             )
             mark("answered")
 
-            await asyncio.sleep(1.0)
+            # 接听后静置时长由厂商实现决定：自带重试的（SIM7600）不必盲等整秒，
+            # 首次失败立刻重试即可，健康态省约 0.8s（WIL-104）。Quectel 维持 1.0s。
+            await asyncio.sleep(
+                getattr(self.modem, "POST_ANSWER_SETTLE_SECONDS", 1.0)
+            )
 
             # 挂断流程会发 AT+QPCMV=0 关闭语音通道，每通电话都要重新启用，
             # 否则第二通开始模组无 PCM 流（双向无声）。

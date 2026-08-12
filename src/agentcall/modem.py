@@ -546,6 +546,11 @@ class SerialModem:
             entries.append((index, sender, timestamp, body))
         return entries
 
+    # 接听后到启用语音通道之间的静置时间（厂商可覆写）。历史上写死 1.0s，
+    # 来历不明（仓库重构时带入，无注释）；对自带重试的实现是纯浪费——健康态
+    # 「接听→启用」总共才 2~3s，这一秒占三分之一（WIL-104）。
+    POST_ANSWER_SETTLE_SECONDS = 1.0
+
     def initialize_for_voice(self, audio_mode: str = "uac") -> None:
         """启用语音 PCM 通道（厂商钩子，子类按各自 AT 指令实现）。"""
         raise NotImplementedError("initialize_for_voice 需由厂商子类实现")
@@ -1237,6 +1242,9 @@ class Sim7600Modem(SerialModem):
     _CPCMREG_ENABLE_RETRY_DELAY = 0.3
 
     _pcm_degraded = False   # 本通是否判定过劣化（通话结束时据此请求自愈）
+    # 本实现对 AT+CPCMREG=1 自带有界重试，模组没就绪时首次失败即刻重试即可，
+    # 不必盲等一整秒（WIL-104：健康态可省约 0.8s）。
+    POST_ANSWER_SETTLE_SECONDS = 0.2
 
     def initialize_for_voice(self, audio_mode: str = "nmea") -> None:
         """使能 PCM-over-USB 语音通道（``AT+CPCMREG=1``）。
@@ -1253,10 +1261,22 @@ class Sim7600Modem(SerialModem):
         # RX 输出音量降到 2：出厂 CLVL=4 时上行 PCM 严重削波（真机 2026-08-11：
         # peak 恒 32768、RMS ~19000，对端语音送到 provider 也识别不出），降为 2
         # 消削波。每次调用都设，重插/换模组后仍生效；失败不致命（_send 不抛）。
+        started = time.monotonic()
         self._send("AT+CLVL=2")
+        clvl_done = time.monotonic()
         for i in range(self._CPCMREG_ENABLE_ATTEMPTS):
-            if "OK" in self._send("AT+CPCMREG=1"):
+            attempt_started = time.monotonic()
+            ok = "OK" in self._send("AT+CPCMREG=1")
+            logger.info(
+                "[timing] CPCMREG 第 %d 次耗时 %.2fs -> %s",
+                i + 1, time.monotonic() - attempt_started, "OK" if ok else "ERROR",
+            )
+            if ok:
                 attempts = i + 1
+                logger.info(
+                    "[timing] 启用总耗时 %.2fs（其中 CLVL %.2fs）",
+                    time.monotonic() - started, clvl_done - started,
+                )
                 logger.info(
                     "PCM-over-USB 语音通道已启用 (AT+CPCMREG=1，第 %d 次)", attempts
                 )
