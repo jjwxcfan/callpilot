@@ -3460,7 +3460,54 @@ class CallAgentService:
                 return
             self._set_modem_connected(True)
             logger.info("模组已连接，等待来电…")
+            self._watch_modem_link()
             return
+
+    # 断连超过该秒数仍未自愈，就由 supervisor 重新走一遍连接流程。
+    _LINK_WATCHDOG_SECONDS = 45.0
+    _LINK_WATCHDOG_POLL = 5.0
+
+    def _watch_modem_link(self) -> None:
+        """连接看门狗：模组长时间断开就重新建连（不依赖 modem 内部重连线程活着）。
+
+        真机事故（2026-08-12，WIL-110）：USB 桥执行 PCM 卡死自愈期间串口消失约
+        100 秒，桥恢复后 app 的重连线程已因异常穿透而死亡，进程活着却永远连不
+        回来——来电全部无人接听，只能手工重启服务。modem 侧的异常穿透已修，但
+        这里再加一道与线程状态无关的兜底：只要「断开持续够久」就重建连接
+        （``start_listener`` 对已存活的线程是幂等的，不会重复起线程）。
+        """
+        # 鸭子类型的 modem（测试替身/旧实现）可能没有 is_connected，
+        # 那就没有可看护的信号，直接退出而不是让看门狗线程抛异常死掉。
+        is_connected = getattr(self.modem, "is_connected", None)
+        if not callable(is_connected):
+            return
+        disconnected_since: float | None = None
+        while self._service_running:
+            time.sleep(self._LINK_WATCHDOG_POLL)
+            if not self._service_running:
+                return
+            if is_connected():
+                disconnected_since = None
+                continue
+            now = time.monotonic()
+            if disconnected_since is None:
+                disconnected_since = now
+                continue
+            if now - disconnected_since < self._LINK_WATCHDOG_SECONDS:
+                continue
+            logger.warning(
+                "模组已断开超过 %.0fs，看门狗重建连接", self._LINK_WATCHDOG_SECONDS
+            )
+            disconnected_since = None
+            try:
+                self.modem.connect()
+                self.modem.initialize_for_voice(self.audio_mode)
+                self.modem.start_listener()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("看门狗重建连接失败，稍后再试: %s", exc)
+                continue
+            self._set_modem_connected(True)
+            logger.info("看门狗已恢复模组连接，等待来电…")
 
     def _set_modem_connected(self, connected: bool, error: str | None = None) -> None:
         """更新模组连接状态并广播给 UI（仅状态翻转时发事件，避免重连期刷屏）。"""

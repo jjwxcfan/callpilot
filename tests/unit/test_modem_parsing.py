@@ -838,3 +838,60 @@ def test_dump_stored_sms_keeps_sim_when_delete_disabled(monkeypatch):
     modem._dump_stored_sms()
 
     assert not any(c.startswith("AT+CMGD") for c in sent)
+
+
+# ---- WIL-110：长断连后必须能自愈（桥自愈了服务也要回来）----
+
+def test_reconnect_retries_on_runtime_error(monkeypatch):
+    """_open_serial 抛 RuntimeError（_send 在 _opening 期上抛）时必须退避重试，
+    不能穿透打死调用方线程——真机曾因此在桥恢复后永远连不回来。"""
+    modem = make_modem()
+    modem._running = True
+    attempts = []
+
+    def flaky_open():
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise RuntimeError("模组未连接")   # 早先会穿透 except 子句
+
+    monkeypatch.setattr(modem, "_open_serial", flaky_open)
+    monkeypatch.setattr("agentcall.modem.time.sleep", lambda s: None)
+    modem._reconnect()                          # 不抛即通过
+    assert len(attempts) == 3                   # 前两次失败后仍继续重试
+
+
+def test_read_loop_survives_reconnect_exception(monkeypatch):
+    """读线程是来电感知命脉：重连里抛任何异常都不许让它退出。"""
+    modem = make_modem()
+    modem._running = True
+    calls = {"reconnect": 0}
+
+    class _DeadSerial:
+        is_open = True
+        in_waiting = 0
+
+        def read(self, _n):
+            raise serial.SerialException("串口未打开")
+
+    modem._ser = _DeadSerial()
+
+    def boom():
+        calls["reconnect"] += 1
+        if calls["reconnect"] >= 3:
+            modem._running = False              # third round ends the loop
+        raise RuntimeError("模组未连接")
+
+    monkeypatch.setattr(modem, "_reconnect", boom)
+    monkeypatch.setattr("agentcall.modem.time.sleep", lambda s: None)
+    modem._read_loop()                          # 不抛、能正常退出即通过
+    assert calls["reconnect"] == 3              # 异常后继续重试而非死掉
+
+
+def test_is_connected_reflects_transport_state():
+    """看门狗据此判断是否需要重建连接。"""
+    modem = make_modem()
+    assert modem.is_connected() is False
+    modem._emit_connection_state(True)
+    assert modem.is_connected() is True
+    modem._emit_connection_state(False)
+    assert modem.is_connected() is False

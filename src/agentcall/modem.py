@@ -424,7 +424,12 @@ class SerialModem:
                     self._emit_current_sim_identity()
                     logger.info("串口已重连: %s", self._active_port)
                     return
-                except (serial.SerialException, OSError) as exc:
+                # 捕全部异常而不只是 (SerialException, OSError)：_open_serial 内部的
+                # _send 在 _opening=True 时会上抛 RuntimeError("模组未连接")，早先它
+                # 会穿透这里、打死调用方线程（真机 2026-08-12：读线程死亡后桥虽已自愈，
+                # app 却永远连不回来，来电无人接听，见 WIL-110）。重连必须是「只要没被
+                # 停止就一直退避重试」。
+                except Exception as exc:  # noqa: BLE001
                     with self._serial_lock:
                         try:
                             if self._ser and self._ser.is_open:
@@ -807,13 +812,32 @@ class SerialModem:
                 if not self._running:
                     break
                 logger.warning("串口读取失败，尝试重连: %s", exc)
-                self._reconnect()
+                try:
+                    self._reconnect()
+                except Exception as reconnect_exc:  # noqa: BLE001
+                    # 读线程是来电感知的命脉：它一死，模组即便恢复也再没人读 URC，
+                    # 电话打进来无人接听（WIL-110）。任何意外都不许让它退出。
+                    logger.error(
+                        "重连过程异常，读线程继续重试: %s", reconnect_exc
+                    )
+                    time.sleep(1.0)
+                continue
+            except Exception as exc:  # noqa: BLE001
+                if not self._running:
+                    break
+                logger.error("读线程意外异常，继续运行: %s", exc)
+                time.sleep(1.0)
                 continue
             if not raw:
                 continue
             text = raw.decode("ascii", errors="ignore")
             self._buffer += text
             self._process_buffer()
+
+    def is_connected(self) -> bool:
+        """串口传输当前是否在线（供上层看门狗判断是否需要重建连接）。"""
+        with self._connection_state_lock:
+            return self._connection_online
 
     def pcm_ready(self) -> bool:
         return self._pcm_ready_event.is_set()
