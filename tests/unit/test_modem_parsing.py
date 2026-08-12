@@ -58,8 +58,8 @@ def test_sim7600_initialize_for_voice_enables_cpcmreg(monkeypatch, caplog):
     monkeypatch.setattr(modem, "_send", lambda cmd: sent.append(cmd) or "OK")
     with caplog.at_level(logging.INFO):
         modem.initialize_for_voice("nmea")
-    # 先降 RX 音量消上行削波（CLVL=2），再使能 PCM 通道。
-    assert sent == ["AT+CLVL=2", "AT+CPCMREG=1"]
+    # 不再发 AT+CLVL（治的是不存在的削波，且每通白花 2.3s，见 WIL-104）。
+    assert sent == ["AT+CPCMREG=1"]
     assert "AT+CPCMREG=1" in caplog.text
 
 
@@ -70,18 +70,18 @@ def test_sim7600_initialize_for_voice_all_error_does_not_raise(monkeypatch):
     monkeypatch.setattr(modem, "_send", lambda cmd: sent.append(cmd) or "ERROR")
     monkeypatch.setattr("agentcall.modem.time.sleep", lambda s: None)
     modem.initialize_for_voice("nmea")  # 不抛即通过
-    assert sent == ["AT+CLVL=2"] + ["AT+CPCMREG=1"] * modem._CPCMREG_ENABLE_ATTEMPTS
+    assert sent == ["AT+CPCMREG=1"] * modem._CPCMREG_ENABLE_ATTEMPTS
 
 
 def test_sim7600_initialize_for_voice_retries_until_enabled(monkeypatch):
     """不依赖 is_call_connected（接通事件有竞态）：ERROR 时重试到 OK 即停。"""
     modem = make_sim7600()  # 不 set 接通事件，证明启用不依赖它
-    responses = iter(["OK", "ERROR", "ERROR", "OK", "OK"])  # 首个 OK 归 CLVL
+    responses = iter(["ERROR", "ERROR", "OK", "OK"])
     sent = []
     monkeypatch.setattr(modem, "_send", lambda cmd: sent.append(cmd) or next(responses))
     monkeypatch.setattr("agentcall.modem.time.sleep", lambda s: None)
     modem.initialize_for_voice("nmea")
-    assert sent == ["AT+CLVL=2", "AT+CPCMREG=1", "AT+CPCMREG=1", "AT+CPCMREG=1"]  # 到 OK 即停
+    assert sent == ["AT+CPCMREG=1"] * 3  # 到 OK 即停
 
 
 def test_sim7600_disable_voice_channel_sends_cpcmreg_off(monkeypatch):
@@ -903,7 +903,7 @@ def test_sim7600_marks_degraded_when_enable_needs_retry(monkeypatch, tmp_path, c
     """CPCMREG 需重试 = 模组已劣化（真机：好通 1 次即成，坏通要重试）。"""
     modem = make_sim7600()
     monkeypatch.setattr(modem, "RECOVERY_REQUEST_PATH", str(tmp_path / "req"))
-    responses = iter(["OK", "ERROR", "OK"])       # CLVL、第1次失败、第2次成功
+    responses = iter(["ERROR", "OK"])            # 第1次失败、第2次成功
     monkeypatch.setattr(modem, "_send", lambda cmd: next(responses))
     monkeypatch.setattr("agentcall.modem.time.sleep", lambda s: None)
     with caplog.at_level(logging.WARNING):

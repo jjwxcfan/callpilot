@@ -1258,12 +1258,10 @@ class Sim7600Modem(SerialModem):
         （supervisor 启动期）几次都 ERROR，属正常，不抛异常（否则 supervisor 误判连
         接失败无限重试）；``AT+CPCMREG=1`` 返回 OK 本身即证明有活跃通话。
         """
-        # RX 输出音量降到 2：出厂 CLVL=4 时上行 PCM 严重削波（真机 2026-08-11：
-        # peak 恒 32768、RMS ~19000，对端语音送到 provider 也识别不出），降为 2
-        # 消削波。每次调用都设，重插/换模组后仍生效；失败不致命（_send 不抛）。
+        # 曾在此发 AT+CLVL=2「消上行削波」——后证实削波是主机侧字节错位（已在
+        # audio_bridge 修复），与音量无关；而实测这条指令本身要花 **2.3 秒**，
+        # 占「接听→启用」总耗时的 83%（WIL-104）。治的是不存在的病，故移除。
         started = time.monotonic()
-        self._send("AT+CLVL=2")
-        clvl_done = time.monotonic()
         for i in range(self._CPCMREG_ENABLE_ATTEMPTS):
             attempt_started = time.monotonic()
             ok = "OK" in self._send("AT+CPCMREG=1")
@@ -1274,8 +1272,7 @@ class Sim7600Modem(SerialModem):
             if ok:
                 attempts = i + 1
                 logger.info(
-                    "[timing] 启用总耗时 %.2fs（其中 CLVL %.2fs）",
-                    time.monotonic() - started, clvl_done - started,
+                    "[timing] 启用总耗时 %.2fs", time.monotonic() - started
                 )
                 logger.info(
                     "PCM-over-USB 语音通道已启用 (AT+CPCMREG=1，第 %d 次)", attempts
