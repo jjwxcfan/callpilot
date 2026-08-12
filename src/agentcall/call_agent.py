@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from queue import Empty, Full, Queue
 from typing import Callable
 
-from . import config
+from . import config, platforms
 from .agents.base import VoiceAgent
 from .agents.factory import create_agent
 from .agents.tools import REQUEST_OWNER_TAKEOVER_SPEC, ToolRegistry
@@ -3466,6 +3466,54 @@ class CallAgentService:
     # 断连超过该秒数仍未自愈，就由 supervisor 重新走一遍连接流程。
     _LINK_WATCHDOG_SECONDS = 45.0
     _LINK_WATCHDOG_POLL = 5.0
+    # 单轮重建的时限：connect() 会跑整套初始化（SMS/SIM 查询），正常几秒内完成。
+    # 真机 2026-08-12 出现过 connect() 5 分钟不返回（WIL-111），故必须有界——
+    # 超时就放弃本轮、下轮再试，绝不让看门狗线程被挂死而失去看护能力。
+    _LINK_RECONNECT_TIMEOUT = 30.0
+
+    def _modem_port_ready(self) -> bool:
+        """串口是否已存在。
+
+        macOS 上串口是 USB 桥建出来的 PTY symlink；桥执行 PCM 自愈期间会删掉它、
+        约一分半后重建。此时去 connect 注定失败，还可能卡在半开状态（WIL-111），
+        故先看文件在不在，不在就安静等下一轮。``auto`` 哨兵交给探测逻辑，不预判。
+        """
+        port = getattr(self.modem, "port", "")
+        if not port or port == platforms.AUTO_PORT:
+            return True
+        return os.path.exists(port)
+
+    def _reconnect_modem_bounded(self) -> bool:
+        """在时限内重建模组连接；超时返回 False（本轮放弃，下轮再试）。
+
+        connect() 可能因串口/锁竞争长时间阻塞，直接在看门狗线程里调用会把看门狗
+        本身挂死。放到独立线程并 join(timeout)：即便它卡住，看门狗仍能继续巡检。
+        """
+        result: dict[str, BaseException | None] = {"error": None}
+
+        def _do() -> None:
+            try:
+                self.modem.connect()
+                self.modem.initialize_for_voice(self.audio_mode)
+                self.modem.start_listener()
+            except BaseException as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        worker = threading.Thread(
+            target=_do, name="modem-watchdog-reconnect", daemon=True
+        )
+        worker.start()
+        worker.join(timeout=self._LINK_RECONNECT_TIMEOUT)
+        if worker.is_alive():
+            logger.warning(
+                "看门狗重建连接超过 %.0fs 未完成，本轮放弃（下轮再试）",
+                self._LINK_RECONNECT_TIMEOUT,
+            )
+            return False
+        if result["error"] is not None:
+            logger.warning("看门狗重建连接失败，稍后再试: %s", result["error"])
+            return False
+        return True
 
     def _watch_modem_link(self) -> None:
         """连接看门狗：模组长时间断开就重新建连（不依赖 modem 内部重连线程活着）。
@@ -3495,16 +3543,15 @@ class CallAgentService:
                 continue
             if now - disconnected_since < self._LINK_WATCHDOG_SECONDS:
                 continue
+            if not self._modem_port_ready():
+                # 桥多半正在做 PCM 自愈（串口被删、约 1 分半后重建）：安静等它建好，
+                # 不把计时清零，端口一回来立刻重连。
+                continue
             logger.warning(
                 "模组已断开超过 %.0fs，看门狗重建连接", self._LINK_WATCHDOG_SECONDS
             )
             disconnected_since = None
-            try:
-                self.modem.connect()
-                self.modem.initialize_for_voice(self.audio_mode)
-                self.modem.start_listener()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("看门狗重建连接失败，稍后再试: %s", exc)
+            if not self._reconnect_modem_bounded():
                 continue
             self._set_modem_connected(True)
             logger.info("看门狗已恢复模组连接，等待来电…")
