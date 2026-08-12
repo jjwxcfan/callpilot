@@ -397,3 +397,69 @@ def test_serial_pcm_discard_pending_output_clears_backlog():
     assert bridge.discard_pending_output() == 4800
     assert bridge.pending_output_bytes() == 0
     assert bridge.discard_pending_output() == 0  # 幂等
+
+
+# ---- 上行字节对齐自愈（真机 2026-08-12：整条上行恒偏移 1 字节）----
+
+def _speech_like(n=20000, seed=7):
+    """造一段相邻样本高度相关的「语音状」信号（真实语音 r>0.8）。"""
+    rng = np.random.default_rng(seed)
+    x = np.cumsum(rng.normal(0, 300, n))
+    x = np.clip(x - np.convolve(x, np.ones(50) / 50, mode="same"), -8000, 8000)
+    return (x * 3).astype(np.int16).tobytes()
+
+
+def _feed(bridge, payload, chunk=640):
+    out = bytearray()
+
+    class _S:
+        def __init__(self, data):
+            self.data = data
+            self.i = 0
+
+        def read(self, n):
+            piece = self.data[self.i:self.i + n]
+            self.i += len(piece)
+            return piece
+
+    bridge._ser = _S(payload)
+    for _ in range(len(payload) // chunk + 2):
+        out += bridge.read_modem_chunk()
+    return bytes(out)
+
+
+def test_uplink_alignment_corrects_one_byte_offset():
+    """流首多出 1 字节导致高低字节颠倒时，桥应自动丢 1 字节回到采样边界。"""
+    from agentcall.audio_bridge import SerialPcmAudioBridge
+
+    good = _speech_like()
+    bridge = SerialPcmAudioBridge("/tmp/x")
+    bridge._rx_carry = b""
+    got = _feed(bridge, b"\x00" + good)      # 人为错位 1 字节
+    assert bridge._align_locked
+    tail = np.frombuffer(got[-16000:], dtype=np.int16).astype(float)
+    r = float(np.corrcoef(tail[:-1], tail[1:])[0, 1])
+    assert r > 0.8, f"纠正后应恢复语音相关性，实际 {r}"
+
+
+def test_uplink_alignment_leaves_correct_stream_untouched():
+    """本来就对齐的流不得被误改（否则反而把好数据弄坏）。"""
+    from agentcall.audio_bridge import SerialPcmAudioBridge
+
+    good = _speech_like()
+    bridge = SerialPcmAudioBridge("/tmp/x")
+    bridge._rx_carry = b""
+    got = _feed(bridge, good)
+    assert bridge._align_locked
+    assert bridge._align_drop is False
+    assert got[:200] == good[:200], "对齐正常时不应丢字节"
+
+
+def test_uplink_alignment_waits_while_silent():
+    """静音期不下判定（避免拿静音瞎判导致误纠正）。"""
+    from agentcall.audio_bridge import SerialPcmAudioBridge
+
+    bridge = SerialPcmAudioBridge("/tmp/x")
+    bridge._rx_carry = b""
+    _feed(bridge, b"\x00" * 40000)
+    assert bridge._align_locked is False

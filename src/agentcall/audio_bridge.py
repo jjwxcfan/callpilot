@@ -33,6 +33,10 @@ NMEA_WRITE_INTERVAL_SECONDS = 0.1
 # “嘟嘟嘟”）、语音直接听不清。20ms 小帧≈连续喂，缓冲不饿死。仅 SerialPcmAudioBridge
 # 用，ffmpeg/UAC(Quectel) 路径仍用上面的 NMEA_WRITE_SIZE。
 SERIAL_PCM_WRITE_SIZE = 640  # 40ms @ 8kHz/16-bit mono
+# 上行对齐自检参数：攒够 ~1s 且有明显声音才判定，避免拿静音瞎判。
+_ALIGN_PROBE_BYTES = 16000      # ~1s @ 8kHz/16-bit
+_ALIGN_MIN_PEAK = 800           # 低于此峰值视为静音，继续攒
+_ALIGN_MARGIN = 0.15            # 偏移1 需明显优于对齐0 才纠正
 SERIAL_PCM_WRITE_INTERVAL_SECONDS = 0.04
 
 
@@ -170,6 +174,13 @@ class SerialPcmAudioBridge:
         # 上行读 carry：串口/PTY 单次 read 可能返回奇数字节（16-bit 采样被拆到两次
         # 读），直接喂 np.frombuffer(int16) 会 ValueError 崩掉整通。留 1 字节到下次。
         self._rx_carry = b""
+        # 上行字节对齐自愈：carry 只保证「相对流首」的一致，保证不了流首本身是否
+        # 落在采样边界上。真机实测（2026-08-12）整条上行恒定偏移 1 字节——高低字节
+        # 颠倒后正常语音变成振幅顶满的垃圾：VAD 以为有人说话、ASR 一个字认不出，
+        # 长期被误判成「模组上行削波」。这里用相邻样本相关性判定真实对齐并一次性纠正。
+        self._align_locked = False
+        self._align_drop = False
+        self._align_probe = bytearray()
         self._ready_check: "Callable[[], bool] | None" = None
         self._ser: serial.Serial | None = None
         self._tx_buffer = bytearray()
@@ -184,6 +195,9 @@ class SerialPcmAudioBridge:
     def start(self) -> None:
         self._ser = self._open_serial()
         self._rx_carry = b""
+        self._align_locked = False
+        self._align_drop = False
+        self._align_probe.clear()
         self._ser.reset_input_buffer()
         self._ser.reset_output_buffer()
         self._running = True
@@ -238,11 +252,48 @@ class SerialPcmAudioBridge:
             return b""
         # carry + 本次读，保证返回偶数字节（16-bit 对齐）；奇出的 1 字节留到下次。
         data = self._rx_carry + self._ser.read(NMEA_READ_SIZE)
+        if self._align_drop and data:
+            # 判定为错位：丢 1 字节把整条流拨回采样边界（此后 carry 维持新对齐）。
+            data = data[1:]
+            self._align_drop = False
         if len(data) % 2:
             self._rx_carry = data[-1:]
-            return data[:-1]
-        self._rx_carry = b""
+            data = data[:-1]
+        else:
+            self._rx_carry = b""
+        if not self._align_locked:
+            self._probe_alignment(data)
         return data
+
+    def _probe_alignment(self, data: bytes) -> None:
+        """用相邻样本相关性判断上行是否整体错位 1 字节，判定后锁定不再改。
+
+        真实语音相邻样本高度相关（r>0.8）；错位后高低字节颠倒，相关性趋近 0。
+        只在攒够足够「有声」样本后判定，避免拿静音段瞎判。
+        """
+        self._align_probe.extend(data)
+        if len(self._align_probe) < _ALIGN_PROBE_BYTES:
+            return
+        probe = bytes(self._align_probe)
+        self._align_probe.clear()
+        scores = []
+        for offset in (0, 1):
+            chunk = probe[offset: offset + (len(probe) - offset) // 2 * 2]
+            samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
+            if samples.size < 1000 or np.max(np.abs(samples)) < _ALIGN_MIN_PEAK:
+                return  # 太安静，判不准，继续攒
+            scores.append(float(np.corrcoef(samples[:-1], samples[1:])[0, 1]))
+        self._align_locked = True
+        if scores[1] > scores[0] + _ALIGN_MARGIN:
+            self._align_drop = True
+            logger.warning(
+                "上行字节错位已纠正：偏移1 相关性 %.3f > 对齐0 %.3f（丢 1 字节回到采样边界）",
+                scores[1], scores[0],
+            )
+        else:
+            logger.info(
+                "上行字节对齐正常（对齐0 相关性 %.3f，偏移1 %.3f）", scores[0], scores[1]
+            )
 
     def pending_output_bytes(self) -> int:
         with self._tx_lock:
