@@ -251,6 +251,10 @@ class SerialModem:
         """
         return self._send(command)
 
+    # 非 owner 等待他方重连的上限。必须有界：调用方可能持有 _serial_lock，
+    # 而重连方需要该锁，无限等待会死锁（WIL-111 真机实证）。
+    _RECONNECT_WAIT_TIMEOUT = 8.0
+
     # SIM 上电后 CIMI 可能短暂 ERROR(卡未 ready);重试覆盖上电延迟。
     _SIM_READ_RETRIES = 3
     _SIM_READ_RETRY_DELAY = 1.0
@@ -408,8 +412,21 @@ class SerialModem:
                     owner = True
 
         if not owner:
+            # 等别人重连完成，但**必须有界**：调用方可能正持有 _serial_lock（如
+            # hangup() 为保证挂断原子性持锁，锁内 _send 失败后走到这里），而真正的
+            # 重连方需要这把锁才能开串口——无限等待即形成循环等待死锁。真机
+            # 2026-08-12（WIL-111）用 faulthandler 抓到：挂断线程持锁等重连、
+            # 读线程等锁开串口，全部线程僵死，进程活着却再也接不了电话。
+            # 超时返回后本次 _send 会失败上抛，由调用方各自的重试路径兜底。
+            deadline = time.monotonic() + self._RECONNECT_WAIT_TIMEOUT
             while self._running and not self._closed:
                 if self._reconnect_complete.wait(timeout=0.2):
+                    return
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "等待他方重连超过 %.0fs，本次放弃（避免持锁死等）",
+                        self._RECONNECT_WAIT_TIMEOUT,
+                    )
                     return
             return
 

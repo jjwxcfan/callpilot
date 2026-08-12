@@ -942,3 +942,22 @@ def test_sim7600_recovery_request_failure_does_not_break_hangup(monkeypatch):
     monkeypatch.setattr(modem, "_send", lambda cmd: "OK")
     modem._pcm_degraded = True
     modem._disable_voice_channel()                  # 不抛即通过
+
+
+def test_reconnect_non_owner_wait_is_bounded(monkeypatch):
+    """非 owner 等待必须有界：调用方可能持有 _serial_lock，无限等会死锁（WIL-111）。
+
+    真机死锁形态：hangup() 持 _serial_lock → 锁内 _send 失败 → _reconnect 作为
+    非 owner 无限等；而 owner 需要同一把锁开串口 → 循环等待，全线程僵死。
+    """
+    modem = make_modem()
+    modem._running = True
+    modem._reconnect_in_progress = True      # 假装别人正在重连
+    modem._reconnect_complete.clear()        # 且永不完成
+    monkeypatch.setattr(modem, "_RECONNECT_WAIT_TIMEOUT", 0.3)
+
+    start = time.monotonic()
+    with modem._serial_lock:                 # 模拟持锁调用（hangup 的形态）
+        modem._reconnect()
+    elapsed = time.monotonic() - start
+    assert elapsed < 3.0, f"应有界返回，实际等了 {elapsed:.1f}s"
