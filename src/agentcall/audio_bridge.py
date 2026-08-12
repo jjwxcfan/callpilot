@@ -32,12 +32,16 @@ NMEA_WRITE_INTERVAL_SECONDS = 0.1
 # 进送：100ms 大帧会让模组播放缓冲在帧间饿死——真机实测对端听到断续（连续音变
 # “嘟嘟嘟”）、语音直接听不清。20ms 小帧≈连续喂，缓冲不饿死。仅 SerialPcmAudioBridge
 # 用，ffmpeg/UAC(Quectel) 路径仍用上面的 NMEA_WRITE_SIZE。
-SERIAL_PCM_WRITE_SIZE = 640  # 40ms @ 8kHz/16-bit mono
+# 下行帧大小对齐 USB bulk 最大包（512B）：桥每次从 PTY 最多读 max_packet=512，
+# 若按 640B/帧写，每帧会被拆成 512+128 两个 USB 包，而 128B 是**短包**——USB 语义
+# 上表示「一次传输结束」，模组音频缓冲会据此做帧边界处理，每 40ms 一次 → 真机表现
+# 为「每个字都卡」。写成 512B/32ms 即每帧恰好一个满包，不产生短包。
+SERIAL_PCM_WRITE_SIZE = 512  # 32ms @ 8kHz/16-bit mono，= USB bulk 满包
 # 上行对齐自检参数：攒够 ~1s 且有明显声音才判定，避免拿静音瞎判。
 _ALIGN_PROBE_BYTES = 16000      # ~1s @ 8kHz/16-bit
 _ALIGN_MIN_PEAK = 800           # 低于此峰值视为静音，继续攒
 _ALIGN_MARGIN = 0.15            # 偏移1 需明显优于对齐0 才纠正
-SERIAL_PCM_WRITE_INTERVAL_SECONDS = 0.04
+SERIAL_PCM_WRITE_INTERVAL_SECONDS = 0.032   # 512B @ 8kHz/16-bit = 32ms 实时
 
 
 def find_device_index(keyword: str, kind: str | None = None) -> int | None:
