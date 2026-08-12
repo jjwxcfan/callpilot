@@ -200,6 +200,12 @@ class OpenAIVoiceAgent(VoiceAgent):
                 },
             },
         }
+        max_tokens = config.get_int("OPENAI_MAX_RESPONSE_TOKENS")
+        if max_tokens > 0:
+            # 从源头限长，比本地丢下行更干净：转写与对端听到的一致，不会出现
+            # 「日志里说了 4 句、对端只听到 2 句」（WIL-112）。
+            session["max_response_output_tokens"] = max_tokens
+
         tool_specs = self._tool_specs()
         if tool_specs:
             session["tools"] = tool_specs
