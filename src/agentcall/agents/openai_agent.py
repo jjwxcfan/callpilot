@@ -700,6 +700,13 @@ class OpenAIVoiceAgent(VoiceAgent):
                 )
         elif event_type == "input_audio_buffer.speech_stopped":
             self._speech_stopped_at = time.monotonic()
+            # audio_end_ms 是 provider 认定的语音终点（其输入缓冲时间轴）。
+            # 与 speech_started 的 audio_start_ms 相减 = 它听到的语音时长，
+            # 拿来与本地录音对账，定位判停拖尾在哪一侧（WIL-112）。
+            logger.info(
+                "[timing] provider 判停 (speech_stopped, audio_end_ms=%s)",
+                event.get("audio_end_ms"),
+            )
         elif event_type == "conversation.item.input_audio_transcription.completed":
             transcript = (event.get("transcript") or "").strip()
             if transcript:
@@ -734,7 +741,12 @@ class OpenAIVoiceAgent(VoiceAgent):
             self._on_response_created()
         elif event_type == "input_audio_buffer.speech_started":
             # 与 call_agent 的「本地检测到语音起点」对表用（WIL-112 暗区定位）。
-            logger.info("[timing] provider 判定开口 (speech_started)")
+            # audio_start_ms 是 provider 认定的语音起点在其输入缓冲时间轴上的
+            # 位置——与 speech_stopped 的 audio_end_ms 相减即它听到的语音时长。
+            logger.info(
+                "[timing] provider 判定开口 (speech_started, audio_start_ms=%s)",
+                event.get("audio_start_ms"),
+            )
             # barge-in：对端在 AI 说话期间开口 → 掐当前生成 + 让 call_agent 清
             # 本地未播积压（回调做），AI 立即闭嘴听对方说完。未注册回调
             # （半双工模式，BARGE_IN_ENABLED=false）时维持原行为：事件忽略。
