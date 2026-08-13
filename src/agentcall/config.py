@@ -187,7 +187,9 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("OPENAI_VAD_SILENCE_MS", "OpenAI VAD 静默判停（毫秒）", "int", "300"),
     # 单轮回复的 token 上限（0=不限）。提示词管不住啰嗦（WIL-83/112 实测：明令
     # 「说短点」仍单轮 14~18 秒），本地硬切又会把话切在半截；在 provider 侧限长
-    # 才是从源头让它少生成，且转写与对端听到的一致。约 200 token ≈ 2~3 句英文。
+    # 才是从源头让它少生成，且转写与对端听到的一致。**注意 audio 与 reasoning
+    # token 都计入**：真机实测一句话 ≈ 250（text 90 + audio 110 + reasoning 48），
+    # 设 200 会把第一句掐成 incomplete。两三句话 ≈ 900。
     ConfigSpec("OPENAI_MAX_RESPONSE_TOKENS", "OpenAI 单轮回复 token 上限（0=不限）",
                "int", "0"),
     # 端点覆写（可选）：留空即直连 api.openai.com；仅在用反代/Azure OpenAI，

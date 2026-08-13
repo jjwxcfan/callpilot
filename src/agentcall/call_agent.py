@@ -11,6 +11,7 @@ import re
 import secrets
 import threading
 import time
+from array import array
 from datetime import UTC, datetime
 from queue import Empty, Full, Queue
 from typing import Callable
@@ -90,6 +91,10 @@ from .triage_judge import (
 )
 
 logger = logging.getLogger(__name__)
+
+# 上行「有声」判定峰值（int16）。蜂窝语音经编解码后底噪远低于此、正常说话远高于
+# 此，只用于轮次延迟测量的起点打点，不参与任何对话逻辑。
+_VOICED_PEAK_THRESHOLD = 1000
 
 # dtmf_outcome 事件里对端话语的截断长度：够判读，又不至于把整段通话搬进事件流。
 _OUTCOME_TEXT_CHARS = 80
@@ -186,6 +191,10 @@ class CallSession:
         self._outgoing_audio: Queue[bytes] = Queue()
         # 本轮是否已记过「排队时长」（每轮只记一次，见 _make_agent_audio_handler）。
         self._turn_first_audio_logged = False
+        # 上行最近一次「有声」块的到达时刻（monotonic）。首块回复音频到达时用
+        # now - 这个值 得到本地可观测的端到端轮次延迟（上行传输 + VAD 判停 +
+        # 生成），比「判停→首音频」多覆盖前半段链路；蜂窝两腿仍在其外。
+        self._last_voiced_at = 0.0
         # barge-in（BARGE_IN_ENABLED）：每通开始时从 config 读取；True 时上行
         # 不做半双工丢弃、对端开口即打断 AI（见 _run_agent_loop 与打断回调）。
         self._barge_in = False
@@ -705,6 +714,17 @@ class CallSession:
                             "[timing] 本轮回复前面还排着 %.1fs 未播完（对端要多等这么久）",
                             ahead,
                         )
+                    # 端到端（本地可观测）：上行最后一块有声 → 首块回复到达。
+                    # 覆盖上行传输 + VAD 判停 + 生成；对端体感还要再加蜂窝两腿
+                    # （各 ~0.2-0.3s）与本地播出排队（上面的 ahead）。
+                    voiced_at = self._last_voiced_at
+                    if voiced_at > 0:
+                        e2e = time.monotonic() - voiced_at
+                        if 0 < e2e < 30:
+                            logger.info(
+                                "[timing] 端到端轮次延迟(本地音尾→首音频): %.0fms",
+                                e2e * 1000,
+                            )
                 self._outgoing_audio.put(pcm_8k)
 
         return on_agent_audio
@@ -906,6 +926,13 @@ class CallSession:
                 if self._dead_media_hangup:
                     break
             if pcm_8k:
+                # 端到端轮次延迟的起点：这块上行是否「有声」。峰值扫描与
+                # PcmFlowStats.add 同量级（每块几百样本），开销可忽略。
+                usable = len(pcm_8k) - (len(pcm_8k) % 2)
+                if usable:
+                    samples = array("h", pcm_8k[:usable])
+                    if max(max(samples), -min(samples)) >= _VOICED_PEAK_THRESHOLD:
+                        self._last_voiced_at = now
                 # 录音不受半双工屏蔽影响（内存追加，非磁盘 IO）。
                 if record is not None:
                     record.write_uplink(pcm_8k)
