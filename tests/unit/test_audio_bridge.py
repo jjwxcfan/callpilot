@@ -463,3 +463,36 @@ def test_uplink_alignment_waits_while_silent():
     bridge._rx_carry = b""
     _feed(bridge, b"\x00" * 40000)
     assert bridge._align_locked is False
+
+
+def test_uplink_alignment_reprobes_after_midstream_slip():
+    """锁定后中途丢 1 字节（劣化模组丢字节）：监控应发现相关性塌陷并重探纠正。"""
+    from agentcall.audio_bridge import SerialPcmAudioBridge
+
+    good = _speech_like(n=60000)
+    half = len(good) // 2
+    # 前半正常 → 锁定「对齐」；中途丢 1 字节 → 后半整体错位。
+    payload = good[:half] + good[half + 1:]
+    bridge = SerialPcmAudioBridge("/tmp/x")
+    bridge._rx_carry = b""
+    got = _feed(bridge, payload)
+    # 监控应已解锁重探，且重探判定错位（丢 1 字节归位后重新锁定）。
+    tail = np.frombuffer(got[-8000:], dtype=np.int16).astype(float)
+    r = float(np.corrcoef(tail[:-1], tail[1:])[0, 1])
+    assert r > 0.8, f"中途错位应被复核纠正，尾段相关性实际 {r}"
+
+
+def test_uplink_alignment_ambiguous_evidence_does_not_lock():
+    """两个偏移的相关性都含糊（分不出胜负）时不得锁定——继续攒证据。
+
+    真机教训（2026-08-12）：对齐0=0.815 / 偏移1=0.844 的含糊样本被锁成
+    「对齐正常」，整通乱码没人管。
+    """
+    from agentcall.audio_bridge import SerialPcmAudioBridge
+
+    bridge = SerialPcmAudioBridge("/tmp/x")
+    bridge._rx_carry = b""
+    # 恒定直流方波：两个偏移读出来相关性都高且接近 → 证据含糊。
+    ambiguous = (b"\x10\x10" * 20000)
+    _feed(bridge, ambiguous)
+    assert bridge._align_locked is False

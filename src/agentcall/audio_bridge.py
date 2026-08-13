@@ -41,6 +41,9 @@ SERIAL_PCM_WRITE_SIZE = 512  # 32ms @ 8kHz/16-bit mono，= USB bulk 满包
 _ALIGN_PROBE_BYTES = 16000      # ~1s @ 8kHz/16-bit
 _ALIGN_MIN_PEAK = 800           # 低于此峰值视为静音，继续攒
 _ALIGN_MARGIN = 0.15            # 偏移1 需明显优于对齐0 才纠正
+_ALIGN_CLEAR_WIN = 0.6          # 判定所需的「明确赢家」相关性下限；两侧都含糊不锁定
+_ALIGN_BAD_CORR = 0.3           # 锁定后监控：有声段相关性低于此=疑似中途错位，重探
+_ALIGN_MONITOR_BYTES = 32000    # 锁定后每 ~2s 有声数据复核一次相关性
 SERIAL_PCM_WRITE_INTERVAL_SECONDS = 0.032   # 512B @ 8kHz/16-bit = 32ms 实时
 
 
@@ -185,6 +188,7 @@ class SerialPcmAudioBridge:
         self._align_locked = False
         self._align_drop = False
         self._align_probe = bytearray()
+        self._align_monitor = bytearray()
         self._ready_check: "Callable[[], bool] | None" = None
         self._ser: serial.Serial | None = None
         self._tx_buffer = bytearray()
@@ -202,6 +206,7 @@ class SerialPcmAudioBridge:
         self._align_locked = False
         self._align_drop = False
         self._align_probe.clear()
+        self._align_monitor.clear()
         self._ser.reset_input_buffer()
         self._ser.reset_output_buffer()
         self._running = True
@@ -267,13 +272,18 @@ class SerialPcmAudioBridge:
             self._rx_carry = b""
         if not self._align_locked:
             self._probe_alignment(data)
+        else:
+            self._monitor_alignment(data)
         return data
 
     def _probe_alignment(self, data: bytes) -> None:
-        """用相邻样本相关性判断上行是否整体错位 1 字节，判定后锁定不再改。
+        """用相邻样本相关性判断上行是否整体错位 1 字节。
 
         真实语音相邻样本高度相关（r>0.8）；错位后高低字节颠倒，相关性趋近 0。
-        只在攒够足够「有声」样本后判定，避免拿静音段瞎判。
+        只在攒够足够「有声」样本后判定，避免拿静音段瞎判。证据必须**一边倒**才
+        锁定（真机教训 2026-08-12：两个偏移都 0.8+ 的含糊样本被当「对齐正常」
+        锁死，整通乱码没人管）；含糊就扔掉这批继续攒。锁定后仍由
+        _monitor_alignment 持续复核——劣化的模组会中途丢字节，错位可能随时发生。
         """
         self._align_probe.extend(data)
         if len(self._align_probe) < _ALIGN_PROBE_BYTES:
@@ -287,8 +297,21 @@ class SerialPcmAudioBridge:
             if samples.size < 1000 or np.max(np.abs(samples)) < _ALIGN_MIN_PEAK:
                 return  # 太安静，判不准，继续攒
             scores.append(float(np.corrcoef(samples[:-1], samples[1:])[0, 1]))
+        best = max(scores)
+        # NaN（恒定/退化信号，如纯音尾巴）视为含糊：NaN 的比较全为 False，
+        # 不设防会直接落到锁定分支。
+        if (
+            not all(np.isfinite(s) for s in scores)
+            or best < _ALIGN_CLEAR_WIN
+            or abs(scores[0] - scores[1]) < _ALIGN_MARGIN
+        ):
+            logger.info(
+                "上行对齐证据含糊（对齐0 %.3f，偏移1 %.3f），不锁定继续探",
+                scores[0], scores[1],
+            )
+            return
         self._align_locked = True
-        if scores[1] > scores[0] + _ALIGN_MARGIN:
+        if scores[1] > scores[0]:
             self._align_drop = True
             logger.warning(
                 "上行字节错位已纠正：偏移1 相关性 %.3f > 对齐0 %.3f（丢 1 字节回到采样边界）",
@@ -297,6 +320,31 @@ class SerialPcmAudioBridge:
         else:
             logger.info(
                 "上行字节对齐正常（对齐0 相关性 %.3f，偏移1 %.3f）", scores[0], scores[1]
+            )
+
+    def _monitor_alignment(self, data: bytes) -> None:
+        """锁定后的持续复核：有声段相关性塌到乱码水平就解锁重探。
+
+        中途错位的来源是 USB/模组丢字节（劣化形态之一），carry 只保证「相对流首」
+        的对齐，保证不了流本身不丢字节。重探期间照常出流（乱码已经在流上了，
+        不会更糟）；重探判定错位后丢 1 字节归位，代价是 1 个采样点的毛刺。
+        """
+        self._align_monitor.extend(data)
+        if len(self._align_monitor) < _ALIGN_MONITOR_BYTES:
+            return
+        probe = bytes(self._align_monitor)
+        self._align_monitor.clear()
+        usable = len(probe) - (len(probe) % 2)
+        samples = np.frombuffer(probe[:usable], dtype=np.int16).astype(np.float32)
+        if samples.size < 1000 or np.max(np.abs(samples)) < _ALIGN_MIN_PEAK:
+            return  # 静音段，无法复核
+        corr = float(np.corrcoef(samples[:-1], samples[1:])[0, 1])
+        if corr < _ALIGN_BAD_CORR:
+            self._align_locked = False
+            self._align_probe.clear()
+            logger.warning(
+                "上行有声段相关性塌陷（%.3f < %.1f），疑似中途字节错位，重新探测对齐",
+                corr, _ALIGN_BAD_CORR,
             )
 
     def pending_output_bytes(self) -> int:
