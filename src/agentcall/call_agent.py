@@ -2225,11 +2225,11 @@ class CallSession:
         代价要说清：这是**硬切**，被截的那一轮结尾会突兀。默认阈值取在实测
         p90 之上就是为了让它只在明显跑飞时才触发。
         """
-        if self._max_turn_seconds <= 0 or not pcm_agent:
+        if not pcm_agent:
             return False
-        rate = getattr(agent, "output_rate", 0) or self._agent_output_rate
-        if rate <= 0:
-            return False
+        # 轮次边界检测不属于闸门：排队/端到端埋点的「每轮一次」标志也靠它复位，
+        # 闸门关闭（max_turn_seconds<=0）时同样要走到（2026-08-12 教训：早退在
+        # 这之前会让埋点在首轮之后永久哑掉）。
         now = time.monotonic()
         with self._turn_lock:
             if now - self._turn_last_chunk_at > self._TURN_GAP_SECONDS:
@@ -2238,6 +2238,10 @@ class CallSession:
                 self._turn_cancel_sent = False
                 self._turn_first_audio_logged = False
             self._turn_last_chunk_at = now
+        rate = getattr(agent, "output_rate", 0) or self._agent_output_rate
+        if self._max_turn_seconds <= 0 or rate <= 0:
+            return False
+        with self._turn_lock:
             if self._turn_cancel_sent:
                 return True  # 本轮已超限，后续分块一律丢弃
             self._turn_audio_bytes += len(pcm_agent)
