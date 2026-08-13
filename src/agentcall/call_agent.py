@@ -932,6 +932,11 @@ class CallSession:
                 if usable:
                     samples = array("h", pcm_8k[:usable])
                     if max(max(samples), -min(samples)) >= _VOICED_PEAK_THRESHOLD:
+                        # 静音 >1s 后再次有声 = 一次新发声的起点。与 provider 的
+                        # speech_started 到达时刻对表，可分离「上行传输延迟」与
+                        # 「VAD 判停拖尾」（WIL-112 暗区定位）。
+                        if now - self._last_voiced_at > 1.0:
+                            logger.info("[timing] 本地检测到语音起点")
                         self._last_voiced_at = now
                 # 录音不受半双工屏蔽影响（内存追加，非磁盘 IO）。
                 if record is not None:

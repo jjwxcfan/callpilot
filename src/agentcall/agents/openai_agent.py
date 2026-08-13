@@ -708,6 +708,8 @@ class OpenAIVoiceAgent(VoiceAgent):
             self._response_active = True
             self._on_response_created()
         elif event_type == "input_audio_buffer.speech_started":
+            # 与 call_agent 的「本地检测到语音起点」对表用（WIL-112 暗区定位）。
+            logger.info("[timing] provider 判定开口 (speech_started)")
             # barge-in：对端在 AI 说话期间开口 → 掐当前生成 + 让 call_agent 清
             # 本地未播积压（回调做），AI 立即闭嘴听对方说完。未注册回调
             # （半双工模式，BARGE_IN_ENABLED=false）时维持原行为：事件忽略。
@@ -727,7 +729,14 @@ class OpenAIVoiceAgent(VoiceAgent):
                 logger.debug("OpenAI 回复轮次完成")
             self._on_response_done()
         elif event_type == "error":
-            logger.error("OpenAI Realtime 错误: %s", event)
+            code = (event.get("error") or {}).get("code")
+            if code == "response_cancel_not_active":
+                # barge-in 的 cancel 与 response.done 的固有竞态：response.created
+                # 后我们置 _response_active，但服务端可能在 cancel 送达前已生成完。
+                # 无副作用，降级为 info 免得像故障。
+                logger.info("response.cancel 晚到（响应已自然结束），忽略")
+            else:
+                logger.error("OpenAI Realtime 错误: %s", event)
 
     async def _dispatch_tool_call(
         self, name: str, call_id: str, arguments: str, ws: Any
