@@ -184,6 +184,8 @@ class CallSession:
         self._active = False
         self._active_lock = threading.Lock()
         self._outgoing_audio: Queue[bytes] = Queue()
+        # 本轮是否已记过「排队时长」（每轮只记一次，见 _make_agent_audio_handler）。
+        self._turn_first_audio_logged = False
         # barge-in（BARGE_IN_ENABLED）：每通开始时从 config 读取；True 时上行
         # 不做半双工丢弃、对端开口即打断 AI（见 _run_agent_loop 与打断回调）。
         self._barge_in = False
@@ -687,6 +689,22 @@ class CallSession:
             if pcm_8k:
                 if record is not None:
                     record.write_downlink(pcm_8k)
+                # 本轮首块音频入队时，记录「它前面还排着多少秒没播完」——这才是
+                # 对端真正要等的时间。判停→首音频只是 OpenAI 生成耗时，不含排队
+                # （WIL-112：录音按生成时点记录，会把排队完全抹掉，别再用它判断）。
+                if not self._turn_first_audio_logged:
+                    self._turn_first_audio_logged = True
+                    pending = (
+                        bridge.pending_output_bytes()
+                        if hasattr(bridge, "pending_output_bytes") else 0
+                    )
+                    queued = self._outgoing_audio.qsize() * len(pcm_8k)
+                    ahead = (pending + queued) / (MODEM_RATE * 2)
+                    if ahead >= 0.5:
+                        logger.info(
+                            "[timing] 本轮回复前面还排着 %.1fs 未播完（对端要多等这么久）",
+                            ahead,
+                        )
                 self._outgoing_audio.put(pcm_8k)
 
         return on_agent_audio
@@ -2186,6 +2204,7 @@ class CallSession:
                 # 空档 → 新的一轮，计数与「已超限」标志一起重置。
                 self._turn_audio_bytes = 0
                 self._turn_cancel_sent = False
+                self._turn_first_audio_logged = False
             self._turn_last_chunk_at = now
             if self._turn_cancel_sent:
                 return True  # 本轮已超限，后续分块一律丢弃
