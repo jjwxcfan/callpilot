@@ -64,6 +64,16 @@ def _vad_silence_ms() -> int:
     return config.get_int("OPENAI_VAD_SILENCE_MS")
 
 
+def _vad_threshold() -> float:
+    """server_vad 能量阈值（注册表 OPENAI_VAD_THRESHOLD，≤0 表示用服务端默认）。"""
+    return config.get_float("OPENAI_VAD_THRESHOLD")
+
+
+def _noise_reduction() -> str:
+    """输入降噪模式（注册表 OPENAI_NOISE_REDUCTION，空=不启用）。"""
+    return config.get_str("OPENAI_NOISE_REDUCTION").strip()
+
+
 def _default_instructions() -> str:
     """无外部指令时的默认系统提示词（与 qwen_agent 的默认语义对齐）。"""
     weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
@@ -186,12 +196,27 @@ class OpenAIVoiceAgent(VoiceAgent):
                             if _vad_silence_ms() > 0
                             else {}
                         ),
+                        # 电话线路底噪会拖住 VAD 判停：真机实测（2026-08-12）
+                        # 音尾→speech_stopped 拖到 0.9~2.7s（配置静默窗仅 0.3s）。
+                        # 抬高能量阈值让底噪更快被认作「静音」；0/负值=服务端默认。
+                        **(
+                            {"threshold": _vad_threshold()}
+                            if _vad_threshold() > 0
+                            else {}
+                        ),
                         **(
                             {"create_response": False}
                             if self._manual_response_enabled
                             else {}
                         ),
                     },
+                    # 喂给 VAD 与模型前先降噪；far_field 适合电话/远场拾音，
+                    # 与抬阈值同攻「判停拖尾」。空=不启用。
+                    **(
+                        {"noise_reduction": {"type": _noise_reduction()}}
+                        if _noise_reduction()
+                        else {}
+                    ),
                     "transcription": {"model": TRANSCRIPTION_MODEL},
                 },
                 "output": {

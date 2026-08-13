@@ -185,6 +185,15 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # 代价是对方句中停顿稍长就会被抢话。真机体感 250~350 较自然。0/负值=不下发，
     # 用 OpenAI 默认。仅 OpenAI 链路。
     ConfigSpec("OPENAI_VAD_SILENCE_MS", "OpenAI VAD 静默判停（毫秒）", "int", "300"),
+    # server_vad 能量阈值（0~1，OpenAI 默认 0.5）。电话线路底噪会拖住判停：真机
+    # 实测音尾→speech_stopped 拖到 0.9~2.7s（静默窗仅 0.3s）。适当抬高让底噪更快
+    # 被认作静音、判停更利落；太高会漏掉小声说话的开头。0=用服务端默认。
+    ConfigSpec("OPENAI_VAD_THRESHOLD", "OpenAI VAD 能量阈值（0=服务端默认）",
+               "float", "0"),
+    # 输入降噪（喂给 VAD 与模型前）：near_field=近讲耳机，far_field=远场/电话。
+    # 与抬 VAD 阈值同攻「判停拖尾」。空=不启用。
+    ConfigSpec("OPENAI_NOISE_REDUCTION", "OpenAI 输入降噪（空/near_field/far_field）",
+               "str", ""),
     # 单轮回复的 token 上限（0=不限）。提示词管不住啰嗦（WIL-83/112 实测：明令
     # 「说短点」仍单轮 14~18 秒），本地硬切又会把话切在半截；在 provider 侧限长
     # 才是从源头让它少生成，且转写与对端听到的一致。**注意 audio 与 reasoning
