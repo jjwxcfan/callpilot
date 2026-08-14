@@ -125,9 +125,25 @@ def test_hard_evidence_confident_passes_unless_sampled():
     assert sampled["review_reason"] == "sampled"
 
 
+def test_local_signal_tools_and_summary_ok_are_not_hard_evidence():
+    """本机信号不是证据（WIL-49/72 假阳性教训）：挂断成功/按键本机 success/
+    摘要生成成功，都不能让判官结论跳过人工复核。"""
+    local_only = _evidence(
+        summary_ok=True,
+        tool_results=[
+            {"tool": "hangup_call", "success": True},
+            {"tool": "send_dtmf", "success": True},
+        ],
+    )
+    assert not hard_evidence_present(local_only)
+
+    real_effect = _evidence(tool_results=[{"tool": "send_sms", "success": True}])
+    assert hard_evidence_present(real_effect)
+
+
 def test_confidence_is_clamped_and_junk_tolerated():
     verdict = judge_call(
-        _evidence(summary_ok=True),
+        _evidence(dtmf_outcomes={"observed": 1}),
         _llm_returning({
             "conclusion": "not_achieved", "attribution": "外星人",
             "confidence": 7, "evidence_refs": list(range(20)),

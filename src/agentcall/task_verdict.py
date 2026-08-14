@@ -88,18 +88,27 @@ def build_evidence(
     }
 
 
+# 这些工具的 success 是**本机信号**，不作硬证据：hangup_call 挂断成功≠任务
+# 达成；send_dtmf 的本机 success 已被真机证实是假阳性（WIL-49/72——按键
+# 「成功」与 IVR 是否推进完全脱节），它的硬证据形态是 dtmf_outcome=observed。
+# summary.ok 同理不算：那只表示「摘要生成成功」，不是核验（2026-08-14 review
+# 抓出的两处「把本机信号当证据」，恰是本规格第四节反复强调的坑）。
+_LOCAL_SIGNAL_TOOLS = frozenset({"hangup_call", "send_dtmf"})
+
+
 def hard_evidence_present(evidence: dict[str, Any]) -> bool:
     """硬证据判定（确定性规则，先于一切 LLM 置信度）：
 
-    按键推进被对端下一句证实（observed）、或工具明确返回成功、或摘要层已
-    核验（summary.ok，含 WIL-74 的短信核验路径）。这些之外的「达成」都只是
-    判官的阅读理解，必须进复核队列。
+    按键推进被**对端下一句**证实（dtmf_outcome=observed），或产生真实外部
+    副作用的工具明确成功（如 send_sms）。这些之外的「达成」都只是判官的
+    阅读理解，必须进复核队列。
     """
     if evidence["dtmf_outcomes"].get("observed"):
         return True
-    if any(t["success"] for t in evidence["tool_results"]):
-        return True
-    return bool(evidence["summary_ok"])
+    return any(
+        t["success"] and t["tool"] not in _LOCAL_SIGNAL_TOOLS
+        for t in evidence["tool_results"]
+    )
 
 
 def _fail_closed(reason: str) -> dict[str, Any]:
