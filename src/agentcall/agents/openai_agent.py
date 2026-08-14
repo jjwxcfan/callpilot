@@ -717,6 +717,9 @@ class OpenAIVoiceAgent(VoiceAgent):
                     latency_ms = (time.monotonic() - self._speech_stopped_at) * 1000
                     self._speech_stopped_at = None
                     logger.info("轮次响应延迟(判停→首音频): %.0fms", latency_ms)
+                    # first_audio_delta_ms（2026-08-14 定义，WIL-95 2.2：语音到
+                    # 语音架构下 TTFT/TTFB 的唯一可观测合并量）→ 经回调落盘。
+                    self._emit_latency("first_audio_delta", round(latency_ms, 1))
                 self._audio_gate.push_audio(
                     _response_id(event), base64.b64decode(delta)
                 )

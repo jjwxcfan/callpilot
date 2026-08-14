@@ -22,6 +22,7 @@ class VoiceAgent(ABC):
     _on_status: "Callable[[str], None] | None" = None
     _on_user_interrupt: "Callable[[], bool] | None" = None
     _on_late_cut: "Callable[[], bool] | None" = None
+    _on_latency: "Callable[[str, float], None] | None" = None
     _tools: "ToolRegistry | None" = None
     _session_instructions: str | None = None
 
@@ -99,6 +100,23 @@ class VoiceAgent(ABC):
             except Exception:  # noqa: BLE001
                 pass
         return False
+
+    def set_latency_handler(
+        self, handler: "Callable[[str, float], None] | None"
+    ) -> None:
+        """注册 provider 侧时延打点回调（WIL-95 第一期）。
+
+        provider 内部测到的逐轮时延（如 OpenAI 的判停→首音频）经此回调交给
+        call_agent 落进 events.jsonl——agent 层不认识 CallRecord，持久化归
+        调用方。参数为 (stage, ms)；不支持的 provider 不触发即可。"""
+        self._on_latency = handler
+
+    def _emit_latency(self, stage: str, ms: float) -> None:
+        if self._on_latency:
+            try:
+                self._on_latency(stage, ms)
+            except Exception:  # noqa: BLE001
+                pass
 
     def set_late_cut_handler(self, handler: "Callable[[], bool] | None") -> None:
         """注册复读晚截清积压回调（ResponseAudioGate ``on_late_cut`` 用）。

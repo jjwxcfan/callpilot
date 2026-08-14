@@ -1161,3 +1161,40 @@ def test_turn_latency_logged_between_speech_stopped_and_first_audio(monkeypatch,
             await agent.stop()
 
     asyncio.run(scenario())
+
+
+def test_turn_latency_emitted_via_latency_handler(monkeypatch):
+    """判停→首音频经 set_latency_handler 上交（WIL-95 第一期：落盘管道）。"""
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+    samples: list[tuple[str, float]] = []
+    agent.set_latency_handler(lambda stage, ms: samples.append((stage, ms)))
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            ws = instances[0]
+            ws.feed({"type": "input_audio_buffer.speech_stopped"})
+            ws.feed(
+                {
+                    "type": "response.output_audio.delta",
+                    "response": {"id": "r1"},
+                    "delta": base64.b64encode(b"\x00\x00").decode(),
+                }
+            )
+            ws.feed(  # 第二个增量不应再产生样本（每轮一条）
+                {
+                    "type": "response.output_audio.delta",
+                    "response": {"id": "r1"},
+                    "delta": base64.b64encode(b"\x00\x00").decode(),
+                }
+            )
+            await _drain()
+            assert len(samples) == 1
+            stage, ms = samples[0]
+            assert stage == "first_audio_delta"
+            assert ms >= 0
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())

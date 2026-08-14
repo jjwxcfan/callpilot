@@ -532,6 +532,34 @@ class CallSession:
             agent.set_late_cut_handler(
                 lambda: self._discard_agent_playback(bridge, "复读晚截")
             )
+            # provider 侧逐轮时延（如判停→首音频）经回调落 events.jsonl
+            # （WIL-95 第一期：测量早已校准，缺的只是持久化）。
+            if record is not None:
+                agent.set_latency_handler(record.log_latency)
+            # 配置快照（WIL-95 第一期硬要求）：没有它，跨时间对比无法归因——
+            # 指标变了可能只是切了 provider / 判停方式 / barge-in。字段增删
+            # 属指标契约变更，要同步升 call_metrics.SCHEMA_VERSION。
+            if record is not None:
+                # 快照失败绝不影响通话（metrics.json 会记 config 缺失 + 原因）。
+                try:
+                    record.log_event(
+                        "config_snapshot",
+                        provider=self.provider,
+                        model=getattr(agent, "model", "") or "",
+                        turn_detection=config.get_str("OPENAI_TURN_DETECTION"),
+                        vad_eagerness=config.get_str("OPENAI_VAD_EAGERNESS"),
+                        vad_silence_ms=config.get_int("OPENAI_VAD_SILENCE_MS"),
+                        barge_in_enabled=self._barge_in,
+                        hangover_seconds=self._hangover_seconds,
+                        dtmf_mode=config.get_str("DTMF_MODE"),
+                        recording_enabled=getattr(
+                            record, "recording_enabled", False
+                        ),
+                        audio_mode=self.audio_mode,
+                        modem_vendor=config.get_str("MODEM_VENDOR"),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning("配置快照落盘失败（不影响通话）", exc_info=True)
             bridge.start()
             mark("bridge_started")
 
@@ -721,6 +749,17 @@ class CallSession:
                     )
                     queued = self._outgoing_audio.qsize() * len(pcm_8k)
                     ahead = (pending + queued) / (MODEM_RATE * 2)
+                    # playout_backlog_ms（2026-08-14 定义，WIL-95 第一期）：本轮
+                    # 首块回复入队时，前面已排未播的音频时长。每轮都落盘——
+                    # 0 也是有效读数（无积压），只有日志沿用 0.5s 的降噪阈值。
+                    if record is not None:
+                        # 埋点失败绝不影响通话（WIL-95 §6；BrokenRecord 测试锁）。
+                        try:
+                            record.log_latency(
+                                "playout_backlog", round(ahead * 1000, 1)
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
                     if ahead >= 0.5:
                         logger.info(
                             "[timing] 本轮回复前面还排着 %.1fs 未播完（对端要多等这么久）",
@@ -733,6 +772,15 @@ class CallSession:
                     if voiced_at > 0:
                         e2e = time.monotonic() - voiced_at
                         if 0 < e2e < 30:
+                            # local_response_latency_ms（2026-08-14 定义，WIL-95
+                            # 2.1：诚实命名，不叫 e2e——蜂窝两腿在观测范围外）。
+                            if record is not None:
+                                try:
+                                    record.log_latency(
+                                        "local_response", round(e2e * 1000, 1)
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    pass
                             logger.info(
                                 "[timing] 端到端轮次延迟(本地音尾→首音频): %.0fms",
                                 e2e * 1000,
