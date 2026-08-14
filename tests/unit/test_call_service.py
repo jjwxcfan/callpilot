@@ -58,6 +58,8 @@ class FakeSmsEmailForwarder:
 
 
 class SpyCallRecord:
+    recording_enabled = False
+
     def __init__(self) -> None:
         self.downlink: list[bytes] = []
         self.events: list[tuple[str, dict]] = []
@@ -67,6 +69,10 @@ class SpyCallRecord:
 
     def log_event(self, type: str, **fields) -> None:  # noqa: A002
         self.events.append((type, fields))
+
+    def log_latency(self, stage: str, ms: float, **fields) -> None:
+        # 与真 CallRecord 同构：latency 是 log_event 的糖（call_log.py:205）。
+        self.log_event("latency", stage=stage, ms=ms, **fields)
 
 
 class FakeRemoteCoordinator:

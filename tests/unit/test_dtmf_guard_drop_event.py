@@ -23,6 +23,7 @@ class SpyRecord:
 
     id = "20260803-000000-outbound-10086"
     path = None
+    recording_enabled = False
 
     def __init__(self) -> None:
         self.events: list[tuple[str, dict]] = []
@@ -30,6 +31,10 @@ class SpyRecord:
 
     def log_event(self, event_type: str, **fields) -> None:
         self.events.append((event_type, fields))
+
+    def log_latency(self, stage: str, ms: float, **fields) -> None:
+        # 与真 CallRecord 同构：latency 是 log_event 的糖（call_log.py:205）。
+        self.log_event("latency", stage=stage, ms=ms, **fields)
 
     def write_downlink(self, pcm: bytes) -> None:
         pass

@@ -5,6 +5,7 @@
     20260707-183000-outbound-10000/
         events.jsonl    # 事件/延迟打点，每行一个 JSON 对象
         meta.json       # 通话元数据（方向/号码/起止时间/状态/事件数/时长）
+        metrics.json    # 每通指标汇总（WIL-95），契约见 call_metrics.py
         uplink.wav      # 上行录音（用户→远端），8kHz 16bit mono
         downlink.wav    # 下行录音（远端→用户），8kHz 16bit mono
         mixed.wav       # 合成对话录音：立体声（左=AI下行 / 右=对方上行），按时间轴对齐
@@ -38,7 +39,7 @@ from typing import Any
 
 import numpy as np
 
-from . import config
+from . import call_metrics, config
 
 logger = logging.getLogger(__name__)
 
@@ -320,6 +321,25 @@ class CallRecord:
                 )
             except OSError as exc:
                 logger.error("落盘通话记录 %s 失败: %s", self.id, exc)
+            # metrics.json（WIL-95 第一期）：每通一条汇总，带 schema_version。
+            # 生成失败绝不影响录音/事件落盘——指标是派生物，原始记录优先。
+            try:
+                events = [json.loads(line) for line in event_lines]
+                metrics = call_metrics.build_call_metrics(
+                    events,
+                    call_id=self.id,
+                    direction=self.direction,
+                    duration_s=ended_at - self.started_at,
+                    answered=answered,
+                    status=status,
+                    generated_at=ended_at,
+                )
+                (self.path / "metrics.json").write_text(
+                    json.dumps(metrics, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("生成 %s/metrics.json 失败: %s", self.id, exc)
 
     def _update_content_meta(
         self, content_updated_at: float, summary_state: str
