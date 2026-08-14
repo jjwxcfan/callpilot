@@ -189,6 +189,13 @@ class SerialPcmAudioBridge:
         self._align_drop = False
         self._align_probe = bytearray()
         self._align_monitor = bytearray()
+        # 上行串口积压观测（read_modem_chunk 内聚合，每 5s 一行）。
+        self._inwaiting_max = 0
+        self._inwaiting_sum = 0
+        self._inwaiting_n = 0
+        self._inwaiting_logged_at = 0.0
+        # 下行首帧观测：最近一次真实（非补零）帧进串口的时刻。
+        self._last_real_payload_at = 0.0
         self._ready_check: "Callable[[], bool] | None" = None
         self._ser: serial.Serial | None = None
         self._tx_buffer = bytearray()
@@ -259,6 +266,30 @@ class SerialPcmAudioBridge:
     def read_modem_chunk(self) -> bytes:
         if not self._ser:
             return b""
+        # 上行盲区埋点（WIL-112）：读之前串口里积着多少字节。常驻高水位=我们
+        # 落后实时（这段延迟对录音/发送/本地埋点全部不可见，只有对端耳朵在付）；
+        # 锯齿形=模组攒批发送。每 5s 聚合一行。
+        try:
+            waiting = self._ser.in_waiting
+        except (OSError, AttributeError):
+            waiting = -1
+        if waiting >= 0:
+            self._inwaiting_max = max(self._inwaiting_max, waiting)
+            self._inwaiting_sum += waiting
+            self._inwaiting_n += 1
+            now = time.monotonic()
+            if now - self._inwaiting_logged_at >= 5 and self._inwaiting_n:
+                logger.info(
+                    "[timing] 上行串口积压: max=%dB(≈%.0fms) 均值=%dB (n=%d)",
+                    self._inwaiting_max,
+                    self._inwaiting_max / (MODEM_RATE * 2) * 1000,
+                    self._inwaiting_sum // self._inwaiting_n,
+                    self._inwaiting_n,
+                )
+                self._inwaiting_max = 0
+                self._inwaiting_sum = 0
+                self._inwaiting_n = 0
+                self._inwaiting_logged_at = now
         # carry + 本次读，保证返回偶数字节（16-bit 对齐）；奇出的 1 字节留到下次。
         data = self._rx_carry + self._ser.read(NMEA_READ_SIZE)
         if self._align_drop and data:
@@ -425,12 +456,20 @@ class SerialPcmAudioBridge:
             if len(self._tx_buffer) >= self._write_size:
                 payload = bytes(self._tx_buffer[: self._write_size])
                 del self._tx_buffer[: self._write_size]
-                return payload
-            if self._tx_buffer:
+            elif self._tx_buffer:
                 payload = bytes(self._tx_buffer)
                 self._tx_buffer.clear()
-                return payload + silence[: self._write_size - len(payload)]
-        return silence
+                payload = payload + silence[: self._write_size - len(payload)]
+            else:
+                return silence
+        # 下行盲区埋点（WIL-112）：≥1s 静默后的首个真实帧=新一轮开播进串口。
+        # 与「判停→首音频」「端到端」两条日志的时间戳相减，即可归属
+        # websocket→闸门→队列→串口 各段耗时。
+        now = time.monotonic()
+        if now - self._last_real_payload_at > 1.0:
+            logger.info("[timing] 下行新一轮首帧进串口")
+        self._last_real_payload_at = now
+        return payload
 
     def _log_write_stats(self) -> None:
         now = time.monotonic()

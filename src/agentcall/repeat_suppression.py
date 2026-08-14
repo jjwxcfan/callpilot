@@ -93,12 +93,16 @@ class RepeatSuppressor:
 
 
 class ResponseAudioGate:
-    """Buffer response audio until transcript is known, then flush or drop it.
+    """Stream response audio immediately; cut a response once判定为复读。
 
-    Qwen/OpenAI both stream audio before final downlink transcript. Instead of
-    provider-specific response.cancel timing, we hold per-response audio locally
-    and only release it after the transcript passes the repeat check; repeated
-    responses are never handed to the modem queue.
+    旧实现把每轮音频扣到整轮转写过完复读检查才放行——复读从不出声，但**每一轮**
+    都要多等「首音频→转写完成」，实测 0.3~2s（回复越长越久），是 WIL-112 轮次
+    延迟里最大的一段自造开销。复读本身是小概率事件，不值得让每轮都买单。
+
+    现改为：音频到即放（streaming），转写完成后才知道是复读的，标记该 response
+    丢弃后续分块，并通过 ``on_late_cut`` 让上层清掉设备侧未播积压（与 barge-in
+    同一套清积压机制）。代价：复读可能已播出 1~2s 开头才被掐；收益：每轮延迟
+    直降为零开销。``on_late_cut`` 未接线（如半双工模式）时仅丢后续分块。
     """
 
     def __init__(
@@ -111,20 +115,21 @@ class ResponseAudioGate:
         time_fn: Callable[[], float] = time.monotonic,
         nudge_cooldown_seconds: float = DEFAULT_NUDGE_COOLDOWN_SECONDS,
         stuck_limit: int = DEFAULT_STUCK_LIMIT,
+        on_late_cut: Callable[[], None] | None = None,
     ) -> None:
         self._provider = provider
         self._emit_audio = emit_audio
         self._suppressor = suppressor or RepeatSuppressor()
         self._on_suppressed = on_suppressed
         self._on_stuck = on_stuck
+        self._on_late_cut = on_late_cut
         self._time_fn = time_fn
         self._nudge_cooldown_seconds = nudge_cooldown_seconds
         self._stuck_limit = stuck_limit
         self._last_nudge_at: float | None = None
         self._consecutive_suppressed = 0
         self._stuck_notified = False
-        self._pending: dict[str, list[bytes]] = {}
-        self._allowed: set[str] = set()
+        self._streamed_bytes: dict[str, int] = {}
         self._suppressed: set[str] = set()
 
     def push_audio(self, response_id: str | None, chunk: bytes) -> None:
@@ -135,20 +140,30 @@ class ResponseAudioGate:
             return
         if response_id in self._suppressed:
             return
-        if response_id in self._allowed:
-            self._emit_audio(chunk)
-            return
-        self._pending.setdefault(response_id, []).append(chunk)
+        self._streamed_bytes[response_id] = (
+            self._streamed_bytes.get(response_id, 0) + len(chunk)
+        )
+        self._emit_audio(chunk)
 
     def complete_transcript(self, response_id: str | None, transcript: str) -> bool:
         if not response_id or self._suppressor.disabled:
             return False
         if self._suppressor.should_suppress(transcript):
-            self._pending.pop(response_id, None)
-            self._allowed.discard(response_id)
+            streamed = self._streamed_bytes.pop(response_id, 0)
             self._suppressed.add(response_id)
             self._consecutive_suppressed += 1
-            logger.info("[%s] 抑制复读: %s", self._provider, transcript)
+            if streamed:
+                logger.info(
+                    "[%s] 抑制复读（已开播 %d 字节，截断剩余并清积压）: %s",
+                    self._provider, streamed, transcript,
+                )
+                if self._on_late_cut is not None:
+                    try:
+                        self._on_late_cut()
+                    except Exception:  # noqa: BLE001
+                        logger.exception("[%s] 复读截断清积压回调失败", self._provider)
+            else:
+                logger.info("[%s] 抑制复读: %s", self._provider, transcript)
             self._notify_suppressed(transcript)
             if (
                 self._stuck_limit > 0
@@ -164,21 +179,14 @@ class ResponseAudioGate:
             return True
         self._consecutive_suppressed = 0
         self._stuck_notified = False
-        self._flush(response_id)
+        self._streamed_bytes.pop(response_id, None)
         return False
 
     def complete_response(self, response_id: str | None) -> None:
         if not response_id:
             return
-        self._flush(response_id)
+        self._streamed_bytes.pop(response_id, None)
         self._suppressed.discard(response_id)
-
-    def _flush(self, response_id: str) -> None:
-        chunks = self._pending.pop(response_id, [])
-        self._allowed.add(response_id)
-        self._suppressed.discard(response_id)
-        for chunk in chunks:
-            self._emit_audio(chunk)
 
     def _notify_suppressed(self, transcript: str) -> None:
         if self._on_suppressed is None:

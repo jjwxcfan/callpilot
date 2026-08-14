@@ -62,6 +62,7 @@ def test_response_gate_suppression_nudges_with_cooldown_and_stuck_limit():
     emitted: list[bytes] = []
     nudges: list[str] = []
     stuck: list[tuple[int, str]] = []
+    late_cuts: list[bool] = []
     gate = ResponseAudioGate(
         "test",
         emitted.append,
@@ -71,6 +72,7 @@ def test_response_gate_suppression_nudges_with_cooldown_and_stuck_limit():
         time_fn=lambda: now,
         nudge_cooldown_seconds=8.0,
         stuck_limit=3,
+        on_late_cut=lambda: late_cuts.append(True),
     )
     first = "您好，我是张三的数字分身，想咨询一下套餐情况。"
     repeated = "您好！我是张三的数字分身，想咨询一下套餐情况"
@@ -87,7 +89,12 @@ def test_response_gate_suppression_nudges_with_cooldown_and_stuck_limit():
     gate.push_audio("r5", b"fifth")
     assert gate.complete_transcript("r5", repeated) is True
 
-    assert emitted == [b"first", b"second"]
+    # streaming 语义：音频到即放（复读判定前已开播），判定后触发 late_cut 清积压。
+    assert emitted == [b"first", b"second", b"third", b"fourth", b"fifth"]
+    assert late_cuts == [True, True, True]
+    # 复读判定后同 response 的后续分块被丢弃。
+    gate.push_audio("r5", b"fifth-tail")
+    assert emitted[-1] == b"fifth"
     assert nudges == [repeated, repeated]
     assert stuck == [(3, repeated)]
 
@@ -118,5 +125,8 @@ def test_response_gate_resets_suppression_streak_after_different_content():
     gate.push_audio("r5", b"repeat-after-reset")
     assert gate.complete_transcript("r5", repeated) is False
 
-    assert emitted == [b"first", b"second", b"different", b"repeat-after-reset"]
+    # streaming 语义：r3 的音频在复读判定前已开播。
+    assert emitted == [
+        b"first", b"second", b"third", b"different", b"repeat-after-reset",
+    ]
     assert stuck == []

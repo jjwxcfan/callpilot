@@ -657,7 +657,11 @@ def test_stop_during_reconnect_closes_new_connection(monkeypatch):
 
 
 def test_repetitive_agent_response_audio_is_suppressed(monkeypatch, caplog):
-    """下行转写命中复读判重时，该 response 已缓存音频不得进入下行队列。"""
+    """复读判定后，该 response 的后续音频分块不得再进入下行队列。
+
+    streaming 语义（WIL-112）：判定前到达的分块即时放行（每轮不再为复读检查
+    垫付「首音频→转写完成」的延迟），判定后丢弃剩余分块并触发清积压回调。
+    """
     monkeypatch.setenv("REPEAT_SUPPRESS_SIMILARITY", "0.9")
     agent = qwen_agent.QwenVoiceAgent(
         api_key="test-key",
@@ -701,14 +705,22 @@ def test_repetitive_agent_response_audio_is_suppressed(monkeypatch, caplog):
             "response_id": "r3",
             "transcript": repeated,
         })
+        # 判定为复读之后，同 response 的迟到分块必须被丢弃。
+        callback.on_event({
+            "type": "response.audio.delta",
+            "response_id": "r3",
+            "delta": base64.b64encode(b"late-tail").decode("ascii"),
+        })
 
     assert agent._audio_queue.get_nowait() == b"repeat"
+    # streaming 语义：r3 判定前到达的分块已放行。
+    assert agent._audio_queue.get_nowait() == b"repeat-again"
     try:
         agent._audio_queue.get_nowait()
     except Empty:
         pass
     else:
-        raise AssertionError("复读响应音频不应进入下行队列")
+        raise AssertionError("复读判定后的迟到分块不应进入下行队列")
     assert "抑制复读" in caplog.text
 
 
