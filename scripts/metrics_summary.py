@@ -26,9 +26,9 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from agentcall.call_metrics import _LATENCY_STAGES  # noqa: E402
+from agentcall.call_metrics import LATENCY_FIELDS  # noqa: E402
 
-_LATENCY_FIELDS = list(_LATENCY_STAGES.values())
+_LATENCY_FIELDS = LATENCY_FIELDS
 
 
 def _nearest_rank(ordered: list[float], q: float) -> float:

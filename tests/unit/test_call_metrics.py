@@ -97,7 +97,7 @@ def test_missing_metrics_are_null_with_reason_never_zero():
     assert unavailable["first_audio_ms"] == "no_samples"
     # 先天测不了/未埋点的常驻原因（WIL-95 2.1 / 分期）。
     assert unavailable["e2e_latency_ms"] == "carrier_legs_unobservable"
-    assert unavailable["termination_kind"] == "not_instrumented"
+    assert unavailable["takeover_latency_ms"] == "not_instrumented"
 
 
 def test_interruption_reason_forks_on_barge_in_flag():
@@ -154,6 +154,71 @@ def test_tool_dtmf_and_fallback_rollups():
         "outcomes": {"observed": 1, "unobserved": 1},
     }
     assert metrics["barge_in_fallback"] is True
+
+
+# ---- v2：终止归类 / 挂断时延 / 工具耗时 / 通话上下文 ----
+
+
+def test_termination_defaults_to_peer_hangup():
+    """没有任何本机主动信号且正常结束 → 排除法归为对端先挂。"""
+    metrics = _build([_snapshot()])
+    assert metrics["termination"] == {
+        "kind": "peer_hangup",
+        "reason": "inferred_no_local_signal",
+    }
+
+
+def test_termination_prefers_local_signals():
+    hang = _build([
+        {"type": "tool_call", "ts": 1.0, "tool": "hangup_call",
+         "args": {}, "result": {"success": True}},
+    ])
+    assert hang["termination"] == {"kind": "agent_hangup", "reason": "hangup_tool"}
+
+    wind = _build([{"type": "winddown", "ts": 2.0, "reason": "wrap_up_judge"}])
+    assert wind["termination"] == {"kind": "agent_hangup", "reason": "wrap_up_judge"}
+
+    took = _build([{"type": "takeover_committed", "ts": 3.0, "generation": 1}])
+    assert took["termination"]["kind"] == "takeover"
+    assert took["takeover"] == {"committed": 1}
+
+    dead = _build([{"type": "dead_media_detected", "ts": 4.0,
+                    "silent_seconds": 8.0, "hangup": True}])
+    assert dead["termination"]["kind"] == "dead_media"
+
+    err = _build([], status="failed")
+    assert err["termination"] == {"kind": "error", "reason": "failed"}
+
+    missed = _build([], status="not_connected")
+    assert missed["termination"]["kind"] == "not_connected"
+
+
+def test_hangup_latency_from_last_dialogue_activity():
+    events = [
+        {"type": "transcript", "ts": 100.0, "role": "user", "text": "好，再见"},
+        {"type": "call_finished", "ts": 101.5, "status": "completed"},
+    ]
+    metrics = _build(events)
+    assert metrics["hangup_latency_ms"] == 1500.0
+
+    empty = _build([])
+    assert empty["hangup_latency_ms"] is None
+    assert empty["unavailable"]["hangup_latency_ms"] == "no_dialogue_activity"
+
+
+def test_tool_latency_context_and_goal_rollup():
+    events = [
+        {"type": "latency", "ts": 1.0, "stage": "tool_call", "ms": 42.0,
+         "tool": "send_sms"},
+        {"type": "call_context", "ts": 2.0, "contact_known": True},
+        {"type": "task_goal", "ts": 3.0, "goal": "确认周六 19:00 有无空位"},
+    ]
+    metrics = _build(events)
+    assert metrics["latency"]["tool_call_latency_ms"]["n"] == 1
+    assert metrics["contact_known"] is True
+    assert metrics["has_task_goal"] is True
+    # 任务目标原文不得进 metrics（隐私：目标可能含机主个人信息）。
+    assert "确认周六" not in json.dumps(metrics, ensure_ascii=False)
 
 
 # ---- finish 落盘 ----
