@@ -9,6 +9,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable
 
+from .. import config
+
 logger = logging.getLogger(__name__)
 
 ToolHandler = Callable[[dict[str, Any]], dict[str, Any]]
@@ -141,6 +143,57 @@ def _dtmf_log_mode(result: dict[str, Any]) -> str:
     return mode if isinstance(mode, str) and mode in _DTMF_LOG_MODES else "unknown"
 
 
+# ---- 工具描述本地化 ----
+# 规格里的中文描述会**随 session 一起发给模型**；英文场景下模型看到满屏中文
+# 会跟着说中文（真机 2026-08-12：机主配置 AGENT_LANGUAGE=en、对端全程说英文，
+# AI 却用中文开口）。这里在注册时按语言替换，不改动既有规格结构。
+_EN_TEXT: dict[tuple[str, str | None], str] = {
+    ("send_sms", None): (
+        "Send an SMS on the owner's behalf. Use it when the caller asks for "
+        "something in writing, or to pass a message along."
+    ),
+    ("send_sms", "to"): (
+        "Recipient phone number; leave empty to text the current caller."
+    ),
+    ("send_sms", "content"): "Message body.",
+    ("hangup_call", None): (
+        "End the call. Say a short goodbye line before calling this."
+    ),
+    ("send_dtmf", None): (
+        "Send DTMF keypad tones, for navigating phone menus."
+    ),
+    ("send_dtmf", "digits"): "Key sequence to send; only 0-9, * and # are allowed.",
+    ("query_verification_code", None): (
+        "Look up the most recently received SMS verification code."
+    ),
+    ("request_owner_takeover", None): (
+        "Hand the live call over to the owner's phone."
+    ),
+}
+
+
+def localize_spec(spec: dict[str, Any]) -> dict[str, Any]:
+    """按 AGENT_LANGUAGE 本地化工具描述；非英文原样返回（不复制、零开销）。"""
+    if config.get_str("AGENT_LANGUAGE").strip().lower() != "en":
+        return spec
+    name = _tool_name(spec)
+    if not name:
+        return spec
+    fn = dict(spec.get("function", {}))
+    top = _EN_TEXT.get((name, None))
+    if top:
+        fn["description"] = top
+    params = fn.get("parameters") or {}
+    props = params.get("properties") or {}
+    if props:
+        new_props = {}
+        for key, schema in props.items():
+            text = _EN_TEXT.get((name, key))
+            new_props[key] = {**schema, "description": text} if text else schema
+        fn["parameters"] = {**params, "properties": new_props}
+    return {**spec, "function": fn}
+
+
 class ToolRegistry:
     """工具注册表：保存规格与对应处理函数，供 Agent 调用。"""
 
@@ -151,7 +204,7 @@ class ToolRegistry:
         name = _tool_name(spec)
         if not name:
             raise ValueError("工具规格缺少 name")
-        self._tools[name] = (spec, handler)
+        self._tools[name] = (localize_spec(spec), handler)
 
     def specs(self) -> list[dict[str, Any]]:
         return [spec for spec, _ in self._tools.values()]

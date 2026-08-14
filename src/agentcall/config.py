@@ -185,6 +185,30 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # 代价是对方句中停顿稍长就会被抢话。真机体感 250~350 较自然。0/负值=不下发，
     # 用 OpenAI 默认。仅 OpenAI 链路。
     ConfigSpec("OPENAI_VAD_SILENCE_MS", "OpenAI VAD 静默判停（毫秒）", "int", "300"),
+    # server_vad 能量阈值（0~1，OpenAI 默认 0.5）。电话线路底噪会拖住判停：真机
+    # 实测音尾→speech_stopped 拖到 0.9~2.7s（静默窗仅 0.3s）。适当抬高让底噪更快
+    # 被认作静音、判停更利落；太高会漏掉小声说话的开头。0=用服务端默认。
+    ConfigSpec("OPENAI_VAD_THRESHOLD", "OpenAI VAD 能量阈值（0=服务端默认）",
+               "float", "0"),
+    # 输入降噪（喂给 VAD 与模型前）：near_field=近讲耳机，far_field=远场/电话。
+    # 与抬 VAD 阈值同攻「判停拖尾」。空=不启用。
+    ConfigSpec("OPENAI_NOISE_REDUCTION", "OpenAI 输入降噪（空/near_field/far_field）",
+               "str", ""),
+    # 判停方式。server_vad 只看静音时长——静默窗短则抢话（对方「OK…」稍顿就被
+    # 接走，2026-08-12 真机复现）、长则每轮都慢，一个旋钮救不了两头。semantic_vad
+    # 按语义判断对方是否说完：完整问句立刻接，明显有下文就等。选 semantic_vad 时
+    # OPENAI_VAD_SILENCE_MS / OPENAI_VAD_THRESHOLD 不生效。
+    ConfigSpec("OPENAI_TURN_DETECTION", "OpenAI 判停方式（server_vad/semantic_vad）",
+               "str", "server_vad"),
+    # semantic_vad 的积极程度：low=多等、medium、high=尽快接话、auto=默认(medium)。
+    ConfigSpec("OPENAI_VAD_EAGERNESS", "semantic_vad 接话积极度", "str", "auto"),
+    # 单轮回复的 token 上限（0=不限）。提示词管不住啰嗦（WIL-83/112 实测：明令
+    # 「说短点」仍单轮 14~18 秒），本地硬切又会把话切在半截；在 provider 侧限长
+    # 才是从源头让它少生成，且转写与对端听到的一致。**注意 audio 与 reasoning
+    # token 都计入**：真机实测一句话 ≈ 250（text 90 + audio 110 + reasoning 48），
+    # 设 200 会把第一句掐成 incomplete。两三句话 ≈ 900。
+    ConfigSpec("OPENAI_MAX_RESPONSE_TOKENS", "OpenAI 单轮回复 token 上限（0=不限）",
+               "int", "0"),
     # 端点覆写（可选）：留空即直连 api.openai.com；仅在用反代/Azure OpenAI，
     # 或所在网络无法直连 OpenAI 时才需要填。
     ConfigSpec("OPENAI_REALTIME_URL", "OpenAI Realtime 端点覆写", "str", "",

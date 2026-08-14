@@ -375,3 +375,29 @@ def test_stale_agent_generation_rejects_every_tool_before_side_effect() -> None:
     assert modem.calls == []
     assert hangups == []
     assert record.events == []
+
+
+# ---- WIL-112：工具描述随 AGENT_LANGUAGE 本地化 ----
+
+def test_tool_specs_localized_to_english(monkeypatch):
+    """规格里的中文描述会随 session 发给模型，英文场景下会把模型带偏说中文
+    （真机 2026-08-12：机主配英文、对端说英文，AI 却用中文开口）。"""
+    monkeypatch.setenv("AGENT_LANGUAGE", "en")
+    from agentcall.agents.tools import SEND_SMS_SPEC, ToolRegistry
+
+    registry = ToolRegistry()
+    registry.register(SEND_SMS_SPEC, lambda args: {})
+    spec = registry.specs()[0]["function"]
+    assert "Send an SMS" in spec["description"]
+    assert "收件" not in str(spec)
+    # 原规格常量不得被就地改动（多处共享）
+    assert "收件手机号码" in str(SEND_SMS_SPEC)
+
+
+def test_tool_specs_keep_chinese_by_default(monkeypatch):
+    monkeypatch.setenv("AGENT_LANGUAGE", "zh")
+    from agentcall.agents.tools import SEND_SMS_SPEC, ToolRegistry
+
+    registry = ToolRegistry()
+    registry.register(SEND_SMS_SPEC, lambda args: {})
+    assert "收件手机号码" in str(registry.specs()[0])

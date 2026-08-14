@@ -32,8 +32,19 @@ NMEA_WRITE_INTERVAL_SECONDS = 0.1
 # 进送：100ms 大帧会让模组播放缓冲在帧间饿死——真机实测对端听到断续（连续音变
 # “嘟嘟嘟”）、语音直接听不清。20ms 小帧≈连续喂，缓冲不饿死。仅 SerialPcmAudioBridge
 # 用，ffmpeg/UAC(Quectel) 路径仍用上面的 NMEA_WRITE_SIZE。
-SERIAL_PCM_WRITE_SIZE = 640  # 40ms @ 8kHz/16-bit mono
-SERIAL_PCM_WRITE_INTERVAL_SECONDS = 0.04
+# 下行帧大小对齐 USB bulk 最大包（512B）：桥每次从 PTY 最多读 max_packet=512，
+# 若按 640B/帧写，每帧会被拆成 512+128 两个 USB 包，而 128B 是**短包**——USB 语义
+# 上表示「一次传输结束」，模组音频缓冲会据此做帧边界处理，每 40ms 一次 → 真机表现
+# 为「每个字都卡」。写成 512B/32ms 即每帧恰好一个满包，不产生短包。
+SERIAL_PCM_WRITE_SIZE = 512  # 32ms @ 8kHz/16-bit mono，= USB bulk 满包
+# 上行对齐自检参数：攒够 ~1s 且有明显声音才判定，避免拿静音瞎判。
+_ALIGN_PROBE_BYTES = 16000      # ~1s @ 8kHz/16-bit
+_ALIGN_MIN_PEAK = 800           # 低于此峰值视为静音，继续攒
+_ALIGN_MARGIN = 0.15            # 偏移1 需明显优于对齐0 才纠正
+_ALIGN_CLEAR_WIN = 0.6          # 判定所需的「明确赢家」相关性下限；两侧都含糊不锁定
+_ALIGN_BAD_CORR = 0.3           # 锁定后监控：有声段相关性低于此=疑似中途错位，重探
+_ALIGN_MONITOR_BYTES = 32000    # 锁定后每 ~2s 有声数据复核一次相关性
+SERIAL_PCM_WRITE_INTERVAL_SECONDS = 0.032   # 512B @ 8kHz/16-bit = 32ms 实时
 
 
 def find_device_index(keyword: str, kind: str | None = None) -> int | None:
@@ -170,6 +181,21 @@ class SerialPcmAudioBridge:
         # 上行读 carry：串口/PTY 单次 read 可能返回奇数字节（16-bit 采样被拆到两次
         # 读），直接喂 np.frombuffer(int16) 会 ValueError 崩掉整通。留 1 字节到下次。
         self._rx_carry = b""
+        # 上行字节对齐自愈：carry 只保证「相对流首」的一致，保证不了流首本身是否
+        # 落在采样边界上。真机实测（2026-08-12）整条上行恒定偏移 1 字节——高低字节
+        # 颠倒后正常语音变成振幅顶满的垃圾：VAD 以为有人说话、ASR 一个字认不出，
+        # 长期被误判成「模组上行削波」。这里用相邻样本相关性判定真实对齐并一次性纠正。
+        self._align_locked = False
+        self._align_drop = False
+        self._align_probe = bytearray()
+        self._align_monitor = bytearray()
+        # 上行串口积压观测（read_modem_chunk 内聚合，每 5s 一行）。
+        self._inwaiting_max = 0
+        self._inwaiting_sum = 0
+        self._inwaiting_n = 0
+        self._inwaiting_logged_at = 0.0
+        # 下行首帧观测：最近一次真实（非补零）帧进串口的时刻。
+        self._last_real_payload_at = 0.0
         self._ready_check: "Callable[[], bool] | None" = None
         self._ser: serial.Serial | None = None
         self._tx_buffer = bytearray()
@@ -184,6 +210,10 @@ class SerialPcmAudioBridge:
     def start(self) -> None:
         self._ser = self._open_serial()
         self._rx_carry = b""
+        self._align_locked = False
+        self._align_drop = False
+        self._align_probe.clear()
+        self._align_monitor.clear()
         self._ser.reset_input_buffer()
         self._ser.reset_output_buffer()
         self._running = True
@@ -236,13 +266,117 @@ class SerialPcmAudioBridge:
     def read_modem_chunk(self) -> bytes:
         if not self._ser:
             return b""
+        # 上行盲区埋点（WIL-112）：读之前串口里积着多少字节。常驻高水位=我们
+        # 落后实时（这段延迟对录音/发送/本地埋点全部不可见，只有对端耳朵在付）；
+        # 锯齿形=模组攒批发送。每 5s 聚合一行。
+        try:
+            waiting = self._ser.in_waiting
+        except (OSError, AttributeError):
+            waiting = -1
+        if waiting >= 0:
+            self._inwaiting_max = max(self._inwaiting_max, waiting)
+            self._inwaiting_sum += waiting
+            self._inwaiting_n += 1
+            now = time.monotonic()
+            if now - self._inwaiting_logged_at >= 5 and self._inwaiting_n:
+                logger.info(
+                    "[timing] 上行串口积压: max=%dB(≈%.0fms) 均值=%dB (n=%d)",
+                    self._inwaiting_max,
+                    self._inwaiting_max / (MODEM_RATE * 2) * 1000,
+                    self._inwaiting_sum // self._inwaiting_n,
+                    self._inwaiting_n,
+                )
+                self._inwaiting_max = 0
+                self._inwaiting_sum = 0
+                self._inwaiting_n = 0
+                self._inwaiting_logged_at = now
         # carry + 本次读，保证返回偶数字节（16-bit 对齐）；奇出的 1 字节留到下次。
         data = self._rx_carry + self._ser.read(NMEA_READ_SIZE)
+        if self._align_drop and data:
+            # 判定为错位：丢 1 字节把整条流拨回采样边界（此后 carry 维持新对齐）。
+            data = data[1:]
+            self._align_drop = False
         if len(data) % 2:
             self._rx_carry = data[-1:]
-            return data[:-1]
-        self._rx_carry = b""
+            data = data[:-1]
+        else:
+            self._rx_carry = b""
+        if not self._align_locked:
+            self._probe_alignment(data)
+        else:
+            self._monitor_alignment(data)
         return data
+
+    def _probe_alignment(self, data: bytes) -> None:
+        """用相邻样本相关性判断上行是否整体错位 1 字节。
+
+        真实语音相邻样本高度相关（r>0.8）；错位后高低字节颠倒，相关性趋近 0。
+        只在攒够足够「有声」样本后判定，避免拿静音段瞎判。证据必须**一边倒**才
+        锁定（真机教训 2026-08-12：两个偏移都 0.8+ 的含糊样本被当「对齐正常」
+        锁死，整通乱码没人管）；含糊就扔掉这批继续攒。锁定后仍由
+        _monitor_alignment 持续复核——劣化的模组会中途丢字节，错位可能随时发生。
+        """
+        self._align_probe.extend(data)
+        if len(self._align_probe) < _ALIGN_PROBE_BYTES:
+            return
+        probe = bytes(self._align_probe)
+        self._align_probe.clear()
+        scores = []
+        for offset in (0, 1):
+            chunk = probe[offset: offset + (len(probe) - offset) // 2 * 2]
+            samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
+            if samples.size < 1000 or np.max(np.abs(samples)) < _ALIGN_MIN_PEAK:
+                return  # 太安静，判不准，继续攒
+            scores.append(float(np.corrcoef(samples[:-1], samples[1:])[0, 1]))
+        best = max(scores)
+        # NaN（恒定/退化信号，如纯音尾巴）视为含糊：NaN 的比较全为 False，
+        # 不设防会直接落到锁定分支。
+        if (
+            not all(np.isfinite(s) for s in scores)
+            or best < _ALIGN_CLEAR_WIN
+            or abs(scores[0] - scores[1]) < _ALIGN_MARGIN
+        ):
+            logger.info(
+                "上行对齐证据含糊（对齐0 %.3f，偏移1 %.3f），不锁定继续探",
+                scores[0], scores[1],
+            )
+            return
+        self._align_locked = True
+        if scores[1] > scores[0]:
+            self._align_drop = True
+            logger.warning(
+                "上行字节错位已纠正：偏移1 相关性 %.3f > 对齐0 %.3f（丢 1 字节回到采样边界）",
+                scores[1], scores[0],
+            )
+        else:
+            logger.info(
+                "上行字节对齐正常（对齐0 相关性 %.3f，偏移1 %.3f）", scores[0], scores[1]
+            )
+
+    def _monitor_alignment(self, data: bytes) -> None:
+        """锁定后的持续复核：有声段相关性塌到乱码水平就解锁重探。
+
+        中途错位的来源是 USB/模组丢字节（劣化形态之一），carry 只保证「相对流首」
+        的对齐，保证不了流本身不丢字节。重探期间照常出流（乱码已经在流上了，
+        不会更糟）；重探判定错位后丢 1 字节归位，代价是 1 个采样点的毛刺。
+        """
+        self._align_monitor.extend(data)
+        if len(self._align_monitor) < _ALIGN_MONITOR_BYTES:
+            return
+        probe = bytes(self._align_monitor)
+        self._align_monitor.clear()
+        usable = len(probe) - (len(probe) % 2)
+        samples = np.frombuffer(probe[:usable], dtype=np.int16).astype(np.float32)
+        if samples.size < 1000 or np.max(np.abs(samples)) < _ALIGN_MIN_PEAK:
+            return  # 静音段，无法复核
+        corr = float(np.corrcoef(samples[:-1], samples[1:])[0, 1])
+        if corr < _ALIGN_BAD_CORR:
+            self._align_locked = False
+            self._align_probe.clear()
+            logger.warning(
+                "上行有声段相关性塌陷（%.3f < %.1f），疑似中途字节错位，重新探测对齐",
+                corr, _ALIGN_BAD_CORR,
+            )
 
     def pending_output_bytes(self) -> int:
         with self._tx_lock:
@@ -322,12 +456,20 @@ class SerialPcmAudioBridge:
             if len(self._tx_buffer) >= self._write_size:
                 payload = bytes(self._tx_buffer[: self._write_size])
                 del self._tx_buffer[: self._write_size]
-                return payload
-            if self._tx_buffer:
+            elif self._tx_buffer:
                 payload = bytes(self._tx_buffer)
                 self._tx_buffer.clear()
-                return payload + silence[: self._write_size - len(payload)]
-        return silence
+                payload = payload + silence[: self._write_size - len(payload)]
+            else:
+                return silence
+        # 下行盲区埋点（WIL-112）：≥1s 静默后的首个真实帧=新一轮开播进串口。
+        # 与「判停→首音频」「端到端」两条日志的时间戳相减，即可归属
+        # websocket→闸门→队列→串口 各段耗时。
+        now = time.monotonic()
+        if now - self._last_real_payload_at > 1.0:
+            logger.info("[timing] 下行新一轮首帧进串口")
+        self._last_real_payload_at = now
+        return payload
 
     def _log_write_stats(self) -> None:
         now = time.monotonic()

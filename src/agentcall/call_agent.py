@@ -11,11 +11,12 @@ import re
 import secrets
 import threading
 import time
+from array import array
 from datetime import UTC, datetime
 from queue import Empty, Full, Queue
 from typing import Callable
 
-from . import config
+from . import config, platforms
 from .agents.base import VoiceAgent
 from .agents.factory import create_agent
 from .agents.tools import REQUEST_OWNER_TAKEOVER_SPEC, ToolRegistry
@@ -90,6 +91,12 @@ from .triage_judge import (
 )
 
 logger = logging.getLogger(__name__)
+
+# 上行「有声」判定峰值（int16）。真机实测（2026-08-12）上行静音是纯数字零
+# （峰值中位 2、p90 13）——modem 不给底噪，所以阈值可以放得很低；而对端小声
+# 说话峰值常在 500~900，设 1000 会把句尾标早、夸大「音尾→判停」的读数。
+# 只用于轮次延迟测量的打点，不参与任何对话逻辑。
+_VOICED_PEAK_THRESHOLD = 350
 
 # dtmf_outcome 事件里对端话语的截断长度：够判读，又不至于把整段通话搬进事件流。
 _OUTCOME_TEXT_CHARS = 80
@@ -184,6 +191,12 @@ class CallSession:
         self._active = False
         self._active_lock = threading.Lock()
         self._outgoing_audio: Queue[bytes] = Queue()
+        # 本轮是否已记过「排队时长」（每轮只记一次，见 _make_agent_audio_handler）。
+        self._turn_first_audio_logged = False
+        # 上行最近一次「有声」块的到达时刻（monotonic）。首块回复音频到达时用
+        # now - 这个值 得到本地可观测的端到端轮次延迟（上行传输 + VAD 判停 +
+        # 生成），比「判停→首音频」多覆盖前半段链路；蜂窝两腿仍在其外。
+        self._last_voiced_at = 0.0
         # barge-in（BARGE_IN_ENABLED）：每通开始时从 config 读取；True 时上行
         # 不做半双工丢弃、对端开口即打断 AI（见 _run_agent_loop 与打断回调）。
         self._barge_in = False
@@ -455,7 +468,11 @@ class CallSession:
             )
             mark("answered")
 
-            await asyncio.sleep(1.0)
+            # 接听后静置时长由厂商实现决定：自带重试的（SIM7600）不必盲等整秒，
+            # 首次失败立刻重试即可，健康态省约 0.8s（WIL-104）。Quectel 维持 1.0s。
+            await asyncio.sleep(
+                getattr(self.modem, "POST_ANSWER_SETTLE_SECONDS", 1.0)
+            )
 
             # 挂断流程会发 AT+QPCMV=0 关闭语音通道，每通电话都要重新启用，
             # 否则第二通开始模组无 PCM 流（双向无声）。
@@ -683,6 +700,33 @@ class CallSession:
             if pcm_8k:
                 if record is not None:
                     record.write_downlink(pcm_8k)
+                # 本轮首块音频入队时，记录「它前面还排着多少秒没播完」——这才是
+                # 对端真正要等的时间。判停→首音频只是 OpenAI 生成耗时，不含排队
+                # （WIL-112：录音按生成时点记录，会把排队完全抹掉，别再用它判断）。
+                if not self._turn_first_audio_logged:
+                    self._turn_first_audio_logged = True
+                    pending = (
+                        bridge.pending_output_bytes()
+                        if hasattr(bridge, "pending_output_bytes") else 0
+                    )
+                    queued = self._outgoing_audio.qsize() * len(pcm_8k)
+                    ahead = (pending + queued) / (MODEM_RATE * 2)
+                    if ahead >= 0.5:
+                        logger.info(
+                            "[timing] 本轮回复前面还排着 %.1fs 未播完（对端要多等这么久）",
+                            ahead,
+                        )
+                    # 端到端（本地可观测）：上行最后一块有声 → 首块回复到达。
+                    # 覆盖上行传输 + VAD 判停 + 生成；对端体感还要再加蜂窝两腿
+                    # （各 ~0.2-0.3s）与本地播出排队（上面的 ahead）。
+                    voiced_at = self._last_voiced_at
+                    if voiced_at > 0:
+                        e2e = time.monotonic() - voiced_at
+                        if 0 < e2e < 30:
+                            logger.info(
+                                "[timing] 端到端轮次延迟(本地音尾→首音频): %.0fms",
+                                e2e * 1000,
+                            )
                 self._outgoing_audio.put(pcm_8k)
 
         return on_agent_audio
@@ -884,6 +928,18 @@ class CallSession:
                 if self._dead_media_hangup:
                     break
             if pcm_8k:
+                # 端到端轮次延迟的起点：这块上行是否「有声」。峰值扫描与
+                # PcmFlowStats.add 同量级（每块几百样本），开销可忽略。
+                usable = len(pcm_8k) - (len(pcm_8k) % 2)
+                if usable:
+                    samples = array("h", pcm_8k[:usable])
+                    if max(max(samples), -min(samples)) >= _VOICED_PEAK_THRESHOLD:
+                        # 静音 >1s 后再次有声 = 一次新发声的起点。与 provider 的
+                        # speech_started 到达时刻对表，可分离「上行传输延迟」与
+                        # 「VAD 判停拖尾」（WIL-112 暗区定位）。
+                        if now - self._last_voiced_at > 1.0:
+                            logger.info("[timing] 本地检测到语音起点")
+                        self._last_voiced_at = now
                 # 录音不受半双工屏蔽影响（内存追加，非磁盘 IO）。
                 if record is not None:
                     record.write_uplink(pcm_8k)
@@ -2171,18 +2227,23 @@ class CallSession:
         代价要说清：这是**硬切**，被截的那一轮结尾会突兀。默认阈值取在实测
         p90 之上就是为了让它只在明显跑飞时才触发。
         """
-        if self._max_turn_seconds <= 0 or not pcm_agent:
+        if not pcm_agent:
             return False
-        rate = getattr(agent, "output_rate", 0) or self._agent_output_rate
-        if rate <= 0:
-            return False
+        # 轮次边界检测不属于闸门：排队/端到端埋点的「每轮一次」标志也靠它复位，
+        # 闸门关闭（max_turn_seconds<=0）时同样要走到（2026-08-12 教训：早退在
+        # 这之前会让埋点在首轮之后永久哑掉）。
         now = time.monotonic()
         with self._turn_lock:
             if now - self._turn_last_chunk_at > self._TURN_GAP_SECONDS:
                 # 空档 → 新的一轮，计数与「已超限」标志一起重置。
                 self._turn_audio_bytes = 0
                 self._turn_cancel_sent = False
+                self._turn_first_audio_logged = False
             self._turn_last_chunk_at = now
+        rate = getattr(agent, "output_rate", 0) or self._agent_output_rate
+        if self._max_turn_seconds <= 0 or rate <= 0:
+            return False
+        with self._turn_lock:
             if self._turn_cancel_sent:
                 return True  # 本轮已超限，后续分块一律丢弃
             self._turn_audio_bytes += len(pcm_agent)
@@ -3460,7 +3521,101 @@ class CallAgentService:
                 return
             self._set_modem_connected(True)
             logger.info("模组已连接，等待来电…")
+            self._watch_modem_link()
             return
+
+    # 断连超过该秒数仍未自愈，就由 supervisor 重新走一遍连接流程。
+    _LINK_WATCHDOG_SECONDS = 45.0
+    _LINK_WATCHDOG_POLL = 5.0
+    # 单轮重建的时限：connect() 会跑整套初始化（SMS/SIM 查询），正常几秒内完成。
+    # 真机 2026-08-12 出现过 connect() 5 分钟不返回（WIL-111），故必须有界——
+    # 超时就放弃本轮、下轮再试，绝不让看门狗线程被挂死而失去看护能力。
+    _LINK_RECONNECT_TIMEOUT = 30.0
+
+    def _modem_port_ready(self) -> bool:
+        """串口是否已存在。
+
+        macOS 上串口是 USB 桥建出来的 PTY symlink；桥执行 PCM 自愈期间会删掉它、
+        约一分半后重建。此时去 connect 注定失败，还可能卡在半开状态（WIL-111），
+        故先看文件在不在，不在就安静等下一轮。``auto`` 哨兵交给探测逻辑，不预判。
+        """
+        port = getattr(self.modem, "port", "")
+        if not port or port == platforms.AUTO_PORT:
+            return True
+        return os.path.exists(port)
+
+    def _reconnect_modem_bounded(self) -> bool:
+        """在时限内重建模组连接；超时返回 False（本轮放弃，下轮再试）。
+
+        connect() 可能因串口/锁竞争长时间阻塞，直接在看门狗线程里调用会把看门狗
+        本身挂死。放到独立线程并 join(timeout)：即便它卡住，看门狗仍能继续巡检。
+        """
+        result: dict[str, BaseException | None] = {"error": None}
+
+        def _do() -> None:
+            try:
+                self.modem.connect()
+                self.modem.initialize_for_voice(self.audio_mode)
+                self.modem.start_listener()
+            except BaseException as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        worker = threading.Thread(
+            target=_do, name="modem-watchdog-reconnect", daemon=True
+        )
+        worker.start()
+        worker.join(timeout=self._LINK_RECONNECT_TIMEOUT)
+        if worker.is_alive():
+            logger.warning(
+                "看门狗重建连接超过 %.0fs 未完成，本轮放弃（下轮再试）",
+                self._LINK_RECONNECT_TIMEOUT,
+            )
+            return False
+        if result["error"] is not None:
+            logger.warning("看门狗重建连接失败，稍后再试: %s", result["error"])
+            return False
+        return True
+
+    def _watch_modem_link(self) -> None:
+        """连接看门狗：模组长时间断开就重新建连（不依赖 modem 内部重连线程活着）。
+
+        真机事故（2026-08-12，WIL-110）：USB 桥执行 PCM 卡死自愈期间串口消失约
+        100 秒，桥恢复后 app 的重连线程已因异常穿透而死亡，进程活着却永远连不
+        回来——来电全部无人接听，只能手工重启服务。modem 侧的异常穿透已修，但
+        这里再加一道与线程状态无关的兜底：只要「断开持续够久」就重建连接
+        （``start_listener`` 对已存活的线程是幂等的，不会重复起线程）。
+        """
+        # 鸭子类型的 modem（测试替身/旧实现）可能没有 is_connected，
+        # 那就没有可看护的信号，直接退出而不是让看门狗线程抛异常死掉。
+        is_connected = getattr(self.modem, "is_connected", None)
+        if not callable(is_connected):
+            return
+        disconnected_since: float | None = None
+        while self._service_running:
+            time.sleep(self._LINK_WATCHDOG_POLL)
+            if not self._service_running:
+                return
+            if is_connected():
+                disconnected_since = None
+                continue
+            now = time.monotonic()
+            if disconnected_since is None:
+                disconnected_since = now
+                continue
+            if now - disconnected_since < self._LINK_WATCHDOG_SECONDS:
+                continue
+            if not self._modem_port_ready():
+                # 桥多半正在做 PCM 自愈（串口被删、约 1 分半后重建）：安静等它建好，
+                # 不把计时清零，端口一回来立刻重连。
+                continue
+            logger.warning(
+                "模组已断开超过 %.0fs，看门狗重建连接", self._LINK_WATCHDOG_SECONDS
+            )
+            disconnected_since = None
+            if not self._reconnect_modem_bounded():
+                continue
+            self._set_modem_connected(True)
+            logger.info("看门狗已恢复模组连接，等待来电…")
 
     def _set_modem_connected(self, connected: bool, error: str | None = None) -> None:
         """更新模组连接状态并广播给 UI（仅状态翻转时发事件，避免重连期刷屏）。"""

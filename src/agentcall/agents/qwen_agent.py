@@ -259,6 +259,8 @@ class QwenVoiceAgent(VoiceAgent):
             lambda chunk: self._audio_queue.put(chunk),
             on_suppressed=self._nudge_after_repeat_suppressed,
             on_stuck=self._repeat_suppression_stuck,
+            # 复读已开播才被判定时清设备侧积压（barge-in 同一回调，未注册则无害）。
+            on_late_cut=self._emit_user_interrupt,
         )
         self._callback = _QwenCallback(self._audio_queue, agent=self)
         self._on_audio_out: Callable[[bytes], None] | None = None

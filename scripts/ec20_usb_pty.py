@@ -97,6 +97,9 @@ class BridgeHandle:
     slave_fd: int
     stop: threading.Event
     closed: bool = False
+    # 因「模组持续不排空端点」而拆桥（区别于真拔线）：置位后主循环会先跑
+    # USB 组合切换恢复再重连，见 usb_composition_recovery。
+    degraded: bool = False
 
     def close(self) -> None:
         if self.closed:
@@ -200,6 +203,135 @@ def probe_at(dev: usb.core.Device, port: UsbPort) -> bytes:
         usb.util.release_interface(dev, port.interface)
 
 
+def at_on_interface(
+    dev: usb.core.Device, port: UsbPort, cmd: str,
+    wait: float = 1.5, rounds: int = 15,
+) -> str:
+    """在指定 bulk 接口上发一条 AT 并返回响应文本（恢复流程用，独立于桥）。"""
+    usb.util.claim_interface(dev, port.interface)
+    try:
+        while True:  # 清残留 URC
+            try:
+                dev.read(port.bulk_in, port.max_packet, timeout=50)
+            except usb.core.USBError:
+                break
+        dev.write(port.bulk_out, (cmd + "\r").encode("ascii"), timeout=1000)
+        time.sleep(wait)
+        data = b""
+        for _ in range(rounds):
+            try:
+                data += bytes(dev.read(port.bulk_in, port.max_packet, timeout=250))
+            except usb.core.USBError:
+                break
+        return data.decode("ascii", "ignore")
+    finally:
+        try:
+            usb.util.release_interface(dev, port.interface)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def find_at_port_dynamic(
+    vid: int, timeout: float = 60.0,
+) -> tuple[usb.core.Device | None, UsbPort | None]:
+    """只按 VID 找设备并逐个 bulk 接口探 AT。
+
+    切换 USB 组合后 **AT 口会换接口号**（真机：9001 组合在 interface 2，
+    9011 组合跑到 interface 4/5），写死接口号会直接失联，故必须动态探测。
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            dev = usb.core.find(idVendor=vid, backend=libusb_backend())
+        except usb.core.NoBackendError:
+            return None, None
+        if dev is None:
+            time.sleep(1.0)
+            continue
+        try:
+            ports = discover_ports(dev)
+        except usb.core.USBError:
+            time.sleep(1.0)
+            continue
+        for port in ports.values():
+            try:
+                if "OK" in at_on_interface(dev, port, "AT", wait=0.4, rounds=8):
+                    return dev, port
+            except usb.core.USBError:
+                continue
+        usb.util.dispose_resources(dev)
+        time.sleep(1.0)
+    return None, None
+
+
+def usb_composition_recovery(
+    vid: int, target_pid: int, alt_pid: int,
+    attempts: int = 3, settle: float = 20.0,
+) -> bool:
+    """PCM 子系统卡死的软件恢复：切到备用 USB 组合再切回，等效物理断电重插。
+
+    真机实测（2026-08-12）：``AT+CRESET`` 与 ``AT+CFUN=0/1`` 都救不回卡死的
+    PCM——射频/SIM 重启了，音频子系统依旧坏；**只有触发 USB 重新枚举有效**。
+    组合切换与物理断电都能触发，故用它做无人值守的自动恢复。
+
+    两个真机踩过的坑，这里都必须处理：
+    1. 备用组合下 AT 口不在原接口号——用 ``find_at_port_dynamic`` 动态探；
+    2. 切回指令若在重枚举/启动完成前下发会返回 ``ERROR`` 并**滞留在备用组合**
+       ——故每次切换后等待 ``settle`` 秒，并**回读校验**，失败重试。
+    """
+    logger.warning(
+        "检测到 PCM 子系统卡死，开始 USB 组合切换恢复（%04x → %04x → %04x）",
+        target_pid, alt_pid, target_pid,
+    )
+    for attempt in range(1, attempts + 1):
+        dev, port = find_at_port_dynamic(vid)
+        if dev is None or port is None:
+            logger.error("恢复第 %d 次：找不到 AT 口", attempt)
+            time.sleep(settle)
+            continue
+        current = at_on_interface(dev, port, "AT+CUSBPIDSWITCH?")
+        if f"{target_pid:04X}" in current.upper() and attempt > 1:
+            logger.info("已回到目标组合 %04x，恢复完成", target_pid)
+            usb.util.dispose_resources(dev)
+            return True
+        # 在目标组合上：先切走；已在备用组合（上次没切回来）：直接切回。
+        going_out = f"{target_pid:04X}" in current.upper()
+        pid = alt_pid if going_out else target_pid
+        logger.info("恢复第 %d 次：切换到 %04x（AT 口 interface %d）",
+                    attempt, pid, port.interface)
+        at_on_interface(dev, port, f"AT+CUSBPIDSWITCH={pid:04X},1,1", wait=2.0)
+        usb.util.dispose_resources(dev)
+        time.sleep(settle)  # 等重枚举+固件启动，发太早会 ERROR 并卡在备用组合
+
+        if not going_out:
+            continue  # 本轮是切回，下一轮开头会回读校验
+
+        dev, port = find_at_port_dynamic(vid)
+        if dev is None or port is None:
+            logger.error("恢复第 %d 次：切走后失联，重试", attempt)
+            continue
+        logger.info("恢复第 %d 次：切回 %04x（AT 口 interface %d）",
+                    attempt, target_pid, port.interface)
+        at_on_interface(dev, port, f"AT+CUSBPIDSWITCH={target_pid:04X},1,1", wait=2.0)
+        usb.util.dispose_resources(dev)
+        time.sleep(settle)
+
+        dev, port = find_at_port_dynamic(vid)
+        if dev is None or port is None:
+            logger.error("恢复第 %d 次：切回后失联，重试", attempt)
+            continue
+        verify = at_on_interface(dev, port, "AT+CUSBPIDSWITCH?")
+        usb.util.dispose_resources(dev)
+        if f"{target_pid:04X}" in verify.upper():
+            logger.warning("USB 组合切换恢复成功，已回到 %04x", target_pid)
+            return True
+        logger.error("恢复第 %d 次：回读未确认（%r），重试", attempt, verify.strip())
+    logger.error(
+        "USB 组合切换恢复连续 %d 次失败——需人工物理断电重插", attempts
+    )
+    return False
+
+
 def make_raw(fd: int) -> None:
     tty.setraw(fd)
     attrs = termios.tcgetattr(fd)
@@ -294,6 +426,9 @@ def bridge_port(
                                 "interface %d 连续写超时 %d 次，判定掉线，触发重连",
                                 port.interface, consecutive_timeouts,
                             )
+                        # 设备还在总线上却持续不收数据 = PCM 子系统卡死，不是拔线。
+                        # 标记后由主循环跑组合切换恢复（真机唯一有效的软件手段）。
+                        handle.degraded = True
                         stop.set()
                         return
                     if not stop.is_set():
@@ -341,8 +476,11 @@ def run_bridges_once(
     maps: list[tuple[int, str]],
     stop: threading.Event,
     reset_first: bool = False,
-) -> None:
+    recovery_request: Path | None = None,
+) -> bool:
     """建立全部桥并阻塞运行，直到 stop 置位或任一桥断开（如设备被拔出）。
+
+    返回是否因「模组持续不排空端点」而断开（True 时主循环会跑组合切换恢复）。
 
     reset_first=True 时先 dev.reset()：macOS 睡眠/重枚举后 bulk 端点常处于 stall，
     不复位则重连后每次 read 立即 [Errno 5] 死循环（见 docs/roadmap.md USB 排查）。
@@ -362,8 +500,17 @@ def run_bridges_once(
                 raise RuntimeError(f"接口 {iface} 不存在，可用接口: {sorted(ports)}")
             handles.append(bridge_port(dev, ports[iface], link))
 
+        requested = False
         while not stop.is_set() and all(not handle.stop.is_set() for handle in handles):
+            # app 侧检测到「CPCMREG 启用需重试」= 模组已劣化，通话结束后写此文件请求
+            # 自愈。它覆盖「模组收数据但播放卡」这一形态——那种形态不产生写超时，
+            # 光靠桥自己发现不了（真机 2026-08-12）。
+            if recovery_request is not None and recovery_request.exists():
+                logger.warning("收到 app 的自愈请求（%s），拆桥执行组合切换", recovery_request)
+                requested = True
+                break
             time.sleep(0.2)
+        return requested or any(handle.degraded for handle in handles)
     finally:
         for handle in handles:
             handle.close()
@@ -377,6 +524,8 @@ def main(
     prog: str | None = None,
     description: str = "EC20 USB vendor serial PTY bridge for macOS",
     reset_on_start: bool = False,
+    recover_alt_pid: int | None = None,
+    recovery_request_path: str | None = None,
 ) -> int:
     parser = argparse.ArgumentParser(prog=prog, description=description)
     parser.add_argument("--list", action="store_true", help="列出 USB bulk 接口后退出")
@@ -405,9 +554,21 @@ def main(
         "--reset-on-start", action="store_true",
         help="首次桥接前先 dev.reset() 清除 stall 端点（SIM7600 对 USB 故障敏感，推荐开）",
     )
+    parser.add_argument(
+        "--recover-alt-pid", type=lambda s: int(s, 16),
+        help="PCM 卡死时自动切到该备用 USB 组合再切回以恢复（十六进制，如 9011）；"
+             "不给则只重连不恢复",
+    )
     parser.add_argument("--log-file", help="同时把日志写入指定文件")
     args = parser.parse_args()
     reset_on_start = reset_on_start or args.reset_on_start
+    if args.recover_alt_pid is not None:
+        recover_alt_pid = args.recover_alt_pid
+    recovery_request = (
+        Path(recovery_request_path) if recovery_request_path else None
+    )
+    if recovery_request is not None:
+        recovery_request.unlink(missing_ok=True)  # 启动时清掉陈旧请求
 
     # 未显式给 --map 时用厂商默认映射（Quectel 默认为空，仍要求显式 --map）。
     if not args.map and default_maps:
@@ -469,8 +630,12 @@ def main(
         # （SIM7600 对 USB 故障敏感，残留 stall 会让首次桥接直接 EIO）。
         reset_first = consecutive_fast_fail > 0 or (first_run and reset_on_start)
         first_run = False
+        degraded = False
         try:
-            run_bridges_once(dev, args.map, stop, reset_first=reset_first)
+            degraded = run_bridges_once(
+                dev, args.map, stop, reset_first=reset_first,
+                recovery_request=recovery_request,
+            )
         except (RuntimeError, usb.core.USBError) as exc:
             # USBError：设备僵死/枚举中时 set_configuration 等处会抛，
             # 不捕获会炸穿进程，launchd 每 10s 重启一次形成崩溃风暴；
@@ -480,6 +645,16 @@ def main(
                 return 1
         if stop.is_set() or args.once:
             break
+
+        # 设备仍在总线上却不收 PCM = 模组音频子系统卡死；软重启/CFUN 都救不回，
+        # 只有 USB 重新枚举有效（WIL-109）。此时通话已随拆桥结束，恢复不会打断通话。
+        if degraded and recover_alt_pid is not None:
+            usb_composition_recovery(args.vid, args.pid, recover_alt_pid)
+            if recovery_request is not None:
+                recovery_request.unlink(missing_ok=True)  # 消费掉，避免反复触发
+            consecutive_fast_fail = 0
+            backoff = 1.0
+            continue
 
         # 判定本轮是否"秒挂"：桥接维持不足 5s 视为快速失败，触发退避。
         ran_seconds = time.monotonic() - started_at

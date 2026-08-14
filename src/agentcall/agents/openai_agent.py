@@ -64,6 +64,28 @@ def _vad_silence_ms() -> int:
     return config.get_int("OPENAI_VAD_SILENCE_MS")
 
 
+def _vad_threshold() -> float:
+    """server_vad 能量阈值（注册表 OPENAI_VAD_THRESHOLD，≤0 表示用服务端默认）。"""
+    return config.get_float("OPENAI_VAD_THRESHOLD")
+
+
+def _noise_reduction() -> str:
+    """输入降噪模式（注册表 OPENAI_NOISE_REDUCTION，空=不启用）。"""
+    return config.get_str("OPENAI_NOISE_REDUCTION").strip()
+
+
+def _turn_detection_type() -> str:
+    """判停方式（注册表 OPENAI_TURN_DETECTION）。非法值回落 server_vad。"""
+    value = config.get_str("OPENAI_TURN_DETECTION").strip()
+    return value if value in ("server_vad", "semantic_vad") else "server_vad"
+
+
+def _vad_eagerness() -> str:
+    """semantic_vad 接话积极度（注册表 OPENAI_VAD_EAGERNESS）。非法值回落 auto。"""
+    value = config.get_str("OPENAI_VAD_EAGERNESS").strip()
+    return value if value in ("low", "medium", "high", "auto") else "auto"
+
+
 def _default_instructions() -> str:
     """无外部指令时的默认系统提示词（与 qwen_agent 的默认语义对齐）。"""
     weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
@@ -106,6 +128,9 @@ class OpenAIVoiceAgent(VoiceAgent):
             self._emit_audio_out,
             on_suppressed=self._nudge_after_repeat_suppressed,
             on_stuck=self._repeat_suppression_stuck,
+            # 复读已开播才被判定时，走 barge-in 同一套清积压回调把没播的截掉；
+            # 半双工模式（未注册回调）下仅丢后续分块。
+            on_late_cut=self._emit_user_interrupt,
         )
         self._running = False
         self._handled_tool_calls: set[str] = set()
@@ -178,13 +203,27 @@ class OpenAIVoiceAgent(VoiceAgent):
                     # 打断事件的消费见 _handle_event 的 speech_started 分支
                     # （barge-in 模式），半双工模式下仍由 call_agent 统一管理。
                     "turn_detection": {
-                        "type": "server_vad",
-                        # 电话场景收窄静默判停窗（OpenAI 默认 500ms），显著缩短
-                        # 「对方说完→AI 开口」的等待；0/负值=不下发用服务端默认。
+                        "type": _turn_detection_type(),
+                        # semantic_vad：按语义判断对方说完没有——「OK…」稍顿不抢，
+                        # 完整问句立刻接（server_vad 只看静音时长，两头顾不上）。
                         **(
-                            {"silence_duration_ms": _vad_silence_ms()}
-                            if _vad_silence_ms() > 0
-                            else {}
+                            {"eagerness": _vad_eagerness()}
+                            if _turn_detection_type() == "semantic_vad"
+                            else {
+                                # 电话场景收窄静默判停窗（OpenAI 默认 500ms），
+                                # 缩短「对方说完→AI 开口」；0/负值=服务端默认。
+                                **(
+                                    {"silence_duration_ms": _vad_silence_ms()}
+                                    if _vad_silence_ms() > 0
+                                    else {}
+                                ),
+                                # 能量阈值；0/负值=服务端默认。
+                                **(
+                                    {"threshold": _vad_threshold()}
+                                    if _vad_threshold() > 0
+                                    else {}
+                                ),
+                            }
                         ),
                         **(
                             {"create_response": False}
@@ -192,6 +231,13 @@ class OpenAIVoiceAgent(VoiceAgent):
                             else {}
                         ),
                     },
+                    # 喂给 VAD 与模型前先降噪；far_field 适合电话/远场拾音，
+                    # 与抬阈值同攻「判停拖尾」。空=不启用。
+                    **(
+                        {"noise_reduction": {"type": _noise_reduction()}}
+                        if _noise_reduction()
+                        else {}
+                    ),
                     "transcription": {"model": TRANSCRIPTION_MODEL},
                 },
                 "output": {
@@ -200,6 +246,15 @@ class OpenAIVoiceAgent(VoiceAgent):
                 },
             },
         }
+        max_tokens = config.get_int("OPENAI_MAX_RESPONSE_TOKENS")
+        if max_tokens > 0:
+            # 从源头限长，比本地丢下行更干净：转写与对端听到的一致，不会出现
+            # 「日志里说了 4 句、对端只听到 2 句」（WIL-112）。
+            # 字段名 max_output_tokens 是**实测**出来的：GA 会话结构下
+            # max_response_output_tokens / max_tokens / audio.output.max_output_tokens
+            # 都被服务端拒为 unknown_parameter（2026-08-12 连线逐个试过）。
+            session["max_output_tokens"] = max_tokens
+
         tool_specs = self._tool_specs()
         if tool_specs:
             session["tools"] = tool_specs
@@ -666,6 +721,13 @@ class OpenAIVoiceAgent(VoiceAgent):
                 )
         elif event_type == "input_audio_buffer.speech_stopped":
             self._speech_stopped_at = time.monotonic()
+            # audio_end_ms 是 provider 认定的语音终点（其输入缓冲时间轴）。
+            # 与 speech_started 的 audio_start_ms 相减 = 它听到的语音时长，
+            # 拿来与本地录音对账，定位判停拖尾在哪一侧（WIL-112）。
+            logger.info(
+                "[timing] provider 判停 (speech_stopped, audio_end_ms=%s)",
+                event.get("audio_end_ms"),
+            )
         elif event_type == "conversation.item.input_audio_transcription.completed":
             transcript = (event.get("transcript") or "").strip()
             if transcript:
@@ -699,6 +761,13 @@ class OpenAIVoiceAgent(VoiceAgent):
             self._response_active = True
             self._on_response_created()
         elif event_type == "input_audio_buffer.speech_started":
+            # 与 call_agent 的「本地检测到语音起点」对表用（WIL-112 暗区定位）。
+            # audio_start_ms 是 provider 认定的语音起点在其输入缓冲时间轴上的
+            # 位置——与 speech_stopped 的 audio_end_ms 相减即它听到的语音时长。
+            logger.info(
+                "[timing] provider 判定开口 (speech_started, audio_start_ms=%s)",
+                event.get("audio_start_ms"),
+            )
             # barge-in：对端在 AI 说话期间开口 → 掐当前生成 + 让 call_agent 清
             # 本地未播积压（回调做），AI 立即闭嘴听对方说完。未注册回调
             # （半双工模式，BARGE_IN_ENABLED=false）时维持原行为：事件忽略。
@@ -718,7 +787,14 @@ class OpenAIVoiceAgent(VoiceAgent):
                 logger.debug("OpenAI 回复轮次完成")
             self._on_response_done()
         elif event_type == "error":
-            logger.error("OpenAI Realtime 错误: %s", event)
+            code = (event.get("error") or {}).get("code")
+            if code == "response_cancel_not_active":
+                # barge-in 的 cancel 与 response.done 的固有竞态：response.created
+                # 后我们置 _response_active，但服务端可能在 cancel 送达前已生成完。
+                # 无副作用，降级为 info 免得像故障。
+                logger.info("response.cancel 晚到（响应已自然结束），忽略")
+            else:
+                logger.error("OpenAI Realtime 错误: %s", event)
 
     async def _dispatch_tool_call(
         self, name: str, call_id: str, arguments: str, ws: Any

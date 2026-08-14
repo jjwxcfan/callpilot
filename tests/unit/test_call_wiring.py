@@ -1710,3 +1710,80 @@ def test_inbound_hard_deadline_finalizes_when_all_hangup_signals_are_lost(
     assert service.session._thread is not None
     service.session._thread.join(timeout=5)
     assert not service.session._thread.is_alive()
+
+
+# ---- WIL-111：看门狗重建必须有界，且避开桥恢复期 ----
+
+def _watchdog_service(tmp_path, port_exists=True):
+    """构造只用于看门狗测试的 service：复用 FakeModem，补上端口与连接状态。"""
+    port = tmp_path / "sim7600-at"
+    if port_exists:
+        port.write_text("")
+
+    class _WatchdogModem(FakeModem):
+        def __init__(self) -> None:
+            super().__init__()
+            self.port = str(port)
+            self.connect_calls = 0
+
+        def is_connected(self) -> bool:
+            return False
+
+        def connect(self) -> None:
+            self.connect_calls += 1
+
+        def initialize_for_voice(self, mode="nmea") -> None:
+            pass
+
+        def start_listener(self) -> None:
+            pass
+
+    modem = _WatchdogModem()
+    return make_service(modem), modem
+
+
+def test_watchdog_skips_reconnect_while_port_missing(tmp_path):
+    """桥做 PCM 自愈时串口被删——此时不该去 connect（注定失败且可能卡住）。"""
+    service, modem = _watchdog_service(tmp_path, port_exists=False)
+    assert service._modem_port_ready() is False
+
+
+def test_watchdog_port_ready_when_symlink_back(tmp_path):
+    service, _ = _watchdog_service(tmp_path, port_exists=True)
+    assert service._modem_port_ready() is True
+
+
+def test_bounded_reconnect_returns_true_on_success(tmp_path):
+    service, modem = _watchdog_service(tmp_path)
+    assert service._reconnect_modem_bounded() is True
+    assert modem.connect_calls == 1
+
+
+def test_bounded_reconnect_gives_up_on_hang(tmp_path, monkeypatch, caplog):
+    """connect() 挂住不返回时必须超时放弃，否则看门狗自己被挂死（真机 WIL-111）。"""
+    import logging as _logging
+    import threading as _th
+
+    service, modem = _watchdog_service(tmp_path)
+    blocked = _th.Event()
+    monkeypatch.setattr(service, "_LINK_RECONNECT_TIMEOUT", 0.2)
+    monkeypatch.setattr(modem, "connect", lambda: blocked.wait(30))
+
+    with caplog.at_level(_logging.WARNING):
+        assert service._reconnect_modem_bounded() is False
+    assert "未完成" in caplog.text
+    blocked.set()
+
+
+def test_bounded_reconnect_reports_error(tmp_path, monkeypatch, caplog):
+    import logging as _logging
+
+    service, modem = _watchdog_service(tmp_path)
+
+    def boom():
+        raise RuntimeError("串口不存在")
+
+    monkeypatch.setattr(modem, "connect", boom)
+    with caplog.at_level(_logging.WARNING):
+        assert service._reconnect_modem_bounded() is False
+    assert "重建连接失败" in caplog.text

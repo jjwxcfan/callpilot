@@ -104,6 +104,21 @@ def _force_utf8() -> None:
                 pass
 
 
+def _enable_thread_dump() -> None:
+    """kill -USR1 <pid> 时打印全部线程栈。
+
+    真机排障用：曾出现「进程活着、某个线程挂住不返回」（WIL-111），当时只能靠
+    推测。装上这个钩子后，现场直接抓栈即可定位，无需复现。
+    """
+    import faulthandler
+    import signal
+
+    try:
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def main() -> None:
     load_dotenv(config.env_file_path())
     _force_utf8()
@@ -190,6 +205,8 @@ def main() -> None:
             "或 ?token=<token>），或将 WEB_HOST 改回 127.0.0.1", host,
         )
         sys.exit(2)
+
+    _enable_thread_dump()
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)

@@ -58,8 +58,8 @@ def test_sim7600_initialize_for_voice_enables_cpcmreg(monkeypatch, caplog):
     monkeypatch.setattr(modem, "_send", lambda cmd: sent.append(cmd) or "OK")
     with caplog.at_level(logging.INFO):
         modem.initialize_for_voice("nmea")
-    # 先降 RX 音量消上行削波（CLVL=2），再使能 PCM 通道。
-    assert sent == ["AT+CLVL=2", "AT+CPCMREG=1"]
+    # 不再发 AT+CLVL（治的是不存在的削波，且每通白花 2.3s，见 WIL-104）。
+    assert sent == ["AT+CPCMREG=1"]
     assert "AT+CPCMREG=1" in caplog.text
 
 
@@ -70,18 +70,18 @@ def test_sim7600_initialize_for_voice_all_error_does_not_raise(monkeypatch):
     monkeypatch.setattr(modem, "_send", lambda cmd: sent.append(cmd) or "ERROR")
     monkeypatch.setattr("agentcall.modem.time.sleep", lambda s: None)
     modem.initialize_for_voice("nmea")  # 不抛即通过
-    assert sent == ["AT+CLVL=2"] + ["AT+CPCMREG=1"] * modem._CPCMREG_ENABLE_ATTEMPTS
+    assert sent == ["AT+CPCMREG=1"] * modem._CPCMREG_ENABLE_ATTEMPTS
 
 
 def test_sim7600_initialize_for_voice_retries_until_enabled(monkeypatch):
     """不依赖 is_call_connected（接通事件有竞态）：ERROR 时重试到 OK 即停。"""
     modem = make_sim7600()  # 不 set 接通事件，证明启用不依赖它
-    responses = iter(["OK", "ERROR", "ERROR", "OK", "OK"])  # 首个 OK 归 CLVL
+    responses = iter(["ERROR", "ERROR", "OK", "OK"])
     sent = []
     monkeypatch.setattr(modem, "_send", lambda cmd: sent.append(cmd) or next(responses))
     monkeypatch.setattr("agentcall.modem.time.sleep", lambda s: None)
     modem.initialize_for_voice("nmea")
-    assert sent == ["AT+CLVL=2", "AT+CPCMREG=1", "AT+CPCMREG=1", "AT+CPCMREG=1"]  # 到 OK 即停
+    assert sent == ["AT+CPCMREG=1"] * 3  # 到 OK 即停
 
 
 def test_sim7600_disable_voice_channel_sends_cpcmreg_off(monkeypatch):
@@ -838,3 +838,134 @@ def test_dump_stored_sms_keeps_sim_when_delete_disabled(monkeypatch):
     modem._dump_stored_sms()
 
     assert not any(c.startswith("AT+CMGD") for c in sent)
+
+
+# ---- WIL-110：长断连后必须能自愈（桥自愈了服务也要回来）----
+
+def test_reconnect_retries_on_runtime_error(monkeypatch):
+    """_open_serial 抛 RuntimeError（_send 在 _opening 期上抛）时必须退避重试，
+    不能穿透打死调用方线程——真机曾因此在桥恢复后永远连不回来。"""
+    modem = make_modem()
+    modem._running = True
+    attempts = []
+
+    def flaky_open():
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise RuntimeError("模组未连接")   # 早先会穿透 except 子句
+
+    monkeypatch.setattr(modem, "_open_serial", flaky_open)
+    monkeypatch.setattr("agentcall.modem.time.sleep", lambda s: None)
+    modem._reconnect()                          # 不抛即通过
+    assert len(attempts) == 3                   # 前两次失败后仍继续重试
+
+
+def test_read_loop_survives_reconnect_exception(monkeypatch):
+    """读线程是来电感知命脉：重连里抛任何异常都不许让它退出。"""
+    modem = make_modem()
+    modem._running = True
+    calls = {"reconnect": 0}
+
+    class _DeadSerial:
+        is_open = True
+        in_waiting = 0
+
+        def read(self, _n):
+            raise serial.SerialException("串口未打开")
+
+    modem._ser = _DeadSerial()
+
+    def boom():
+        calls["reconnect"] += 1
+        if calls["reconnect"] >= 3:
+            modem._running = False              # third round ends the loop
+        raise RuntimeError("模组未连接")
+
+    monkeypatch.setattr(modem, "_reconnect", boom)
+    monkeypatch.setattr("agentcall.modem.time.sleep", lambda s: None)
+    modem._read_loop()                          # 不抛、能正常退出即通过
+    assert calls["reconnect"] == 3              # 异常后继续重试而非死掉
+
+
+def test_is_connected_reflects_transport_state():
+    """看门狗据此判断是否需要重建连接。"""
+    modem = make_modem()
+    assert modem.is_connected() is False
+    modem._emit_connection_state(True)
+    assert modem.is_connected() is True
+    modem._emit_connection_state(False)
+    assert modem.is_connected() is False
+
+
+# ---- WIL-109 续：劣化检测 + 自愈请求（覆盖「收数据但播放卡」形态）----
+
+def test_sim7600_marks_degraded_when_enable_needs_retry(monkeypatch, tmp_path, caplog):
+    """CPCMREG 需重试 = 模组已劣化（真机：好通 1 次即成，坏通要重试）。"""
+    modem = make_sim7600()
+    monkeypatch.setattr(modem, "RECOVERY_REQUEST_PATH", str(tmp_path / "req"))
+    responses = iter(["ERROR", "OK"])            # 第1次失败、第2次成功
+    monkeypatch.setattr(modem, "_send", lambda cmd: next(responses))
+    monkeypatch.setattr("agentcall.modem.time.sleep", lambda s: None)
+    with caplog.at_level(logging.WARNING):
+        modem.initialize_for_voice("nmea")
+    assert modem._pcm_degraded is True
+    assert "判定模组已劣化" in caplog.text
+
+
+def test_sim7600_first_try_enable_not_degraded(monkeypatch, tmp_path):
+    """一次就 OK（健康态）不得误判劣化——否则每通都触发 ~100s 自愈。"""
+    modem = make_sim7600()
+    monkeypatch.setattr(modem, "RECOVERY_REQUEST_PATH", str(tmp_path / "req"))
+    monkeypatch.setattr(modem, "_send", lambda cmd: "OK")
+    modem.initialize_for_voice("nmea")
+    assert modem._pcm_degraded is False
+    modem._disable_voice_channel()
+    assert not (tmp_path / "req").exists()        # 健康态不写请求
+
+
+def test_sim7600_writes_recovery_request_on_hangup(monkeypatch, tmp_path):
+    """劣化通话结束时写哨兵，由桥进程读到后执行组合切换自愈。"""
+    modem = make_sim7600()
+    req = tmp_path / "req"
+    monkeypatch.setattr(modem, "RECOVERY_REQUEST_PATH", str(req))
+    monkeypatch.setattr(modem, "_send", lambda cmd: "OK")
+    modem._pcm_degraded = True
+    modem._disable_voice_channel()
+    assert req.exists()                            # 已请求自愈
+    assert modem._pcm_degraded is False             # 标志已消费，不重复请求
+
+
+def test_sim7600_recovery_request_failure_does_not_break_hangup(monkeypatch):
+    """写哨兵失败不得影响挂断流程。"""
+    modem = make_sim7600()
+    monkeypatch.setattr(modem, "RECOVERY_REQUEST_PATH", "/nonexistent-dir/req")
+    monkeypatch.setattr(modem, "_send", lambda cmd: "OK")
+    modem._pcm_degraded = True
+    modem._disable_voice_channel()                  # 不抛即通过
+
+
+def test_reconnect_non_owner_wait_is_bounded(monkeypatch):
+    """非 owner 等待必须有界：调用方可能持有 _serial_lock，无限等会死锁（WIL-111）。
+
+    真机死锁形态：hangup() 持 _serial_lock → 锁内 _send 失败 → _reconnect 作为
+    非 owner 无限等；而 owner 需要同一把锁开串口 → 循环等待，全线程僵死。
+    """
+    modem = make_modem()
+    modem._running = True
+    modem._reconnect_in_progress = True      # 假装别人正在重连
+    modem._reconnect_complete.clear()        # 且永不完成
+    monkeypatch.setattr(modem, "_RECONNECT_WAIT_TIMEOUT", 0.3)
+
+    start = time.monotonic()
+    with modem._serial_lock:                 # 模拟持锁调用（hangup 的形态）
+        modem._reconnect()
+    elapsed = time.monotonic() - start
+    assert elapsed < 3.0, f"应有界返回，实际等了 {elapsed:.1f}s"
+
+
+def test_settle_delay_shorter_for_sim7600_than_quectel():
+    """SIM7600 自带重试，不必盲等一整秒；Quectel 维持原 1.0s 不回归（WIL-104）。"""
+    from agentcall.modem import Sim7600Modem
+
+    assert make_modem().POST_ANSWER_SETTLE_SECONDS == 1.0
+    assert Sim7600Modem("/dev/null-not-used").POST_ANSWER_SETTLE_SECONDS < 0.5

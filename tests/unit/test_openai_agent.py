@@ -505,7 +505,7 @@ def test_transcripts_emitted_for_user_and_agent(monkeypatch):
 
 
 def test_repetitive_agent_response_audio_is_suppressed(monkeypatch, caplog):
-    """下行转写命中复读判重时，该 response 已缓存音频不得输出。"""
+    """复读判定后，该 response 的后续音频分块不得再输出（streaming 语义，WIL-112）。"""
     monkeypatch.setenv("REPEAT_SUPPRESS_SIMILARITY", "0.9")
     instances, _calls = _patch_connect(monkeypatch)
     agent = _make_agent()
@@ -550,12 +550,19 @@ def test_repetitive_agent_response_audio_is_suppressed(monkeypatch, caplog):
                     "response_id": "r3",
                     "transcript": repeated,
                 })
+                # 判定为复读之后，同 response 的迟到分块必须被丢弃。
+                instances[0].feed({
+                    "type": "response.output_audio.delta",
+                    "response_id": "r3",
+                    "delta": base64.b64encode(b"late-tail").decode("ascii"),
+                })
                 await _drain()
         finally:
             await agent.stop()
 
     asyncio.run(scenario())
-    assert received == [b"first", b"repeat"]
+    # streaming 语义：判定前到达的分块（含 r3 首块）已放行，迟到分块被丢弃。
+    assert received == [b"first", b"repeat", b"repeat-again"]
     assert "抑制复读" in caplog.text
     assert any(
         msg.get("type") == "response.create"

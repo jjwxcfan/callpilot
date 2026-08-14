@@ -382,14 +382,19 @@ def test_inbound_rules_do_not_quote_the_greeting():
 def test_inbound_identity_moves_into_the_rules():
     """开场白不报身份了，身份就必须由规则兜住——否则对方可能整通都以为在跟机主讲话。
 
-    这是 WIL-91 砍开场白的**补偿机制**：改成「对方一说明来意就顺势表明」，
-    而不是原来的「被问才说」。没有这一条，缩短开场白就成了误导对方。
+    这是 WIL-91 砍开场白的**补偿机制**：身份要主动说，而不是「被问才说」。
+    没有这一条，缩短开场白就成了误导对方。
+
+    WIL-112 调整了措辞（从「对方一说明来意就顺势表明」改为「在第一个自然时机说
+    一次、之后不再重复」，因为 AI 每轮重复自我介绍把真正的回答埋在套话后面），
+    语义不变：仍是主动表明。故这里断言语义而非原措辞。
     """
     text = build_instructions("inbound", "李明", "数字分身", DEFAULT_OUTBOUND_TASK)
     assert "不要冒充李明本人" in text
     assert "数字分身" in text
     # 必须是主动表明，不能只写「被问才说」
-    assert "说明来意" in text or "顺势表明" in text
+    assert "第一个自然时机" in text and "说一次" in text
+    assert "被直接问身份时如实回答" in text  # 被问也要答，但不是唯一触发
 
 
 # ---- 无预设任务（空 task）：不塞元指令、强化「你是主叫不是客服」----
@@ -464,3 +469,40 @@ def test_agent_language_reads_config(monkeypatch):
     assert prompts.agent_language() == "en"
     monkeypatch.setenv("AGENT_LANGUAGE", "zh")
     assert prompts.agent_language() == "zh"
+
+
+# ---- WIL-112：别把要问的事当清单背诵 / 身份只说一次 ----
+
+def test_inbound_prompt_has_no_unfilled_placeholders():
+    """f-string 漏了前缀会让 {owner} 原样进提示词——静默 bug，模型会照着念。"""
+    from agentcall.prompts import build_instructions
+
+    for lang in ("zh", "en"):
+        text = build_instructions("inbound", "李明", "小助理", "", lang)
+        assert "{owner}" not in text, lang
+        assert "{persona}" not in text, lang
+        assert "{task}" not in text, lang
+
+
+def test_outbound_prompt_has_no_unfilled_placeholders():
+    from agentcall.prompts import build_instructions
+
+    for lang in ("zh", "en"):
+        text = build_instructions("outbound", "李明", "小助理", "确认预约", lang)
+        assert "{owner}" not in text and "{persona}" not in text, lang
+
+
+def test_inbound_prompt_tells_model_not_to_recite_or_repeat_identity():
+    """真机 2026-08-12：AI 每轮重复自我介绍 + 一口气问完 4 件事，单轮 14~18 秒，
+    对端要等 5 秒才听到真正的回答（WIL-112）。提示词须明确「逐步问」「只说一次」。"""
+    from agentcall.prompts import build_instructions
+
+    zh = build_instructions("inbound", "李明", "小助理", "", "zh")
+    assert "不是一份要背诵的清单" in zh
+    assert "一次只问其中一件" in zh
+    assert "后续轮次绝不再重复" in zh
+
+    en = build_instructions("inbound", "Shaocheng", "AI assistant", "", "en")
+    assert "not a checklist to recite" in en
+    assert "one of them at a time" in en
+    assert "never repeat it in later turns" in en

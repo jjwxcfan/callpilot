@@ -6,6 +6,7 @@ import logging
 import re
 import threading
 import time
+from pathlib import Path
 from queue import Queue
 from typing import Callable
 
@@ -250,6 +251,10 @@ class SerialModem:
         """
         return self._send(command)
 
+    # 非 owner 等待他方重连的上限。必须有界：调用方可能持有 _serial_lock，
+    # 而重连方需要该锁，无限等待会死锁（WIL-111 真机实证）。
+    _RECONNECT_WAIT_TIMEOUT = 8.0
+
     # SIM 上电后 CIMI 可能短暂 ERROR(卡未 ready);重试覆盖上电延迟。
     _SIM_READ_RETRIES = 3
     _SIM_READ_RETRY_DELAY = 1.0
@@ -407,8 +412,21 @@ class SerialModem:
                     owner = True
 
         if not owner:
+            # 等别人重连完成，但**必须有界**：调用方可能正持有 _serial_lock（如
+            # hangup() 为保证挂断原子性持锁，锁内 _send 失败后走到这里），而真正的
+            # 重连方需要这把锁才能开串口——无限等待即形成循环等待死锁。真机
+            # 2026-08-12（WIL-111）用 faulthandler 抓到：挂断线程持锁等重连、
+            # 读线程等锁开串口，全部线程僵死，进程活着却再也接不了电话。
+            # 超时返回后本次 _send 会失败上抛，由调用方各自的重试路径兜底。
+            deadline = time.monotonic() + self._RECONNECT_WAIT_TIMEOUT
             while self._running and not self._closed:
                 if self._reconnect_complete.wait(timeout=0.2):
+                    return
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        "等待他方重连超过 %.0fs，本次放弃（避免持锁死等）",
+                        self._RECONNECT_WAIT_TIMEOUT,
+                    )
                     return
             return
 
@@ -424,7 +442,12 @@ class SerialModem:
                     self._emit_current_sim_identity()
                     logger.info("串口已重连: %s", self._active_port)
                     return
-                except (serial.SerialException, OSError) as exc:
+                # 捕全部异常而不只是 (SerialException, OSError)：_open_serial 内部的
+                # _send 在 _opening=True 时会上抛 RuntimeError("模组未连接")，早先它
+                # 会穿透这里、打死调用方线程（真机 2026-08-12：读线程死亡后桥虽已自愈，
+                # app 却永远连不回来，来电无人接听，见 WIL-110）。重连必须是「只要没被
+                # 停止就一直退避重试」。
+                except Exception as exc:  # noqa: BLE001
                     with self._serial_lock:
                         try:
                             if self._ser and self._ser.is_open:
@@ -522,6 +545,11 @@ class SerialModem:
             sender, timestamp, body = self._interpret_sms(header_line, raw_body)
             entries.append((index, sender, timestamp, body))
         return entries
+
+    # 接听后到启用语音通道之间的静置时间（厂商可覆写）。历史上写死 1.0s，
+    # 来历不明（仓库重构时带入，无注释）；对自带重试的实现是纯浪费——健康态
+    # 「接听→启用」总共才 2~3s，这一秒占三分之一（WIL-104）。
+    POST_ANSWER_SETTLE_SECONDS = 1.0
 
     def initialize_for_voice(self, audio_mode: str = "uac") -> None:
         """启用语音 PCM 通道（厂商钩子，子类按各自 AT 指令实现）。"""
@@ -807,13 +835,32 @@ class SerialModem:
                 if not self._running:
                     break
                 logger.warning("串口读取失败，尝试重连: %s", exc)
-                self._reconnect()
+                try:
+                    self._reconnect()
+                except Exception as reconnect_exc:  # noqa: BLE001
+                    # 读线程是来电感知的命脉：它一死，模组即便恢复也再没人读 URC，
+                    # 电话打进来无人接听（WIL-110）。任何意外都不许让它退出。
+                    logger.error(
+                        "重连过程异常，读线程继续重试: %s", reconnect_exc
+                    )
+                    time.sleep(1.0)
+                continue
+            except Exception as exc:  # noqa: BLE001
+                if not self._running:
+                    break
+                logger.error("读线程意外异常，继续运行: %s", exc)
+                time.sleep(1.0)
                 continue
             if not raw:
                 continue
             text = raw.decode("ascii", errors="ignore")
             self._buffer += text
             self._process_buffer()
+
+    def is_connected(self) -> bool:
+        """串口传输当前是否在线（供上层看门狗判断是否需要重建连接）。"""
+        with self._connection_state_lock:
+            return self._connection_online
 
     def pcm_ready(self) -> bool:
         return self._pcm_ready_event.is_set()
@@ -1179,12 +1226,25 @@ class Sim7600Modem(SerialModem):
       ``pcm_ready`` 恒 True。
     """
 
+    # 劣化检测信号：健康态 AT+CPCMREG=1 一次就 OK；劣化态要重试多次（每次 _send
+    # 读超时 3s）。真机 2026-08-12 与人耳评价完全对上——好通 2~3s/1 次即成，
+    # 坏通 9~12s/多次重试，无交叉。故「启用需要重试」即判定 PCM 子系统已劣化。
+    _DEGRADED_ENABLE_ATTEMPTS = 2
+    # 通话结束后写这个哨兵文件，由 USB 桥进程读到后执行组合切换自愈（WIL-109）。
+    # 只报告不自己动手：桥才是 USB 设备的持有者。
+    RECOVERY_REQUEST_PATH = "/tmp/sim7600-recover-request"
+
     # 刚接通瞬间 CPCMREG=1 偶发未就绪（真机实测：同样接通，有时首发 OK、有时 ERROR）。
     # 音频桥一旦 start() 就持续往 iface4 写 PCM，若此刻 CPCMREG 未生效、模组不排空该
     # bulk 端点 → USB 写超时 → 整个 USB 桥被判定掉线拆桥（连 AT 口一起塌）。故通话中
     # 必须重试到真正启用，确保写 PCM 前 iface4 已进入 PCM 模式。
     _CPCMREG_ENABLE_ATTEMPTS = 6
     _CPCMREG_ENABLE_RETRY_DELAY = 0.3
+
+    _pcm_degraded = False   # 本通是否判定过劣化（通话结束时据此请求自愈）
+    # 本实现对 AT+CPCMREG=1 自带有界重试，模组没就绪时首次失败即刻重试即可，
+    # 不必盲等一整秒（WIL-104：健康态可省约 0.8s）。
+    POST_ANSWER_SETTLE_SECONDS = 0.2
 
     def initialize_for_voice(self, audio_mode: str = "nmea") -> None:
         """使能 PCM-over-USB 语音通道（``AT+CPCMREG=1``）。
@@ -1198,13 +1258,32 @@ class Sim7600Modem(SerialModem):
         （supervisor 启动期）几次都 ERROR，属正常，不抛异常（否则 supervisor 误判连
         接失败无限重试）；``AT+CPCMREG=1`` 返回 OK 本身即证明有活跃通话。
         """
-        # RX 输出音量降到 2：出厂 CLVL=4 时上行 PCM 严重削波（真机 2026-08-11：
-        # peak 恒 32768、RMS ~19000，对端语音送到 provider 也识别不出），降为 2
-        # 消削波。每次调用都设，重插/换模组后仍生效；失败不致命（_send 不抛）。
-        self._send("AT+CLVL=2")
+        # 曾在此发 AT+CLVL=2「消上行削波」——后证实削波是主机侧字节错位（已在
+        # audio_bridge 修复），与音量无关；而实测这条指令本身要花 **2.3 秒**，
+        # 占「接听→启用」总耗时的 83%（WIL-104）。治的是不存在的病，故移除。
+        started = time.monotonic()
         for i in range(self._CPCMREG_ENABLE_ATTEMPTS):
-            if "OK" in self._send("AT+CPCMREG=1"):
-                logger.info("PCM-over-USB 语音通道已启用 (AT+CPCMREG=1)")
+            attempt_started = time.monotonic()
+            ok = "OK" in self._send("AT+CPCMREG=1")
+            logger.info(
+                "[timing] CPCMREG 第 %d 次耗时 %.2fs -> %s",
+                i + 1, time.monotonic() - attempt_started, "OK" if ok else "ERROR",
+            )
+            if ok:
+                attempts = i + 1
+                logger.info(
+                    "[timing] 启用总耗时 %.2fs", time.monotonic() - started
+                )
+                logger.info(
+                    "PCM-over-USB 语音通道已启用 (AT+CPCMREG=1，第 %d 次)", attempts
+                )
+                if attempts >= self._DEGRADED_ENABLE_ATTEMPTS:
+                    # 启用要重试 = 模组已劣化（对端会听到卡顿），标记待恢复；
+                    # 真正的恢复在通话结束时请求，绝不打断进行中的通话。
+                    self._pcm_degraded = True
+                    logger.warning(
+                        "PCM 启用重试 %d 次，判定模组已劣化，本通结束后请求自愈", attempts
+                    )
                 return
             if i < self._CPCMREG_ENABLE_ATTEMPTS - 1:
                 time.sleep(self._CPCMREG_ENABLE_RETRY_DELAY)
@@ -1220,6 +1299,24 @@ class Sim7600Modem(SerialModem):
 
     def _disable_voice_channel(self) -> None:
         self._send("AT+CPCMREG=0")
+        self._request_recovery_if_degraded()
+
+    def _request_recovery_if_degraded(self) -> None:
+        """通话结束时，若本通判定过劣化就写哨兵文件请求桥执行自愈。
+
+        写文件而非直接动手：USB 设备由桥进程持有，组合切换必须由它来做。
+        写失败不致命（下通若仍劣化会再写），绝不因此影响挂断流程。
+        """
+        if not self._pcm_degraded:
+            return
+        self._pcm_degraded = False
+        try:
+            Path(self.RECOVERY_REQUEST_PATH).write_text(
+                f"degraded at {time.time():.0f}\n", encoding="utf-8"
+            )
+            logger.warning("已请求 USB 桥执行 PCM 自愈: %s", self.RECOVERY_REQUEST_PATH)
+        except OSError as exc:
+            logger.warning("写恢复请求失败（不影响挂断）: %s", exc)
 
     def _hangup_command(self) -> str:
         # SIM7600 语音通话 ATH 不可靠（真机：ATH 返回 OK 但 CLCC 仍显示 active，
