@@ -128,9 +128,10 @@ class OpenAIVoiceAgent(VoiceAgent):
             self._emit_audio_out,
             on_suppressed=self._nudge_after_repeat_suppressed,
             on_stuck=self._repeat_suppression_stuck,
-            # 复读已开播才被判定时，走 barge-in 同一套清积压回调把没播的截掉；
-            # 半双工模式（未注册回调）下仅丢后续分块。
-            on_late_cut=self._emit_user_interrupt,
+            # 复读已开播才被判定时清设备侧积压。与 barge-in 是同一个清积压
+            # 动作、不同语义——晚截是自己复读被掐，不是对端插话，走专用回调
+            # 以免被计进自激笔数（见 base.set_late_cut_handler）。
+            on_late_cut=self._emit_late_cut,
         )
         self._running = False
         self._handled_tool_calls: set[str] = set()
@@ -768,13 +769,13 @@ class OpenAIVoiceAgent(VoiceAgent):
                 "[timing] provider 判定开口 (speech_started, audio_start_ms=%s)",
                 event.get("audio_start_ms"),
             )
-            # barge-in：对端在 AI 说话期间开口 → 掐当前生成 + 让 call_agent 清
-            # 本地未播积压（回调做），AI 立即闭嘴听对方说完。未注册回调
+            # barge-in：对端在 AI 说话期间开口 → 先问 call_agent 接不接受这次
+            # 打断（DTMF 护窗期让位、自激兜底退回半双工时会拒绝，WIL-94 坑 1/4），
+            # 接受才掐当前生成；本地未播积压由回调自己清。未注册回调
             # （半双工模式，BARGE_IN_ENABLED=false）时维持原行为：事件忽略。
             if self._on_user_interrupt is not None:
-                if self._response_active:
+                if self._emit_user_interrupt() and self._response_active:
                     asyncio.get_running_loop().create_task(self.cancel_response())
-                self._emit_user_interrupt()
         elif event_type == "response.done":
             self._response_active = False
             status = (event.get("response") or {}).get("status")

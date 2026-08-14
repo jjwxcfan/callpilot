@@ -115,7 +115,9 @@ class ResponseAudioGate:
         time_fn: Callable[[], float] = time.monotonic,
         nudge_cooldown_seconds: float = DEFAULT_NUDGE_COOLDOWN_SECONDS,
         stuck_limit: int = DEFAULT_STUCK_LIMIT,
-        on_late_cut: Callable[[], None] | None = None,
+        # 返回值被忽略：回调可能回报「是否真的清了」（DTMF 护窗期会拒绝），
+        # 闸门不据此改变行为——丢弃后续分块无论如何都要做。
+        on_late_cut: Callable[[], object] | None = None,
     ) -> None:
         self._provider = provider
         self._emit_audio = emit_audio

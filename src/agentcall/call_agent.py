@@ -98,6 +98,15 @@ logger = logging.getLogger(__name__)
 # 只用于轮次延迟测量的打点，不参与任何对话逻辑。
 _VOICED_PEAK_THRESHOLD = 350
 
+# barge-in 自激兜底（WIL-94 坑 4）：回复出声后极短时间内就被「对端开口」打断、
+# 且连续多次，即视为疑似自激（下行被模组回采成上行触发 provider VAD）。前提
+# 「模组无回采」是一次性实测（SIM7600 r=0.009），换硬件/改增益后可能失效，
+# 失效的代价是通话自循环——必须有运行时兜底：触发后本通退回半双工。
+# 窗口取 2s：无积压时回声必然落在首块音频到达后的这段内；真人抢话通常更晚。
+# 连续 3 次才触发——单次快速插话是正常抢话，不该因此没收打断能力。
+_BARGE_IN_ECHO_WINDOW_SECONDS = 2.0
+_BARGE_IN_ECHO_STRIKES = 3
+
 # dtmf_outcome 事件里对端话语的截断长度：够判读，又不至于把整段通话搬进事件流。
 _OUTCOME_TEXT_CHARS = 80
 # 按键后等待对端反应的窗口，与 scripts/regression_call.py 的 8s 观察窗一致。
@@ -198,8 +207,13 @@ class CallSession:
         # 生成），比「判停→首音频」多覆盖前半段链路；蜂窝两腿仍在其外。
         self._last_voiced_at = 0.0
         # barge-in（BARGE_IN_ENABLED）：每通开始时从 config 读取；True 时上行
-        # 不做半双工丢弃、对端开口即打断 AI（见 _run_agent_loop 与打断回调）。
+        # 不做半双工丢弃、对端开口即打断 AI（见 _run_agent_loop 与
+        # _handle_peer_barge_in）。自激兜底触发时本通内置回 False。
         self._barge_in = False
+        # 自激兜底状态（WIL-94 坑 4）：连续「刚出声即被打断」计数 + 本轮首块
+        # 回复音频的到达时刻（0.0 = 本通尚无回复音频）。
+        self._barge_in_echo_strikes = 0
+        self._turn_audio_started_at = 0.0
         self._record: CallRecord | None = None
         self._summary_thread: threading.Thread | None = None
         # 延迟挂断（hangup 工具）状态：CallSession 跨通复用，上一通排下的
@@ -503,27 +517,21 @@ class CallSession:
             if isinstance(bridge, SerialPcmAudioBridge):
                 bridge.set_ready_check(self.modem.pcm_ready)
             self._barge_in = config.get_bool("BARGE_IN_ENABLED")
+            self._barge_in_echo_strikes = 0
+            self._turn_audio_started_at = 0.0
             if self._barge_in:
-                # 对端开口（provider VAD speech_started）→ 立即丢弃本地未播积压，
-                # AI 闭嘴听对方说完。掐生成（response.cancel）由 agent 侧同事件触发。
-                def _on_user_interrupt(bridge=bridge) -> None:
-                    dropped = 0
-                    if hasattr(bridge, "discard_pending_output"):
-                        dropped = bridge.discard_pending_output()
-                    cleared = 0
-                    try:
-                        while True:
-                            self._outgoing_audio.get_nowait()
-                            cleared += 1
-                    except Empty:
-                        pass
-                    if dropped or cleared:
-                        logger.info(
-                            "对端开口打断 AI：丢弃未播积压 %d 字节 / 队列 %d 块",
-                            dropped, cleared,
-                        )
-
-                agent.set_user_interrupt_handler(_on_user_interrupt)
+                # 对端开口（provider VAD speech_started）→ 丢弃本地未播积压，
+                # AI 闭嘴听对方说完；护窗期让位与自激兜底见 _handle_peer_barge_in。
+                # 掐生成（response.cancel）由 agent 侧按回调返回值决定。
+                agent.set_user_interrupt_handler(
+                    lambda: self._handle_peer_barge_in(bridge)
+                )
+            # 复读晚截（ResponseAudioGate on_late_cut）：同一个清积压动作、
+            # 不同语义——不计自激笔数，且半双工模式也要清（复读开头已播出的
+            # 尾巴不清会多拖 1~2s）。护窗让位逻辑在 _discard_agent_playback 内。
+            agent.set_late_cut_handler(
+                lambda: self._discard_agent_playback(bridge, "复读晚截")
+            )
             bridge.start()
             mark("bridge_started")
 
@@ -705,6 +713,8 @@ class CallSession:
                 # （WIL-112：录音按生成时点记录，会把排队完全抹掉，别再用它判断）。
                 if not self._turn_first_audio_logged:
                     self._turn_first_audio_logged = True
+                    # 自激兜底的时间锚点：本轮首块回复音频到达时刻。
+                    self._turn_audio_started_at = time.monotonic()
                     pending = (
                         bridge.pending_output_bytes()
                         if hasattr(bridge, "pending_output_bytes") else 0
@@ -2159,6 +2169,89 @@ class CallSession:
                 # 没发出去就不该白白哑掉 Agent：预装的护窗要还原。
                 self._dtmf_guard_until = previous_guard
             return ok, mode
+
+    def _handle_peer_barge_in(self, bridge: AudioBridge) -> bool:
+        """对端开口（provider VAD speech_started）→ 让 AI 让路；返回是否接受打断。
+
+        返回 False（provider 侧据此**不发** ``response.cancel``）的两种情形：
+
+        - **DTMF 护窗期内（WIL-94 坑 1）**：inband 双音与 Agent 语音共用
+          ``_outgoing_audio``，IVR 提示音触发的「对端开口」若在此时清队列，
+          会把排队中的双音打断——WIL-49 修好的 IVR 导航就回归了。护窗在
+          ``_send_dtmf_raw`` 里**先装再入队**，所以这里先查护窗再动手是安全的。
+        - **自激兜底已触发（WIL-94 坑 4）**：本通已退回半双工，后续事件全拒。
+
+        自激指纹：回复首块音频到达后 ``_BARGE_IN_ECHO_WINDOW_SECONDS`` 内就被
+        「打断」，连续 ``_BARGE_IN_ECHO_STRIKES`` 次。真人抢话通常更晚，且出现
+        一次较晚的打断即清零计数。误判的代价是本通退回半双工（即今天的默认
+        行为），远小于放任自激的代价（通话自循环）。
+        """
+        now = time.monotonic()
+        if not self._barge_in:
+            return False
+        if now < self._dtmf_guard_until:
+            logger.info("护窗期内忽略对端开口：barge-in 让位，双音优先（WIL-49）")
+            return False
+        pending = (
+            bridge.pending_output_bytes()
+            if hasattr(bridge, "pending_output_bytes")
+            else 0
+        )
+        agent_in_flight = pending > 0 or not self._outgoing_audio.empty()
+        if agent_in_flight and self._turn_audio_started_at > 0:
+            if now - self._turn_audio_started_at <= _BARGE_IN_ECHO_WINDOW_SECONDS:
+                self._barge_in_echo_strikes += 1
+                if self._barge_in_echo_strikes >= _BARGE_IN_ECHO_STRIKES:
+                    self._barge_in = False
+                    logger.warning(
+                        "疑似自激：连续 %d 次回复出声 %.1fs 内即被「打断」，"
+                        "本通退回半双工（WIL-94 兜底）",
+                        self._barge_in_echo_strikes,
+                        _BARGE_IN_ECHO_WINDOW_SECONDS,
+                    )
+                    record = self._record
+                    if record is not None:
+                        record.log_event(
+                            "barge_in_fallback",
+                            strikes=self._barge_in_echo_strikes,
+                            window_s=_BARGE_IN_ECHO_WINDOW_SECONDS,
+                        )
+                    return False
+            else:
+                self._barge_in_echo_strikes = 0
+        return self._discard_agent_playback(bridge, "对端开口打断 AI")
+
+    def _discard_agent_playback(self, bridge: AudioBridge, reason: str) -> bool:
+        """清掉 AI 未播出的下行积压（桥内 + 队列）；护窗期拒绝，双音优先。
+
+        barge-in 让路与复读晚截（ResponseAudioGate ``on_late_cut``）共用的
+        清积压动作。护窗语义对两者一致：DTMF 期间谁都不许清队列。
+        """
+        if time.monotonic() < self._dtmf_guard_until:
+            logger.info("护窗期内拒绝清积压（%s）：双音优先（WIL-49）", reason)
+            return False
+        with self._media_lock:
+            # 双检护窗：_send_dtmf_raw 是「先装护窗、再持本锁清队+入队双音」。
+            # 首查护窗时它可能还没装；等拿到锁，若双音已入队则护窗必已装上——
+            # 锁内重查一次，堵住「首查未装、动手时双音在队」的毫秒级竞态。
+            if time.monotonic() < self._dtmf_guard_until:
+                logger.info("护窗在清积压途中装上（%s）：让位，双音优先", reason)
+                return False
+            dropped = 0
+            if hasattr(bridge, "discard_pending_output"):
+                dropped = bridge.discard_pending_output()
+            cleared = 0
+            try:
+                while True:
+                    self._outgoing_audio.get_nowait()
+                    cleared += 1
+            except Empty:
+                pass
+        if dropped or cleared:
+            logger.info(
+                "%s：丢弃未播积压 %d 字节 / 队列 %d 块", reason, dropped, cleared
+            )
+        return True
 
     # 一轮之内 provider 是突发写音频的（分块几乎连着到），轮次之间才有真空档。
     # 用这个空档判定「新的一轮开始了」，就不必依赖各 provider 的 response 事件。

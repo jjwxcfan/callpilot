@@ -14,6 +14,9 @@ class FakeAudioBridge:
         self.stopped = False
         self.uplink: deque[bytes] = deque()  # 测试注入的"模组上行"音频
         self.downlink: list[bytes] = []  # 会话写给模组的下行音频
+        # 模拟桥内未播积压（barge-in 测试用）：测试直接设字节数。
+        self.pending_bytes = 0
+        self.discarded_bytes = 0
 
     def start(self) -> None:
         self.started = True
@@ -29,7 +32,12 @@ class FakeAudioBridge:
         return self.uplink.popleft() if self.uplink else b""
 
     def pending_output_bytes(self) -> int:
-        return 0
+        return self.pending_bytes
+
+    def discard_pending_output(self) -> int:
+        dropped, self.pending_bytes = self.pending_bytes, 0
+        self.discarded_bytes += dropped
+        return dropped
 
     def write_modem_chunks(self, chunks: Iterable[bytes]) -> None:
         self.downlink.extend(chunk for chunk in chunks if chunk)
