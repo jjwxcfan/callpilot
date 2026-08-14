@@ -1007,11 +1007,16 @@ def test_factory_unknown_provider_mentions_openai():
 # ---- barge-in：speech_started 打断 ----
 
 def test_barge_in_speech_started_cancels_and_fires_interrupt(monkeypatch):
-    """注册了打断回调时：对端开口 → 发 response.cancel（仅回复生成中）+ 触发回调。"""
+    """回调接受打断时：对端开口 → 发 response.cancel（仅回复生成中）+ 触发回调。"""
     instances, _calls = _patch_connect(monkeypatch)
     agent = _make_agent()
     interrupts: list[int] = []
-    agent.set_user_interrupt_handler(lambda: interrupts.append(1))
+
+    def accept_interrupt() -> bool:
+        interrupts.append(1)
+        return True
+
+    agent.set_user_interrupt_handler(accept_interrupt)
 
     async def scenario():
         await agent.start(lambda pcm: None)
@@ -1033,7 +1038,12 @@ def test_barge_in_no_active_response_skips_cancel_but_fires_interrupt(monkeypatc
     instances, _calls = _patch_connect(monkeypatch)
     agent = _make_agent()
     interrupts: list[int] = []
-    agent.set_user_interrupt_handler(lambda: interrupts.append(1))
+
+    def accept_interrupt() -> bool:
+        interrupts.append(1)
+        return True
+
+    agent.set_user_interrupt_handler(accept_interrupt)
 
     async def scenario():
         await agent.start(lambda pcm: None)
@@ -1046,6 +1056,34 @@ def test_barge_in_no_active_response_skips_cancel_but_fires_interrupt(monkeypatc
             await asyncio.sleep(0.05)
             assert "response.cancel" not in ws.sent_types()
             assert interrupts
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
+def test_barge_in_rejected_by_handler_skips_cancel(monkeypatch):
+    """回调拒绝打断（DTMF 护窗让位 / 自激兜底，WIL-94）：即使回复生成中也不 cancel。"""
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+    interrupts: list[int] = []
+
+    def reject_interrupt() -> bool:
+        interrupts.append(1)
+        return False
+
+    agent.set_user_interrupt_handler(reject_interrupt)
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            ws = instances[0]
+            ws.feed({"type": "response.created", "response": {"id": "r1"}})
+            ws.feed({"type": "input_audio_buffer.speech_started"})
+            await _drain()
+            await asyncio.sleep(0.05)
+            assert "response.cancel" not in ws.sent_types()
+            assert interrupts, "回调必须被问到（由它记录让位原因）"
         finally:
             await agent.stop()
 

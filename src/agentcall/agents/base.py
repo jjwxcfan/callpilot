@@ -20,7 +20,7 @@ class VoiceAgent(ABC):
     _on_transcript: "Callable[[str, str], None] | None" = None
     _on_repeat_stuck: "Callable[[str], None] | None" = None
     _on_status: "Callable[[str], None] | None" = None
-    _on_user_interrupt: "Callable[[], None] | None" = None
+    _on_user_interrupt: "Callable[[], bool] | None" = None
     _tools: "ToolRegistry | None" = None
     _session_instructions: str | None = None
 
@@ -80,20 +80,24 @@ class VoiceAgent(ABC):
         self._on_status = handler
 
     def set_user_interrupt_handler(
-        self, handler: "Callable[[], None] | None"
+        self, handler: "Callable[[], bool] | None"
     ) -> None:
         """注册对端开口打断（barge-in）回调：provider 侧 VAD 检测到对端在 AI
         说话期间开口时触发；调用方在回调里清掉本地未播完的下行积压，让 AI 立即
-        闭嘴。仅在 barge-in 模式（BARGE_IN_ENABLED）下由 call_agent 注册；
-        不支持打断事件的 provider 不触发即可。"""
+        闭嘴。回调返回**是否接受这次打断**——False 表示让位（DTMF 护窗期内双音
+        优先，或自激兜底已退回半双工，见 WIL-94 坑 1/坑 4），provider 侧此时
+        不得 response.cancel。仅在 barge-in 模式（BARGE_IN_ENABLED）下由
+        call_agent 注册；不支持打断事件的 provider 不触发即可。"""
         self._on_user_interrupt = handler
 
-    def _emit_user_interrupt(self) -> None:
+    def _emit_user_interrupt(self) -> bool:
+        """触发打断回调；返回是否接受打断（无回调/回调异常一律视为不接受）。"""
         if self._on_user_interrupt:
             try:
-                self._on_user_interrupt()
+                return bool(self._on_user_interrupt())
             except Exception:  # noqa: BLE001
                 pass
+        return False
 
     def _emit_status(self, text: str) -> None:
         if self._on_status and text:
