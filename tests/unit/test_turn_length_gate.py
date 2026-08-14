@@ -351,3 +351,45 @@ def test_base_agent_reports_unsupported():
             pass
 
     assert asyncio.run(Bare().cancel_response()) is False
+
+
+# ---- 轮首静音掐除（WIL-112 最后一块：TTS 前缘垫中位 470ms 纯静音）----
+
+def _trim_session() -> CallSession:
+    session = CallSession(
+        modem=FakeModem(),  # type: ignore[arg-type]
+        audio_keyword="unused",
+        provider="qwen",
+        audio_mode="uac",
+        pcm_port=None,
+        pcm_baudrate=921600,
+        tx_gain=1.0,
+    )
+    from agentcall.call_agent import _TURN_TRIM_CAP_BYTES
+    session._turn_trim_budget = _TURN_TRIM_CAP_BYTES
+    session._turn_trimmed_bytes = 0
+    return session
+
+
+def test_leading_silence_is_trimmed_until_first_voiced_sample():
+    session = _trim_session()
+    silence = b"\x00\x00" * 160
+    assert session._trim_leading_silence(silence) == b""       # 整块静音被掐
+    mixed = b"\x00\x00" * 100 + b"\x00\x10" * 60               # 静音前缀+语音
+    out = session._trim_leading_silence(mixed)
+    assert out == b"\x00\x10" * 60                             # 前缀被掐、语音保留
+    # 见声后本轮预算清零：后续静音（句中停顿）原样通过
+    pause = b"\x00\x00" * 160
+    assert session._trim_leading_silence(pause) == pause
+
+
+def test_leading_silence_trim_respects_cap():
+    session = _trim_session()
+    from agentcall.call_agent import _TURN_TRIM_CAP_BYTES
+    # 连续灌超过上限的纯静音：超出上限的部分必须放行（防止无声轮被无限吞）
+    chunk = b"\x00\x00" * 8000  # 16000B = 1s
+    first = session._trim_leading_silence(chunk)
+    assert first == b""
+    second = session._trim_leading_silence(chunk)
+    swallowed = _TURN_TRIM_CAP_BYTES - len(chunk)
+    assert len(second) == len(chunk) - swallowed

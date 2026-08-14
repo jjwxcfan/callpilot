@@ -98,6 +98,11 @@ logger = logging.getLogger(__name__)
 # 只用于轮次延迟测量的打点，不参与任何对话逻辑。
 _VOICED_PEAK_THRESHOLD = 350
 
+# 下行轮首静音垫的判定峰值与掐除上限（WIL-112）。TTS 音频前缘实测垫中位
+# 470ms、最长 ~1s 纯静音；上限防止把真正的轻声开头吃掉。16B = 1ms @8kHz/16bit。
+_DOWNLINK_SILENCE_PEAK = 500
+_TURN_TRIM_CAP_BYTES = 24000  # 1.5s
+
 # barge-in 自激兜底（WIL-94 坑 4）：回复出声后极短时间内就被「对端开口」打断、
 # 且连续多次，即视为疑似自激（下行被模组回采成上行触发 provider VAD）。前提
 # 「模组无回采」是一次性实测（SIM7600 r=0.009），换硬件/改增益后可能失效，
@@ -206,6 +211,9 @@ class CallSession:
         # now - 这个值 得到本地可观测的端到端轮次延迟（上行传输 + VAD 判停 +
         # 生成），比「判停→首音频」多覆盖前半段链路；蜂窝两腿仍在其外。
         self._last_voiced_at = 0.0
+        # 轮首静音掐除：本轮还允许掐多少字节（轮次边界重置为上限）与已掐字节。
+        self._turn_trim_budget = 0
+        self._turn_trimmed_bytes = 0
         # barge-in（BARGE_IN_ENABLED）：每通开始时从 config 读取；True 时上行
         # 不做半双工丢弃、对端开口即打断 AI（见 _run_agent_loop 与
         # _handle_peer_barge_in）。自激兜底触发时本通内置回 False。
@@ -705,6 +713,11 @@ class CallSession:
             pcm_8k = bridge.agent_to_modem(pcm_agent, agent.output_rate)
             if hasattr(bridge, "amplify_for_modem"):
                 pcm_8k = bridge.amplify_for_modem(pcm_8k)
+            # 掐掉本轮开头的静音垫（WIL-112 最后一块）：TTS 音频前缘实测垫
+            # 中位 470ms、最长 ~1s 纯静音——仪器在「首字节到达」停表，对端耳朵
+            # 却要等垫子播完。只掐轮首、设上限防误伤；句中停顿原样保留。
+            if pcm_8k and self._turn_trim_budget > 0:
+                pcm_8k = self._trim_leading_silence(pcm_8k)
             if pcm_8k:
                 if record is not None:
                     record.write_downlink(pcm_8k)
@@ -740,6 +753,43 @@ class CallSession:
                 self._outgoing_audio.put(pcm_8k)
 
         return on_agent_audio
+
+    def _trim_leading_silence(self, pcm_8k: bytes) -> bytes:
+        """掐掉本轮开头的静音垫，返回剩余部分（可能为空）。
+
+        预算（_turn_trim_budget）由轮次边界重置为上限：静音块整块掐掉直到
+        预算耗尽或遇到第一个过阈样本；一旦见声或预算耗尽即停，本轮不再触碰
+        （句中停顿因此不受影响）。
+        """
+        usable = len(pcm_8k) - (len(pcm_8k) % 2)
+        if not usable:
+            return pcm_8k
+        samples = array("h", pcm_8k[:usable])
+        if max(max(samples), -min(samples)) < _DOWNLINK_SILENCE_PEAK:
+            drop = min(len(pcm_8k), self._turn_trim_budget)
+            self._turn_trimmed_bytes += drop
+            self._turn_trim_budget -= drop
+            if self._turn_trim_budget <= 0:
+                self._log_turn_trim()
+            return pcm_8k[drop:]
+        cut_idx = 0
+        for k, sample in enumerate(samples):
+            if abs(sample) >= _DOWNLINK_SILENCE_PEAK:
+                cut_idx = k
+                break
+        cut = min(cut_idx * 2, self._turn_trim_budget)
+        self._turn_trimmed_bytes += cut
+        self._turn_trim_budget = 0
+        self._log_turn_trim()
+        return pcm_8k[cut:]
+
+    def _log_turn_trim(self) -> None:
+        if self._turn_trimmed_bytes:
+            logger.info(
+                "[timing] 已掐掉本轮开头静音 %dms",
+                self._turn_trimmed_bytes // 16,
+            )
+        self._turn_trimmed_bytes = 0
 
     async def _speak_takeover_hold_if_needed(
         self, agent: VoiceAgent, bridge: AudioBridge, generation: int
@@ -2332,6 +2382,8 @@ class CallSession:
                 self._turn_audio_bytes = 0
                 self._turn_cancel_sent = False
                 self._turn_first_audio_logged = False
+                self._turn_trim_budget = _TURN_TRIM_CAP_BYTES
+                self._turn_trimmed_bytes = 0
             self._turn_last_chunk_at = now
         rate = getattr(agent, "output_rate", 0) or self._agent_output_rate
         if self._max_turn_seconds <= 0 or rate <= 0:

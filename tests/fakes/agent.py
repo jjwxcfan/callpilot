@@ -10,7 +10,10 @@ from agentcall.agents.base import VoiceAgent
 class FakeAgent(VoiceAgent):
     """say() 时按脚本推一段假 PCM 到 on_audio_out 并产生 agent 转写。"""
 
-    def __init__(self, reply_pcm: bytes = b"\x01\x00" * 240) -> None:
+    # 假回复 PCM 用清晰可闻的振幅（0x1000=4096）：真实 TTS 语音必然过阈，
+    # 全 1 之类的准静音样本会被轮首静音掐除（call_agent._trim_leading_silence）
+    # 当垫子吃掉，不代表任何真实场景。
+    def __init__(self, reply_pcm: bytes = b"\x00\x10" * 240) -> None:
         self.reply_pcm = reply_pcm
         self.started = False
         self.stopped = False
