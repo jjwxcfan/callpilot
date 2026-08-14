@@ -128,9 +128,10 @@ class OpenAIVoiceAgent(VoiceAgent):
             self._emit_audio_out,
             on_suppressed=self._nudge_after_repeat_suppressed,
             on_stuck=self._repeat_suppression_stuck,
-            # 复读已开播才被判定时，走 barge-in 同一套清积压回调把没播的截掉；
-            # 半双工模式（未注册回调）下仅丢后续分块。
-            on_late_cut=self._emit_user_interrupt,
+            # 复读已开播才被判定时清设备侧积压。与 barge-in 是同一个清积压
+            # 动作、不同语义——晚截是自己复读被掐，不是对端插话，走专用回调
+            # 以免被计进自激笔数（见 base.set_late_cut_handler）。
+            on_late_cut=self._emit_late_cut,
         )
         self._running = False
         self._handled_tool_calls: set[str] = set()

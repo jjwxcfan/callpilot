@@ -21,6 +21,7 @@ class VoiceAgent(ABC):
     _on_repeat_stuck: "Callable[[str], None] | None" = None
     _on_status: "Callable[[str], None] | None" = None
     _on_user_interrupt: "Callable[[], bool] | None" = None
+    _on_late_cut: "Callable[[], bool] | None" = None
     _tools: "ToolRegistry | None" = None
     _session_instructions: str | None = None
 
@@ -98,6 +99,24 @@ class VoiceAgent(ABC):
             except Exception:  # noqa: BLE001
                 pass
         return False
+
+    def set_late_cut_handler(self, handler: "Callable[[], bool] | None") -> None:
+        """注册复读晚截清积压回调（ResponseAudioGate ``on_late_cut`` 用）。
+
+        与打断回调是**同一个清积压动作、不同的语义**：晚截是 AI 自己复读被掐，
+        不是对端插话——绝不能走 ``_emit_user_interrupt``，否则会被 call_agent
+        计进 barge-in 的自激笔数（连续几次复读就误判自激退回半双工）。回调
+        返回是否真的清了（DTMF 护窗期内会拒绝，双音优先）。"""
+        self._on_late_cut = handler
+
+    def _emit_late_cut(self) -> bool:
+        """触发复读晚截清积压；未注册专用回调时回落到打断回调（旧接线兼容）。"""
+        if self._on_late_cut:
+            try:
+                return bool(self._on_late_cut())
+            except Exception:  # noqa: BLE001
+                return False
+        return self._emit_user_interrupt()
 
     def _emit_status(self, text: str) -> None:
         if self._on_status and text:

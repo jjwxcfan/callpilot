@@ -526,6 +526,12 @@ class CallSession:
                 agent.set_user_interrupt_handler(
                     lambda: self._handle_peer_barge_in(bridge)
                 )
+            # 复读晚截（ResponseAudioGate on_late_cut）：同一个清积压动作、
+            # 不同语义——不计自激笔数，且半双工模式也要清（复读开头已播出的
+            # 尾巴不清会多拖 1~2s）。护窗让位逻辑在 _discard_agent_playback 内。
+            agent.set_late_cut_handler(
+                lambda: self._discard_agent_playback(bridge, "复读晚截")
+            )
             bridge.start()
             mark("bridge_started")
 
@@ -2213,12 +2219,23 @@ class CallSession:
                     return False
             else:
                 self._barge_in_echo_strikes = 0
+        return self._discard_agent_playback(bridge, "对端开口打断 AI")
+
+    def _discard_agent_playback(self, bridge: AudioBridge, reason: str) -> bool:
+        """清掉 AI 未播出的下行积压（桥内 + 队列）；护窗期拒绝，双音优先。
+
+        barge-in 让路与复读晚截（ResponseAudioGate ``on_late_cut``）共用的
+        清积压动作。护窗语义对两者一致：DTMF 期间谁都不许清队列。
+        """
+        if time.monotonic() < self._dtmf_guard_until:
+            logger.info("护窗期内拒绝清积压（%s）：双音优先（WIL-49）", reason)
+            return False
         with self._media_lock:
             # 双检护窗：_send_dtmf_raw 是「先装护窗、再持本锁清队+入队双音」。
             # 首查护窗时它可能还没装；等拿到锁，若双音已入队则护窗必已装上——
             # 锁内重查一次，堵住「首查未装、动手时双音在队」的毫秒级竞态。
             if time.monotonic() < self._dtmf_guard_until:
-                logger.info("护窗在打断处理途中装上：barge-in 让位，双音优先")
+                logger.info("护窗在清积压途中装上（%s）：让位，双音优先", reason)
                 return False
             dropped = 0
             if hasattr(bridge, "discard_pending_output"):
@@ -2232,8 +2249,7 @@ class CallSession:
                 pass
         if dropped or cleared:
             logger.info(
-                "对端开口打断 AI：丢弃未播积压 %d 字节 / 队列 %d 块",
-                dropped, cleared,
+                "%s：丢弃未播积压 %d 字节 / 队列 %d 块", reason, dropped, cleared
             )
         return True
 

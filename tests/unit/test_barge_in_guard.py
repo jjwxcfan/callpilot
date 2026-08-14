@@ -164,6 +164,79 @@ def test_quiet_turn_start_does_not_count_strikes():
     assert session._barge_in_echo_strikes == 0
 
 
+# ---- 复读晚截（ResponseAudioGate on_late_cut）：同动作、不同语义 ----
+
+
+def test_late_cut_clears_without_counting_echo_strikes():
+    """晚截是 AI 自己复读被掐，不是对端插话——清积压但**绝不**计自激笔数。
+
+    否则一通电话里复读 3 次就会被误判自激、白白退回半双工（d12f6ea 与
+    5d42dc8 并行开发引入的语义冲突，本测试锁住修复）。
+    """
+    session = make_session()
+    bridge = FakeAudioBridge()
+    bridge.pending_bytes = 800
+    session._outgoing_audio.put(b"\x11\x11" * 100)
+    # 刚出声（在自激窗口内）——若走 barge-in 路径这会 +1 笔。
+    session._turn_audio_started_at = time.monotonic()
+
+    accepted = session._discard_agent_playback(bridge, "复读晚截")
+
+    assert accepted is True
+    assert queued(session) == []
+    assert bridge.discarded_bytes == 800
+    assert session._barge_in_echo_strikes == 0, "晚截不得计入自激笔数"
+    assert session._barge_in is True, "晚截不得触发退回半双工"
+
+
+def test_late_cut_respects_dtmf_guard(monkeypatch):
+    monkeypatch.setenv("DTMF_MODE", "inband")
+    monkeypatch.setenv("DTMF_GUARD_MS", "400")
+    session = make_session()
+    bridge = FakeAudioBridge()
+    session._send_dtmf_raw("1", source="agent_tool")
+
+    assert session._discard_agent_playback(bridge, "复读晚截") is False
+    assert len(queued(session)) == 1, "护窗期内晚截同样让位，双音必须活着"
+
+
+def test_late_cut_clears_in_half_duplex_mode_too():
+    """半双工模式（BARGE_IN_ENABLED=false）复读晚截也要清——不清则复读开头
+    已入队的尾巴照播 1~2s。"""
+    session = make_session(barge_in=False)
+    bridge = FakeAudioBridge()
+    session._outgoing_audio.put(b"\x11\x11" * 100)
+
+    assert session._discard_agent_playback(bridge, "复读晚截") is True
+    assert queued(session) == []
+
+
+def test_emit_late_cut_uses_dedicated_handler_not_user_interrupt():
+    """base 层：注册了晚截回调就走它，绝不误触打断回调。"""
+    from fakes import FakeAgent
+
+    agent = FakeAgent()
+    calls: list[str] = []
+    agent.set_user_interrupt_handler(lambda: (calls.append("interrupt"), True)[1])
+    agent.set_late_cut_handler(lambda: (calls.append("late_cut"), True)[1])
+
+    assert agent._emit_late_cut() is True
+    assert calls == ["late_cut"]
+
+
+def test_emit_late_cut_falls_back_to_user_interrupt_when_unset():
+    """base 层：未接晚截回调时回落打断回调（旧接线兼容），都没有则 False。"""
+    from fakes import FakeAgent
+
+    agent = FakeAgent()
+    assert agent._emit_late_cut() is False
+
+    calls: list[str] = []
+    agent.set_user_interrupt_handler(lambda: (calls.append("interrupt"), True)[1])
+    assert agent._emit_late_cut() is True
+    assert calls == ["interrupt"]
+
+
 @pytest.mark.parametrize("mode", ["inband", "qvts"])
 def test_guard_expiry_restores_barge_in(monkeypatch, mode):
     """护窗过期后 barge-in 恢复正常让路——让位是暂时的，不是本通失效。"""
