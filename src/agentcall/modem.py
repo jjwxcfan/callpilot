@@ -909,6 +909,10 @@ class SerialModem:
                 trigger = "NO CARRIER" if "NO CARRIER" in self._buffer else "+CEND:"
                 logger.info("通话已结束 (触发=%s)", trigger)
                 self._buffer = ""
+                # 通话结束即清来电号码：隐藏号码来电的 +CLIP 是空引号、匹配不到，
+                # 不清的话下一通会把**上一通**的号码当成本通来电（转告短信会把
+                # 错误的回拨号码写给机主，review finding #8）。None = 如实的未知。
+                self._last_caller = None
                 if self._on_hangup:
                     self._on_hangup()
                 return

@@ -165,6 +165,21 @@ def test_inbound_instructions_inject_owner_and_rules():
     assert "这件事是李明的" not in text
 
 
+def test_inbound_relay_sms_must_carry_caller_identity():
+    """转告短信不能只写「有人找你」——机主不在通话里，谁、什么事只能由 AI 写进去。
+
+    真机 2026-08-14：来电者请 AI 给机主发消息，短信正文只有
+    「Caller needs to speak with you. Please reach out to them when available.」。
+    """
+    zh = build_instructions("inbound", "李明", "数字分身", "")
+    en = build_instructions("inbound", "Alex", "AI assistant", "", "en")
+
+    assert "send_sms" in zh and "对方是谁" in zh and "没留姓名" in zh
+    assert "send_sms" in en and "who is calling" in en and "no name" in en
+    # 「号码留空」的含义必须与实现一致：发给当前通话对端，不是机主
+    assert "empty to text the person you are on the call with" in en
+
+
 def test_inbound_takeover_preference_is_free_text_with_injection_boundary():
     preference = "快递和外卖也转给我；教育培训、贷款等营销电话由你处理。"
 

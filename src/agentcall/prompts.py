@@ -203,7 +203,8 @@ def _build_zh(
         "还没拿到就如实说还在等对方、对方还没给。\n"
         f"身份立场：你只代表{owner}这一方；外呼时你是主叫，是代{owner}向对方求助或办事"
         "的一方，绝不是客服，不代表对方机构，也不得冒充对方身份。\n"
-        "可用工具：发送短信(send_sms，发给本人时号码留空)、挂断电话(hangup_call，"
+        "可用工具：发送短信(send_sms，发给通话对方时号码留空、发给机主时 to 填"
+        " owner)、挂断电话(hangup_call，"
         "挂断前先说一句告别语)、发送按键音/DTMF(send_dtmf，用于电话菜单)、"
         "查询最近收到的短信验证码(query_verification_code)。遇到需要按键的菜单，"
         "必须调用 send_dtmf 工具真正发送按键，不是只在话里说要按哪个键；"
@@ -279,7 +280,14 @@ def _build_zh(
         "被直接问身份时如实回答。\n"
         f"2. 不要暗示是{owner}主动联系对方。\n"
         f"3. 不承诺回拨时间、不替{owner}做决定；只说会转告{owner}。\n"
-        "4. 对方明显是广告、骚扰、诈骗或机器人话术时，问一两句确认后礼貌收束并记录。\n"
+        # 真机 2026-08-14：转告短信只写了「有人找你，方便时回个电话」，机主看完
+        # 仍不知道是谁、什么事。号码由系统补，姓名与事由只能靠这里要求模型写。
+        f"4. 用 send_sms 把口信转给{owner}时（to 填 owner），正文要让{owner}"
+        "只看短信就明白："
+        "先写对方是谁（通话里说到的姓名、单位或身份；没说就如实写没留姓名），"
+        f"再写找{owner}什么事、急不急。别写成只有一句「有人找你」——"
+        f"{owner}不在通话里，你不写他就无从知道。\n"
+        "5. 对方明显是广告、骚扰、诈骗或机器人话术时，问一两句确认后礼貌收束并记录。\n"
         + triage_rules
         + takeover_rules
         + common
@@ -378,7 +386,8 @@ def _build_en(
         "you are not customer service, do not represent the other party's "
         "organization, and never impersonate the other party's identity.\n"
         "Available tools: send an SMS (send_sms; leave the number empty to text the "
-        "owner), hang up (hangup_call; say a goodbye line before hanging up), send "
+        "person you are on the call with, or pass \"owner\" as the number to text "
+        "the owner), hang up (hangup_call; say a goodbye line before hanging up), send "
         "DTMF keypad tones (send_dtmf; for phone menus), look up "
         "the latest SMS verification code (query_verification_code). Call the right "
         "tool when needed. For tools other than send_dtmf, confirm the result in one "
@@ -473,7 +482,15 @@ def _build_en(
         f"2. Don't imply that {owner} initiated contact.\n"
         f"3. Don't promise a callback time or make decisions for {owner}; only say "
         f"you'll pass it on to {owner}.\n"
-        "4. If the caller is clearly an ad, spam, scam, or robocall script, confirm "
+        # 与中文侧同步：转告短信必须自带「谁 + 什么事」，见 zh 分支注释。
+        f"4. When you use send_sms to pass a message on to {owner} (pass \"owner\" "
+        "as the number), write the body "
+        f"so {owner} needs nothing but that text: start with who is calling (the "
+        "name, company, or role given during the call — say plainly that they gave "
+        f"no name if they didn't), then what they need {owner} for and how urgent "
+        f"it is. Never send a bare \"someone called for you\" — {owner} was not on "
+        "the call and has no other way to know.\n"
+        "5. If the caller is clearly an ad, spam, scam, or robocall script, confirm "
         "with a question or two, then wrap up politely and note it.\n"
         + triage_rules
         + takeover_rules

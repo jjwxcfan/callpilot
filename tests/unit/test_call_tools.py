@@ -39,6 +39,7 @@ def make_tools(
     sms_gate=None,
     send_dtmf=None,
     effect_guard=None,
+    direction=None,
 ) -> tuple[CallTools, FakeModem, list]:
     modem = modem or FakeModem()
     hangups: list[bool] = []
@@ -51,6 +52,7 @@ def make_tools(
         is_sms_target_allowed=sms_gate,
         send_dtmf=send_dtmf,
         effect_guard=effect_guard,
+        direction=direction,
     )
     return tools, modem, hangups
 
@@ -188,6 +190,193 @@ def test_tool_calls_write_sanitized_audit_events():
     assert "secret body" not in str(audits)
     assert "482913" not in str(audits)
     assert hangups == [True]
+
+
+# ---- to="owner"：系统解析机主号码（WIL-116） ----
+
+def test_send_sms_owner_token_resolves_to_configured_number(monkeypatch):
+    """模型只写 owner，真实号码由系统从 OWNER_PHONE 解析；工具结果也只回传
+    owner 标记——结果回流进模型上下文，回号码等于送到模型嘴边念给来电者。"""
+    monkeypatch.setenv("OWNER_PHONE", "+16505550100")
+    tools, modem, _ = make_tools(
+        caller="13800000000", direction="inbound", sms_gate=lambda n: True
+    )
+
+    result = tools._send_sms({"to": "Owner", "content": "张伟找您，说合同的事"})
+
+    assert result["success"] is True
+    number, text = modem.calls[0][1]
+    assert number == "+16505550100"
+    assert "13800000000" in text  # 转告机主仍要带来电号码
+    assert result["to"] == "owner"
+    assert "+16505550100" not in repr(result)  # 机主号码不回流给模型
+
+
+def test_send_sms_owner_token_tolerates_quotes(monkeypatch):
+    """提示词里 owner 带引号展示，模型照抄引号也必须认。"""
+    monkeypatch.setenv("OWNER_PHONE", "18800000000")
+    tools, modem, _ = make_tools(sms_gate=lambda n: True)
+
+    assert tools._send_sms({"to": '"owner"', "content": "hi"})["success"] is True
+    assert modem.calls[0][1][0] == "18800000000"
+
+
+def test_send_sms_owner_token_fails_clearly_when_unconfigured(monkeypatch):
+    monkeypatch.delenv("OWNER_PHONE", raising=False)
+    record = SpyRecord()
+    tools, modem, _ = make_tools(caller="13800000000", record=record)
+
+    result = tools._send_sms({"to": "owner", "content": "hi"})
+
+    assert result["success"] is False
+    assert "OWNER_PHONE" in result["message"]
+    assert modem.calls == []
+    audits = [fields for typ, fields in record.events if typ == "tool_call"]
+    assert audits[0]["args"]["to"] == "owner"
+
+
+def test_send_sms_owner_phone_human_format_sanitized(monkeypatch):
+    """OWNER_PHONE 填人类格式（空格/括号/连字符）也能拨——清洗后再校验。"""
+    monkeypatch.setenv("OWNER_PHONE", "+1 (650) 555-0100")
+    tools, modem, _ = make_tools(sms_gate=lambda n: True)
+
+    assert tools._send_sms({"to": "owner", "content": "hi"})["success"] is True
+    assert modem.calls[0][1][0] == "+16505550100"
+
+
+def test_send_sms_owner_phone_invalid_format_rejected(monkeypatch):
+    """清洗后仍不成号码形状的 OWNER_PHONE 要报格式错误，而不是发到 AT 层才失败。"""
+    monkeypatch.setenv("OWNER_PHONE", "not-a-phone")
+    tools, modem, _ = make_tools(sms_gate=lambda n: True)
+
+    result = tools._send_sms({"to": "owner", "content": "hi"})
+
+    assert result["success"] is False
+    assert "格式无效" in result["message"]
+    assert modem.calls == []
+
+
+def test_send_sms_non_numeric_to_error_teaches_owner_token():
+    """to 既不是号码也不是 owner 标记（如「机主」）时，错误信息要教会模型正确写法。"""
+    tools, modem, _ = make_tools(caller="13800000000")
+
+    result = tools._send_sms({"to": "机主", "content": "hi"})
+
+    assert result["success"] is False
+    assert "owner" in result["message"]
+    assert modem.calls == []
+
+
+# ---- 转给机主的短信必须带来电号码（且只有转给机主的才带） ----
+
+def make_relay_tools(monkeypatch, caller="13800000000", owner="18800000000"):
+    monkeypatch.setenv("OWNER_PHONE", owner)
+    return make_tools(caller=caller, direction="inbound", sms_gate=lambda n: True)
+
+
+def test_relay_sms_appends_caller_number(monkeypatch):
+    """转给机主的短信要带来电号码，否则机主不知道该回给谁（真机 2026-08-14）。"""
+    tools, modem, _ = make_relay_tools(monkeypatch)
+
+    result = tools._send_sms({"to": "owner", "content": "张伟找您，说合同的事"})
+
+    assert result["success"] is True
+    text = modem.calls[0][1][1]
+    assert text.startswith("张伟找您，说合同的事")
+    assert "13800000000" in text
+    assert result["content"] == text  # 回给模型的也是真正发出去的正文
+
+
+def test_explicit_owner_number_also_counts_as_relay(monkeypatch):
+    """模型直接填机主号码（而非 owner 标记）同样算中继，国家码形变也认。"""
+    tools, modem, _ = make_relay_tools(monkeypatch, owner="+8618800000000")
+
+    result = tools._send_sms({"to": "18800000000", "content": "张伟找您"})
+
+    assert "13800000000" in modem.calls[0][1][1]
+    assert result["to"] == "18800000000"  # 模型自己给的号码不用打码
+
+
+def test_third_party_sms_never_carries_caller_number(monkeypatch):
+    """发给第三方的短信绝不附来电号码——那是把来电者的号码泄露给无关的人。"""
+    tools, modem, _ = make_relay_tools(monkeypatch)
+
+    tools._send_sms({"to": "19900000000", "content": "地址是人民路 1 号"})
+
+    assert modem.calls[0][1][1] == "地址是人民路 1 号"
+
+
+def test_caller_line_language_follows_body_script(monkeypatch):
+    """追加行跟正文字符集走：给 ASCII 正文追中文会把整条短信翻成 UCS2（70 字上限）。"""
+    tools, modem, _ = make_relay_tools(monkeypatch, caller="+16505550100")
+
+    tools._send_sms({"to": "owner", "content": "Wei from Acme called."})
+    tools._send_sms({"to": "owner", "content": "张伟来电找您"})
+
+    en_text = modem.calls[0][1][1]
+    assert en_text.endswith("(Caller: +16505550100)")
+    assert en_text.isascii()  # 不因追加行翻成 UCS2
+    assert modem.calls[1][1][1].endswith("（来电号码：+16505550100）")
+
+
+def test_reply_to_caller_keeps_content_untouched(monkeypatch):
+    """回给来电者本人时不标注来源——对方当然知道自己是谁。"""
+    tools, modem, _ = make_relay_tools(monkeypatch)
+
+    tools._send_sms({"content": "地址是人民路 1 号"})
+
+    assert modem.calls[0][1][1] == "地址是人民路 1 号"
+
+
+def test_outbound_call_sms_keeps_content_untouched(monkeypatch):
+    """外呼时对端不是「来电」，这行措辞不成立。"""
+    monkeypatch.setenv("OWNER_PHONE", "18800000000")
+    tools, modem, _ = make_tools(
+        caller="10086", direction="outbound", sms_gate=lambda n: True
+    )
+
+    tools._send_sms({"to": "owner", "content": "客服说下月生效"})
+
+    assert modem.calls[0][1][1] == "客服说下月生效"
+
+
+def test_relay_dedup_tolerates_number_format_variants(monkeypatch):
+    """CLIP 是 +86 全格式、模型写裸号码：算已含，不重复追加。"""
+    tools, modem, _ = make_relay_tools(monkeypatch, caller="+8613800000000")
+
+    tools._send_sms({"to": "owner", "content": "张伟找您，回拨 13800000000"})
+
+    assert modem.calls[0][1][1] == "张伟找您，回拨 13800000000"
+
+
+def test_relay_dedup_respects_digit_boundaries(monkeypatch):
+    """短号是长数字的子串时不算已含：10086 不能被「100863 元」骗过。"""
+    tools, modem, _ = make_relay_tools(monkeypatch, caller="10086")
+
+    tools._send_sms({"to": "owner", "content": "话费余额 100863 元，来电想聊套餐"})
+
+    assert modem.calls[0][1][1].endswith("（来电号码：10086）")
+
+
+def test_relay_without_caller_id_sends_without_line(monkeypatch):
+    """隐藏号码来电（CLIP 为空）：正常发送，不编造号码行。"""
+    monkeypatch.setenv("OWNER_PHONE", "18800000000")
+    tools, modem, _ = make_tools(
+        caller=None, direction="inbound", sms_gate=lambda n: True
+    )
+
+    result = tools._send_sms({"to": "owner", "content": "有人来电找您，没留姓名"})
+
+    assert result["success"] is True
+    assert modem.calls[0][1][1] == "有人来电找您，没留姓名"
+
+
+def test_empty_content_still_rejected_on_owner_relay(monkeypatch):
+    """补号码不能把空正文补成非空，绕过空内容校验。"""
+    tools, modem, _ = make_relay_tools(monkeypatch)
+
+    assert tools._send_sms({"to": "owner", "content": "  "})["success"] is False
+    assert modem.calls == []
 
 
 def test_send_sms_no_gate_allows_all():

@@ -224,6 +224,10 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("CARRIER_HOTLINE", "运营商免费客服号（留空=按 SIM 自动识别）", "str", "",
                requires_restart=True),
     ConfigSpec("OWNER_NAME", "机主姓名", "str", ""),
+    # 机主手机号：AI 把通话口信转发给机主时的短信收件号码（send_sms 的 to 填
+    # owner 时由系统解析成这个号码，模型不接触真实号码）。同时进发信白名单——
+    # 这个号码即使从未与本机通信过也放行（WIL-116）。留空 = 无法代发给机主。
+    ConfigSpec("OWNER_PHONE", "机主手机号（转告短信收件号码）", "str", ""),
     ConfigSpec(
         "INBOUND_TAKEOVER_ENABLED",
         "来电转手机真人接管",

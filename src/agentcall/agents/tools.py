@@ -25,13 +25,19 @@ SEND_SMS_SPEC: dict[str, Any] = {
             "给指定手机号发送一条短信，支持中文。当用户在通话中要求发短信时调用本工具，"
             "例如“给我发一条短信”“给这个号码发条广告”。若用户说发给他本人/发到当前号码，"
             "可以把 to 留空，系统会自动使用当前通话对方的号码。"
+            "若这条短信是把通话里的事转达给不在通话中的人（例如来电者请你给机主留言），"
+            "正文要写成收信人只看这条短信就够用：先写清对方是谁（通话里说到的姓名、"
+            "单位或身份；对方没说就如实写没留姓名），再写要转达什么事。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "to": {
                     "type": "string",
-                    "description": "收件手机号码；若指当前通话对方本人则可留空。",
+                    "description": (
+                        "收件手机号码；若指当前通话对方本人则可留空；"
+                        "要发给机主本人时填 owner，系统会用机主配置的号码。"
+                    ),
                 },
                 "content": {
                     "type": "string",
@@ -150,10 +156,17 @@ def _dtmf_log_mode(result: dict[str, Any]) -> str:
 _EN_TEXT: dict[tuple[str, str | None], str] = {
     ("send_sms", None): (
         "Send an SMS on the owner's behalf. Use it when the caller asks for "
-        "something in writing, or to pass a message along."
+        "something in writing, or to pass a message along. When the message "
+        "relays something from this call to someone who is not on it (e.g. the "
+        "caller asks you to leave a message for the owner), write the body so "
+        "the recipient needs nothing else: start with who is calling (the name, "
+        "company, or role given during the call — say plainly that they gave no "
+        "name if they didn't), then what they want passed on."
     ),
     ("send_sms", "to"): (
-        "Recipient phone number; leave empty to text the current caller."
+        "Recipient phone number; leave empty to text the current caller; "
+        "pass \"owner\" to text the owner (the system fills in the owner's "
+        "configured number)."
     ),
     ("send_sms", "content"): "Message body.",
     ("hangup_call", None): (

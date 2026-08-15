@@ -475,6 +475,9 @@ async def _send_sms(request: web.Request) -> web.Response:
         hub,
         call_logger,
         extra_allowed=current_caller,
+        # 这里刻意**不**放行 OWNER_PHONE：本端点 loopback 下无鉴权，白名单就是
+        # 它仅有的 CSRF 护栏；放行机主号码等于让任意页面能用本机 SIM 给机主发
+        # 钓鱼短信（review finding #6）。owner 放行只给通话内的 Agent 工具链路。
         allow_any=config.get_bool("SMS_ALLOW_ANY_TARGET"),
     ):
         return web.json_response(
