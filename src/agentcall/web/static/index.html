@@ -387,6 +387,33 @@
   .tl-row .ty { color: var(--text); min-width: 88px; flex-shrink: 0; font-family: inherit; }
   .tl-row .detail { white-space: pre-wrap; word-break: break-word; }
 
+  /* ========= 指标面板 ========= */
+  #page-metrics .wrap { max-width: 900px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+  #page-metrics .inner { overflow-x: auto; }  /* 窄屏时表格横向滚动而非被卡片裁切 */
+  .met-meta { font-size: 12px; color: var(--muted); }
+  .met-schema { font-size: 11px; letter-spacing: .18em; color: var(--muted); font-weight: 700; margin: 14px 0 4px; }
+  .met-dir { font-size: 13px; font-weight: 700; margin: 10px 0 4px; }
+  .met-table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+  .met-table th { text-align: left; font-size: 12px; color: var(--dim); font-weight: 500;
+    padding: 5px 12px 5px 0; border-bottom: 1px solid var(--border); }
+  .met-table td { padding: 6px 12px 6px 0; border-bottom: 1px solid rgba(255, 255, 255, .04); white-space: nowrap; }
+  .met-table td.na { color: var(--dim); }
+  .met-pills { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .met-pill { background: var(--well); border: 1px solid var(--border); border-radius: 999px;
+    padding: 3px 11px; font-size: 12px; color: var(--muted); font-family: var(--mono); }
+  .met-pill.bad { color: var(--err); border-color: rgba(255, 69, 58, .4); }
+  /* 悬浮详细说明：可悬浮元素虚线下划线，气泡用 fixed 单例（防被卡片 overflow 裁剪） */
+  .tip { cursor: help; border-bottom: 1px dashed var(--dim); }
+  .met-tipbox {
+    position: fixed; z-index: 200; max-width: 360px;
+    background: rgba(18, 24, 35, .97); border: 1px solid var(--border-strong);
+    border-radius: 12px; padding: 10px 13px;
+    font-size: 12px; line-height: 1.55; color: var(--text); font-weight: 400;
+    box-shadow: 0 10px 32px rgba(0, 0, 0, .55);
+    opacity: 0; pointer-events: none; transition: opacity .12s;
+  }
+  .met-tipbox.show { opacity: 1; }
+
   /* ========= 设置面板 ========= */
   #page-settings .wrap { max-width: 760px; margin: 0 auto; }
   #configForm { padding: 4px 20px 12px; }
@@ -885,6 +912,16 @@
       </div>
     </div>
 
+    <!-- 指标看板 -->
+    <div class="panel-page" id="page-metrics">
+      <div class="wrap">
+        <section class="card">
+          <h2><span data-i18n="met_title"></span><span class="sub" data-i18n="met_sub"></span></h2>
+          <div class="inner" id="metricsRoot"><div class="empty" data-i18n="met_loading"></div></div>
+        </section>
+      </div>
+    </div>
+
     <!-- 预设任务库 -->
     <div class="panel-page" id="page-profiles">
       <div class="wrap">
@@ -1041,6 +1078,7 @@
     <button data-page="live"><span class="ico">💬</span><span data-i18n="nav_live"></span><span class="dot"></span></button>
     <button data-page="sms"><span class="ico">✉️</span><span data-i18n="nav_sms"></span><span class="dot"></span></button>
     <button data-page="history"><span class="ico">🕘</span><span data-i18n="nav_history"></span><span class="dot"></span></button>
+    <button data-page="metrics"><span class="ico">📊</span><span data-i18n="nav_metrics"></span><span class="dot"></span></button>
     <button data-page="profiles"><span class="ico">☷</span><span data-i18n="nav_profiles"></span><span class="dot"></span></button>
     <button data-page="settings"><span class="ico">⚙️</span><span data-i18n="nav_settings"></span><span class="dot"></span></button>
   </nav>
@@ -1202,7 +1240,7 @@ const $ = (id) => document.getElementById(id);
 const I18N = {
   en: {
     slogan: "Your calls, handled by AI",
-    nav_phone: "Phone", nav_live: "Live", nav_sms: "SMS", nav_history: "History", nav_profiles: "Presets", nav_settings: "Settings",
+    nav_phone: "Phone", nav_live: "Live", nav_sms: "SMS", nav_history: "History", nav_metrics: "Metrics", nav_profiles: "Presets", nav_settings: "Settings",
     st_idle: "Standby", st_ringing: "Ringing", st_dialing: "Dialing", st_answered: "On call", st_ended: "Ended",
     conn_on: "Connected", conn_retry: "Reconnecting", conn_ing: "Connecting",
     modem_on: "Modem ready", modem_off: "Modem offline",
@@ -1267,6 +1305,33 @@ const I18N = {
     sms_title: "SMS", empty_sms: "No messages", ph_sms_text: "Message text",
     sms_send: "Send SMS", sending: "Sending…", sent: "Sent", send_fail: "Send failed: ",
     need_sms: "Enter number and text", sms_in: "IN ← ", sms_out: "OUT → ",
+    met_title: "Metrics", met_sub: "WIL-95 · per schema version, versions never averaged together",
+    met_loading: "Loading…", met_load_fail: "Failed to load: ",
+    met_meta_calls: "{n} calls analyzed ({skip} skipped — recorded before metrics collection landed)",
+    met_empty: "No data yet — it grows here after the first call on current main.",
+    met_schema_label: "SCHEMA v{v} · {n} CALLS",
+    met_dir_inbound: "Inbound", met_dir_outbound: "Outbound", met_dir_calls: "{n} calls",
+    met_hdr_metric: "Metric (ms)", met_no_sample: "no samples",
+    met_tip_n: "Number of samples (turns or calls) behind this row.",
+    met_tip_p50: "Median — half of the samples were faster than this.",
+    met_tip_p95: "95th percentile — the bad-case tail.",
+    met_tip_max: "Worst single sample seen.",
+    met_lat_local: "Local response (speech end → first reply chunk)",
+    met_tip_local: "Per turn: from your speech ending locally (uplink audio tail) to the first chunk of the AI's reply arriving back on this machine. Covers uplink upload, model thinking, TTS first chunk and network round-trips — the two cellular legs are outside what we can observe. Turns that ran a tool include the tool's execution time, so they read much longer.",
+    met_lat_first_delta: "VAD stop → first audio (generation)",
+    met_tip_first_delta: "From the provider deciding you stopped speaking (speech_stopped) to the first audio delta arriving. Pure generation + network segment; compare with local response to tell whether latency lives in stop detection or in generation.",
+    met_lat_backlog: "Playout backlog (perceived-lag culprit)",
+    met_tip_backlog: "When this turn's first reply chunk is queued, how much earlier audio is still waiting to play. Anything above 0 means the playback queue is congested — the #1 reason instruments say 1.7 s while ears hear 3 s+. Ideal is a flat 0.",
+    met_lat_tool: "Tool call duration",
+    met_tip_tool: "Time from a tool invocation (hang up, send SMS, take note…) to its result. Tool time is included in that turn's local response — which is why tool turns look slow.",
+    met_lat_first: "First audio of the call (answer → arrival)",
+    met_tip_first: "Whole-call first impression: from the call being answered to the first AI audio arriving. One sample per call.",
+    met_lat_hangup: "Hangup latency (last dialog event → call end)",
+    met_tip_hangup: "From the last dialog activity (transcript, DTMF outcome or tool action) to the call actually ending. Event-based approximation — the playout tail is not included; a large value means the goodbye drags.",
+    met_pill_term: "end", met_tip_term: "How calls ended, counted by termination kind: agent_hangup = the AI hung up via its tool, remote_hangup = the other side hung up, and so on.",
+    met_pill_known: "known caller", met_tip_known: "Calls where the caller was recognized as a known contact (affects greeting and strategy).",
+    met_tip_combo: "The provider / turn-detection / barge-in configuration these calls ran with. Different configs are counted separately so their numbers never blend.",
+    met_pill_fallback: "self-echo fallback", met_tip_fallback: "Calls where suspected self-echo (downlink audio re-captured as uplink) triggered the half-duplex fallback.",
     hist_title: "Call History", hist_sub: "Click to expand timeline", empty_history: "No call records",
     hist_clear: "Clear all", hist_clear_title: "Clear all call history?",
     hist_clear_msg: "Finished call records and recordings will be deleted. Active calls are kept.",
@@ -1373,7 +1438,7 @@ const I18N = {
   },
   zh: {
     slogan: "电话，交给 AI",
-    nav_phone: "电话", nav_live: "对话", nav_sms: "短信", nav_history: "历史", nav_profiles: "任务库", nav_settings: "设置",
+    nav_phone: "电话", nav_live: "对话", nav_sms: "短信", nav_history: "历史", nav_metrics: "指标", nav_profiles: "任务库", nav_settings: "设置",
     st_idle: "待命", st_ringing: "振铃中", st_dialing: "拨号中", st_answered: "通话中", st_ended: "已结束",
     conn_on: "已连接", conn_retry: "重连中", conn_ing: "连接中",
     modem_on: "模组就绪", modem_off: "模组未连接",
@@ -1438,6 +1503,33 @@ const I18N = {
     sms_title: "短信", empty_sms: "暂无短信", ph_sms_text: "短信内容",
     sms_send: "发送短信", sending: "发送中…", sent: "已发送", send_fail: "发送失败：",
     need_sms: "请填写号码和内容", sms_in: "收 ← ", sms_out: "发 → ",
+    met_title: "指标看板", met_sub: "WIL-95 · 逐 schema 版本出数，版本间不平均",
+    met_loading: "加载中…", met_load_fail: "加载失败：",
+    met_meta_calls: "通话 {n} 通（跳过 {skip} 通无指标——录制于指标采集合入之前）",
+    met_empty: "还没有数据——在当前 main 上打第一通电话后，这里会长出来。",
+    met_schema_label: "SCHEMA v{v} · {n} 通",
+    met_dir_inbound: "来电", met_dir_outbound: "外呼", met_dir_calls: "{n} 通",
+    met_hdr_metric: "指标（ms）", met_no_sample: "无样本",
+    met_tip_n: "该行背后的样本数（轮数或通数）。",
+    met_tip_p50: "中位数——一半样本比它快。",
+    met_tip_p95: "95 分位——坏情况的尾部。",
+    met_tip_max: "最差的一次。",
+    met_lat_local: "本机应答（音尾→首块回复）",
+    met_tip_local: "每一轮：从本机检测到你话音结束（上行音尾）到 AI 回复的第一块音频回到本机的耗时。含上行上传、模型思考、TTS 首块与网络往返；蜂窝网两条腿在观测范围之外。该轮若调用了工具，工具执行时间也计入，因此会明显偏长。",
+    met_lat_first_delta: "判停→首音频（生成）",
+    met_tip_first_delta: "云端判定你说完（speech_stopped）到第一个音频增量到达的耗时。纯「生成 + 网络」段；与「本机应答」对比，可定位延迟出在判停还是生成。",
+    met_lat_backlog: "播出积压（体感主因）",
+    met_tip_backlog: "本轮首块回复入队时，前面还排着没播完的音频时长。大于 0 即播放队列积压——「仪器测 1.7 秒、耳朵听 3 秒+」的头号元凶；理想是恒为 0。",
+    met_lat_tool: "工具调用耗时",
+    met_tip_tool: "工具（挂断、发短信、记录等）从调用到返回的耗时。工具时间计入该轮「本机应答」——这就是带工具的轮次显得慢的原因。",
+    met_lat_first: "整通首音频（接通→到达）",
+    met_tip_first: "整通第一印象：从接通到第一次听到 AI 声音的耗时，每通一条。",
+    met_lat_hangup: "挂断时延（末条对话事件→结束）",
+    met_tip_hangup: "最后一条对话活动（转写 / 按键结果 / 工具动作）到通话真正结束的间隔。事件近似、不含播出尾巴；偏大说明收尾拖沓。",
+    met_pill_term: "终止", met_tip_term: "通话如何收场，按终止方式计数：agent_hangup=AI 用工具挂断，remote_hangup=对方挂断，以此类推。",
+    met_pill_known: "熟人", met_tip_known: "来电被识别为通讯录熟人的通数（影响开场白与策略）。",
+    met_tip_combo: "该批通话运行时的 provider / 判停 / barge-in 配置组合。不同配置分开统计，数字绝不混平均。",
+    met_pill_fallback: "自激兜底", met_tip_fallback: "疑似自激（下行音频被回采成上行）触发半双工兜底的通数。",
     hist_title: "通话历史", hist_sub: "点击展开事件时间线", empty_history: "暂无通话记录",
     hist_clear: "清除全部", hist_clear_title: "清除全部通话历史？",
     hist_clear_msg: "已结束的通话记录和录音会被删除，进行中的通话会保留。",
@@ -1521,6 +1613,8 @@ function applyI18n() {
   if (typeof refreshProfileEditorText === "function") refreshProfileEditorText();
   if (typeof renderSetupWizard === "function") renderSetupWizard();
   if (typeof syncRecordingUi === "function") syncRecordingUi();
+  // 指标面板内容是动态渲染的，换语言需整体重取重画。
+  if (currentPage === "metrics" && typeof loadMetrics === "function") loadMetrics();
 }
 
 
@@ -1559,6 +1653,7 @@ function switchPage(name) {
     if (b.dataset.page === name) b.classList.remove("notify");
   });
   if (name === "history") loadHistory();
+  if (name === "metrics") loadMetrics();
   if (name === "profiles" && !profileDirty) loadManagedProfiles();
 }
 /* 自定义模态确认框：返回 Promise<所选 action.key>；点遮罩/Esc 视为第一个 action */
@@ -2694,6 +2789,124 @@ $("batchDialBtn").addEventListener("click", async () => {
   finally { btn.disabled = false; }
 });
 
+/* ========= 指标看板（消费 /api/metrics/summary；el() 全量 textContent 防注入） ========= */
+// 时延字段 → i18n 后缀；标签 met_lat_<k>，悬浮详解 met_tip_<k>。
+const MET_LAT_KEYS = {
+  local_response_latency_ms: "local",
+  first_audio_delta_ms: "first_delta",
+  playout_backlog_ms: "backlog",
+  tool_call_latency_ms: "tool",
+  first_audio_ms: "first",
+  hangup_latency_ms: "hangup",
+};
+const MET_STAT_COLS = ["n", "p50", "p95", "max"];
+
+function metFmt(tpl, vars) {
+  return Object.entries(vars).reduce((s, [k, v]) => s.replaceAll("{" + k + "}", v), t(tpl));
+}
+function metTip(node, tipText) {
+  if (!tipText) return node;
+  node.classList.add("tip");
+  node.dataset.tip = tipText;
+  return node;
+}
+
+function metStatTable(group) {
+  const table = el("table", "met-table");
+  const head = el("tr");
+  head.appendChild(el("th", null, t("met_hdr_metric")));
+  for (const col of MET_STAT_COLS)
+    head.appendChild(metTip(el("th", null, col), t("met_tip_" + col)));
+  table.appendChild(head);
+  const rows = { ...group.latency, first_audio_ms: group.first_audio_ms,
+                 hangup_latency_ms: group.hangup_latency_ms };
+  // 已知字段按固定顺序，未知字段（未来 schema）原样兜底展示。
+  const fields = [...Object.keys(MET_LAT_KEYS).filter((f) => f in rows),
+                  ...Object.keys(rows).filter((f) => !(f in MET_LAT_KEYS))];
+  for (const field of fields) {
+    const key = MET_LAT_KEYS[field];
+    const row = el("tr");
+    const labelCell = el("td");
+    labelCell.appendChild(metTip(el("span", null, key ? t("met_lat_" + key) : field),
+                                 key ? t("met_tip_" + key) : null));
+    row.appendChild(labelCell);
+    const s = rows[field];
+    if (!s) {
+      const td = el("td", "na", t("met_no_sample"));
+      td.colSpan = MET_STAT_COLS.length;
+      row.appendChild(td);
+    } else {
+      for (const col of MET_STAT_COLS) row.appendChild(el("td", null, String(s[col])));
+    }
+    table.appendChild(row);
+  }
+  return table;
+}
+
+function metPill(text, tip, cls) {
+  return metTip(el("span", "met-pill" + (cls ? " " + cls : ""), text), tip);
+}
+
+function renderMetricsSummary(root, s) {
+  root.textContent = "";
+  root.appendChild(el("div", "met-meta",
+    metFmt("met_meta_calls", { n: s.calls_analyzed, skip: s.calls_skipped })));
+  if (!s.calls_analyzed) { root.appendChild(el("div", "empty", t("met_empty"))); return; }
+  for (const [ver, d] of Object.entries(s.schema_versions)) {
+    root.appendChild(el("div", "met-schema", metFmt("met_schema_label", { v: ver, n: d.calls })));
+    for (const [dir, g] of Object.entries(d.directions)) {
+      const dirLabel = t("met_dir_" + dir) !== "met_dir_" + dir ? t("met_dir_" + dir) : dir;
+      root.appendChild(el("div", "met-dir",
+        `${dirLabel}（${metFmt("met_dir_calls", { n: g.calls })}）`));
+      root.appendChild(metStatTable(g));
+    }
+    const pills = el("div", "met-pills");
+    for (const [kind, n] of Object.entries(d.terminations || {}))
+      pills.appendChild(metPill(`${t("met_pill_term")}·${kind}: ${n}`, t("met_tip_term")));
+    const c = d.contact_known || {};
+    if (c.known || c.unknown)
+      pills.appendChild(metPill(`${t("met_pill_known")} ${c.known}/${c.known + c.unknown}`, t("met_tip_known")));
+    for (const [combo, n] of Object.entries(d.config_combos || {}))
+      pills.appendChild(metPill(`${combo}: ${n}`, t("met_tip_combo")));
+    if (d.barge_in_fallback_calls)
+      pills.appendChild(metPill(`${t("met_pill_fallback")} ${d.barge_in_fallback_calls}`, t("met_tip_fallback"), "bad"));
+    if (pills.children.length) root.appendChild(pills);
+  }
+}
+
+// 判官裁决（复核队列 + 标注）曾在此展示；形态待机主重新设计，2026-08-14 先撤下 UI。
+// 后端 task_verdict / judge_calls / /api/metrics/label 均保留，重接 UI 即可复活。
+async function loadMetrics() {
+  try {
+    const res = await fetch("/api/metrics/summary");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    renderMetricsSummary($("metricsRoot"), data.summary);
+  } catch (e) {
+    const root = $("metricsRoot");
+    root.textContent = "";
+    root.appendChild(el("div", "empty", t("met_load_fail") + e));
+  }
+}
+
+/* 悬浮详解气泡：fixed 单例跟随 .tip 元素，不受卡片 overflow 裁剪 */
+const metTipBox = el("div", "met-tipbox");
+document.body.appendChild(metTipBox);
+document.addEventListener("mouseover", (e) => {
+  const tgt = e.target.closest?.(".tip[data-tip]");
+  if (!tgt) { metTipBox.classList.remove("show"); return; }
+  metTipBox.textContent = tgt.dataset.tip;
+  metTipBox.style.left = "0px";
+  metTipBox.style.top = "0px";
+  metTipBox.classList.add("show");
+  const r = tgt.getBoundingClientRect();
+  const w = metTipBox.offsetWidth, h = metTipBox.offsetHeight;
+  const x = Math.min(Math.max(8, r.left), window.innerWidth - w - 8);
+  const y = r.top - h - 8 >= 8 ? r.top - h - 8 : r.bottom + 8;
+  metTipBox.style.left = x + "px";
+  metTipBox.style.top = y + "px";
+});
+
 /* ========= 设置 ========= */
 let cfgSpecs = [];
 let cfgDirty = false;  // 设置有未保存修改（离开页面时据此提示）
@@ -3331,6 +3544,8 @@ loadConfig();
 loadDialPresets();
 loadRemoteDialerStatus();
 setInterval(refreshQueue, 2000);
+// 支持 /#metrics 直达指标面板（旧 /static/metrics.html 链接由后端 302 到这里）。
+if (location.hash === "#metrics") navTo("metrics");
 </script>
 </body>
 </html>

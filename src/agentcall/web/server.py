@@ -322,6 +322,8 @@ def build_app(
     app.router.add_get("/api/history/{call_id}/events", _history_events)
     app.router.add_get("/api/metrics/summary", _metrics_summary)
     app.router.add_post("/api/metrics/label", _metrics_label)
+    # 看板已并入主界面 #metrics 面板；老链接 302 保活（先于 add_static 注册）。
+    app.router.add_get("/static/metrics.html", _metrics_page)
     app.router.add_get("/api/history/{call_id}/audio/{track}", _history_audio)
     app.router.add_get("/api/config", _get_config)
     app.router.add_post("/api/config", _post_config)
@@ -340,6 +342,10 @@ async def _index(request: web.Request) -> web.StreamResponse:
         index_file,
         headers={"Cache-Control": "no-cache, must-revalidate"},
     )
+
+
+async def _metrics_page(request: web.Request) -> web.StreamResponse:
+    raise web.HTTPFound("/#metrics")
 
 
 async def _remote_dialer_redirect(request: web.Request) -> web.StreamResponse:
