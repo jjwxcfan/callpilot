@@ -18,7 +18,7 @@ from pathlib import Path
 from aiohttp import WSMsgType, web
 from serial.tools import list_ports
 
-from .. import config, platforms
+from .. import config, metrics_report, platforms
 from ..audio_bridge import apply_pcm_gain
 from ..contacts import is_reply_target_allowed
 from ..events import EventHub
@@ -320,6 +320,8 @@ def build_app(
     app.router.add_post("/api/history/{call_id}", _history_delete)
     app.router.add_delete("/api/history/{call_id}", _history_delete)
     app.router.add_get("/api/history/{call_id}/events", _history_events)
+    app.router.add_get("/api/metrics/summary", _metrics_summary)
+    app.router.add_post("/api/metrics/label", _metrics_label)
     app.router.add_get("/api/history/{call_id}/audio/{track}", _history_audio)
     app.router.add_get("/api/config", _get_config)
     app.router.add_post("/api/config", _post_config)
@@ -955,6 +957,50 @@ async def _history_delete(request: web.Request) -> web.Response:
     deleted = [call_id] if status == "deleted" else []
     skipped = [call_id] if status == "skipped" else []
     return web.json_response({"ok": True, "deleted": deleted, "skipped": skipped})
+
+
+async def _metrics_summary(request: web.Request) -> web.Response:
+    """看板数据源（WIL-95 第四期）：指标汇总 + 裁决 rollup + 复核队列。
+
+    只读汇总物（metrics.json/verdicts.json，几百字节级），不碰事件流与音频
+    ——WIL-76 的全量重扫教训针对的是每请求重解析 events。
+    """
+    service = require_call_logger(request)
+    report = await asyncio.to_thread(
+        metrics_report.build_dashboard_report, Path(service.call_logger.base_dir)
+    )
+    return web.json_response(report)
+
+
+async def _metrics_label(request: web.Request) -> web.Response:
+    """人工标注判官裁决（对/错/看不出）——地面真值，判官回归测试集的来源。"""
+    service = require_call_logger(request)
+    data = await read_json(request)
+    if not isinstance(data, dict):
+        return web.json_response(
+            {"ok": False, "error": "请求体需为 JSON 对象"}, status=400
+        )
+    call_id = str(data.get("call_id") or "")
+    label = str(data.get("label") or "")
+    if not _CALL_ID_RE.fullmatch(call_id):
+        return web.json_response({"ok": False, "error": "非法的通话 ID"}, status=400)
+    if label not in metrics_report.REVIEW_LABELS:
+        return web.json_response(
+            {"ok": False, "error": f"label 需为 {metrics_report.REVIEW_LABELS} 之一"},
+            status=400,
+        )
+    label_path = _call_artifact_path(
+        service.call_logger.base_dir, call_id, "verdict_label.json"
+    )
+    if label_path is None or not label_path.parent.is_dir():
+        return web.json_response({"ok": False, "error": "通话记录不存在"}, status=404)
+    try:
+        payload = await asyncio.to_thread(
+            metrics_report.write_label, label_path, label
+        )
+    except (OSError, ValueError) as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+    return web.json_response({"ok": True, **payload})
 
 
 async def _history_events(request: web.Request) -> web.Response:

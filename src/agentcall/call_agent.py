@@ -30,7 +30,7 @@ from .audio_bridge import (
 )
 from .call_log import CallLogger, CallRecord
 from .call_tools import CallTools
-from .contacts import is_reply_target_allowed
+from .contacts import is_reply_target_allowed, known_contact_numbers
 from .dial_guard import DialGuardFailure, check_dial_guard
 from .dial_queue import DialQueue, whitelist_from_env
 from .dtmf import dtmf_tone
@@ -568,6 +568,16 @@ class CallSession:
                     )
                 except Exception:  # noqa: BLE001
                     logger.warning("配置快照落盘失败（不影响通话）", exc_info=True)
+            if record is not None:
+                # 通话上下文（WIL-95 第二期）：熟人布尔——只记 bool 不记身份
+                # （§7 同款约束）。是 Stage 2「熟人来电处理占比」的数据前置。
+                try:
+                    known = bool(number) and number in known_contact_numbers(
+                        self.hub, self.call_logger
+                    )
+                    record.log_event("call_context", contact_known=known)
+                except Exception:  # noqa: BLE001
+                    pass
             bridge.start()
             mark("bridge_started")
 
@@ -899,6 +909,13 @@ class CallSession:
         judge_interval = config.get_float("WRAP_UP_JUDGE_INTERVAL_SECONDS")
         last_judge_at = loop_started
         goal = self._outbound_task(agent_language()) if judge_enabled else ""
+        if record is not None and goal:
+            # 任务目标随通落盘（WIL-95 §4 证据层）：判官离线裁决「目的是否达成」
+            # 必须知道目的是什么；不落盘则历史通话永远无法重算。
+            try:
+                record.log_event("task_goal", goal=goal)
+            except Exception:  # noqa: BLE001
+                pass
         # 浏览器实时旁听：对方上行电平低，推给浏览器前按此增益放大到可闻。
         uplink_listen_gain = config.get_float("MONITOR_UPLINK_GAIN")
         agent_uplink_gain = config.get_float("AGENT_UPLINK_GAIN")
@@ -972,6 +989,7 @@ class CallSession:
                     "外呼超过 %.0fs 仍在进行，自动道别收尾",
                     outbound_max_seconds,
                 )
+                self._log_winddown(record, "outbound_deadline")
                 try:
                     await agent.say(self._winddown_instructions())
                 except Exception as exc:  # noqa: BLE001
@@ -993,6 +1011,7 @@ class CallSession:
             # ③ 裁判判定该收尾 → 说句告别再挂（同硬时限收尾路径）
             if self._wrap_up_requested and winddown_deadline is None:
                 logger.info("收尾裁判判定结束（%s），自动收尾", self._wrap_up_reason)
+                self._log_winddown(record, "wrap_up_judge")
                 try:
                     await agent.say(self._winddown_instructions())
                 except Exception as exc:  # noqa: BLE001
@@ -2318,6 +2337,19 @@ class CallSession:
             else:
                 self._barge_in_echo_strikes = 0
         return self._discard_agent_playback(bridge, "对端开口打断 AI")
+
+    def _log_winddown(self, record: CallRecord | None, reason: str) -> None:
+        """收尾起因落盘（WIL-95 第二期）：termination_kind 的证据之一。
+
+        只在「AI 主动收尾」的两个路径打（外呼硬时限 / 收尾裁判）；hangup 工具、
+        接管、对端先挂各有既有事件，metrics 层统一归类。埋点失败不影响通话。
+        """
+        if record is None:
+            return
+        try:
+            record.log_event("winddown", reason=reason)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _discard_agent_playback(self, bridge: AudioBridge, reason: str) -> bool:
         """清掉 AI 未播出的下行积压（桥内 + 队列）；护窗期拒绝，双音优先。

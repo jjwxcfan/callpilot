@@ -1,4 +1,4 @@
-"""每通通话的指标汇总（WIL-95 第一期）：从事件流生成 ``metrics.json``。
+"""每通通话的指标汇总（WIL-95）：从事件流生成 ``metrics.json``。
 
 契约要点（与 WIL-95 规格逐条对应）：
 
@@ -11,10 +11,12 @@
   （WIL-95 2.1），把本地测量叫端到端会系统性低估。
 - **只读事件、不碰音频**：音频派生指标（每轮出声时长、打断率等）归 WIL-89
   离线审计工具——两个生产者、一份契约，字段定义以先落盘者为准。
+- **隐私（WIL-95 §7）**：不含转写文本、任务目标原文、按键值、任何凭证——
+  字数/次数/布尔这类派生量除外。
 
 本模块是纯函数（events 进、dict 出），落盘由 ``call_log.CallRecord.finish``
-调用；判定层（任务是否达成）刻意不在这里——那是可重算的派生视图（WIL-95 §4），
-不写进不可变的原始记录。
+调用；判定层（任务是否达成）刻意不在这里——那是可重算的派生视图
+（WIL-95 §4，见 ``task_verdict``），不写进不可变的原始记录。
 """
 
 from __future__ import annotations
@@ -24,8 +26,11 @@ import statistics
 import time
 from typing import Any
 
-# 指标契约版本（2026-08-14 v1）。改任何字段定义前先读模块 docstring 第一条。
-SCHEMA_VERSION = 1
+# 指标契约版本。
+# v1（2026-08-14）：三个逐轮时延 + 配置快照 + 基础 rollup。
+# v2（2026-08-14）：新增 termination / hangup_latency_ms / tool_call_latency_ms /
+#   contact_known / takeover / has_task_goal（WIL-95 第二期补埋点）。
+SCHEMA_VERSION = 2
 
 # 逐轮时延指标：events.jsonl 里 latency 事件的 stage → metrics.json 字段名。
 # 各 stage 的精确定义（2026-08-14）：
@@ -42,14 +47,23 @@ _LATENCY_STAGES = {
     "playout_backlog": "playout_backlog_ms",
 }
 
+# 汇总层（metrics_report / 看板）拉取的全部时延字段；tool_call 单列——
+# 它是每次工具调用一条，不是每轮一条，语义与上面三个不同。
+LATENCY_FIELDS = [*_LATENCY_STAGES.values(), "tool_call_latency_ms"]
+
 # 本版本先天测不了/未埋点的指标及原因——字段常驻，等埋点补上后从这里移走。
 # 打断类的原因按 barge_in 开关分岔（WIL-95 2.3），在 build 时动态填。
 _STATIC_UNAVAILABLE = {
     "e2e_latency_ms": "carrier_legs_unobservable",  # WIL-95 2.1：不要假装能测
-    "tool_call_latency_ms": "tool_call_event_has_no_duration",  # 第二期补
-    "termination_kind": "not_instrumented",  # 第二期补
-    "hangup_latency_ms": "not_instrumented",  # 第二期补
+    "scenario": "not_tagged",  # 场景矩阵②③④⑤维度标签：任务预设/判官标注，后补
+    "takeover_latency_ms": "not_instrumented",  # 无 takeover_requested 事件，后补
 }
+
+# hangup_latency 的「对话尾声」取这些事件里最晚的 ts（2026-08-14 定义 v2）：
+# transcript（转写到达≈该轮说完）/ dtmf_outcome（按键推进判定）/
+# tool_call（最后一次工具动作）。这是**事件近似**，不含播出尾巴；
+# 判「滞留/误挂」仍要判官读转写裁决（WIL-95 C 类），此值只是量化证据。
+_ACTIVITY_EVENT_TYPES = ("transcript", "dtmf_outcome", "tool_call")
 
 
 def _nearest_rank_p90(ordered: list[float]) -> float:
@@ -62,7 +76,7 @@ def _nearest_rank_p90(ordered: list[float]) -> float:
 def _describe(values: list[float]) -> dict[str, Any] | None:
     """n/median/p90/max + 原始值；空样本返回 None（落到 unavailable，不记 0）。
 
-    保留 ``values``（升序）是刻意的：单通轮次数很小（通常 <50），多存几十个
+    保留 ``values``（升序）是刻意的：单通样本数很小（通常 <50），多存几十个
     数换来跨通分位数**精确可算**——汇总工具只读 metrics.json，不必回头重解析
     全部 events.jsonl（WIL-76 全量重扫退化的教训）。
     """
@@ -78,6 +92,37 @@ def _describe(values: list[float]) -> dict[str, Any] | None:
     }
 
 
+def _derive_termination(
+    status: str,
+    *,
+    takeover: dict[str, int],
+    dead_media_hangup: bool,
+    winddown_reason: str | None,
+    hangup_tool_called: bool,
+    inbound_deadline: bool,
+) -> dict[str, str]:
+    """通话终止归类（2026-08-14 定义 v2，全部由既有事件派生）。
+
+    优先级：未接通 > 接管 > 媒体已死 > 错误 > AI 主动收尾（细分起因）>
+    对端先挂（排除法兜底——主循环因对端挂断而结束时本机没有任何主动信号）。
+    """
+    if status == "not_connected":
+        return {"kind": "not_connected", "reason": "not_connected"}
+    if takeover.get("committed"):
+        return {"kind": "takeover", "reason": "takeover_committed"}
+    if dead_media_hangup:
+        return {"kind": "dead_media", "reason": "uplink_digital_silence"}
+    if status not in ("completed",):
+        return {"kind": "error", "reason": status}
+    if winddown_reason:
+        return {"kind": "agent_hangup", "reason": winddown_reason}
+    if hangup_tool_called:
+        return {"kind": "agent_hangup", "reason": "hangup_tool"}
+    if inbound_deadline:
+        return {"kind": "agent_hangup", "reason": "inbound_deadline"}
+    return {"kind": "peer_hangup", "reason": "inferred_no_local_signal"}
+
+
 def build_call_metrics(
     events: list[dict[str, Any]],
     *,
@@ -88,12 +133,9 @@ def build_call_metrics(
     status: str,
     generated_at: float | None = None,
 ) -> dict[str, Any]:
-    """从一通通话的事件流构建 metrics.json 内容（纯函数，不做 IO）。
-
-    只消费事件与元数据；隐私约束（WIL-95 §7）：不含转写文本、不含按键值、
-    不含任何凭证——字数/次数这类派生量除外。
-    """
+    """从一通通话的事件流构建 metrics.json 内容（纯函数，不做 IO）。"""
     latencies: dict[str, list[float]] = {stage: [] for stage in _LATENCY_STAGES}
+    tool_latencies: list[float] = []
     config_snapshot: dict[str, Any] | None = None
     first_audio_ms: float | None = None
     agent_turn_chars: list[float] = []
@@ -102,14 +144,31 @@ def build_call_metrics(
     dtmf_actions = 0
     dtmf_outcomes: dict[str, int] = {}
     barge_in_fallback = False
+    contact_known: bool | None = None
+    has_task_goal = False
+    winddown_reason: str | None = None
+    inbound_deadline = False
+    dead_media_hangup = False
+    hangup_tool_called = False
+    takeover: dict[str, int] = {}
+    finished_ts: float | None = None
+    last_activity_ts: float | None = None
 
     for event in events:
         etype = event.get("type")
+        ts = event.get("ts")
+        if etype in _ACTIVITY_EVENT_TYPES and isinstance(ts, (int, float)):
+            if last_activity_ts is None or ts > last_activity_ts:
+                last_activity_ts = float(ts)
         if etype == "latency":
             stage = event.get("stage")
             ms = event.get("ms")
-            if stage in latencies and isinstance(ms, (int, float)):
+            if not isinstance(ms, (int, float)):
+                continue
+            if stage in latencies:
                 latencies[stage].append(float(ms))
+            elif stage == "tool_call":
+                tool_latencies.append(float(ms))
         elif etype == "config_snapshot":
             config_snapshot = {
                 k: v for k, v in event.items() if k not in ("type", "ts")
@@ -128,6 +187,10 @@ def build_call_metrics(
         elif etype == "tool_call":
             tool = str(event.get("tool") or "unknown")
             tool_calls[tool] = tool_calls.get(tool, 0) + 1
+            if tool == "hangup_call":
+                result = event.get("result")
+                if isinstance(result, dict) and result.get("success"):
+                    hangup_tool_called = True
         elif etype == "dtmf_action":
             dtmf_actions += 1
         elif etype == "dtmf_outcome":
@@ -135,6 +198,24 @@ def build_call_metrics(
             dtmf_outcomes[outcome_status] = dtmf_outcomes.get(outcome_status, 0) + 1
         elif etype == "barge_in_fallback":
             barge_in_fallback = True
+        elif etype == "call_context":
+            value = event.get("contact_known")
+            if isinstance(value, bool):
+                contact_known = value
+        elif etype == "task_goal":
+            has_task_goal = True  # 只记有无，目标原文不进 metrics（隐私）
+        elif etype == "winddown":
+            winddown_reason = str(event.get("reason") or "") or winddown_reason
+        elif etype == "inbound_hard_deadline":
+            inbound_deadline = True
+        elif etype == "dead_media_detected":
+            if event.get("hangup"):
+                dead_media_hangup = True
+        elif isinstance(etype, str) and etype.startswith("takeover_"):
+            suffix = etype[len("takeover_"):]
+            takeover[suffix] = takeover.get(suffix, 0) + 1
+        elif etype == "call_finished" and isinstance(ts, (int, float)):
+            finished_ts = float(ts)
 
     unavailable = dict(_STATIC_UNAVAILABLE)
     if config_snapshot is None:
@@ -161,8 +242,25 @@ def build_call_metrics(
             unavailable[field] = "no_samples"
         else:
             latency_out[field] = described
+    tool_described = _describe(tool_latencies)
+    if tool_described is None:
+        unavailable["tool_call_latency_ms"] = "no_samples"
+    else:
+        latency_out["tool_call_latency_ms"] = tool_described
     if first_audio_ms is None:
         unavailable["first_audio_ms"] = "no_samples"
+    if contact_known is None:
+        unavailable["contact_known"] = "no_call_context_event"
+
+    # hangup_latency_ms（v2 定义见 _ACTIVITY_EVENT_TYPES 注释）：对话尾声
+    # → 通话实际结束。agent 主动收尾时包含刻意的道别延时，属定义内。
+    hangup_latency_ms: float | None = None
+    if finished_ts is not None and last_activity_ts is not None:
+        gap = (finished_ts - last_activity_ts) * 1000
+        if gap >= 0:
+            hangup_latency_ms = round(gap, 1)
+    if hangup_latency_ms is None:
+        unavailable["hangup_latency_ms"] = "no_dialogue_activity"
 
     metrics: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -183,6 +281,18 @@ def build_call_metrics(
         "tool_calls": tool_calls,
         "dtmf": {"actions": dtmf_actions, "outcomes": dtmf_outcomes},
         "barge_in_fallback": barge_in_fallback,
+        "termination": _derive_termination(
+            status,
+            takeover=takeover,
+            dead_media_hangup=dead_media_hangup,
+            winddown_reason=winddown_reason,
+            hangup_tool_called=hangup_tool_called,
+            inbound_deadline=inbound_deadline,
+        ),
+        "hangup_latency_ms": hangup_latency_ms,
+        "takeover": takeover,
+        "contact_known": contact_known,
+        "has_task_goal": has_task_goal,
         "unavailable": unavailable,
     }
     return metrics

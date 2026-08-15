@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from typing import TYPE_CHECKING, Callable
 
 from . import config
@@ -65,12 +66,42 @@ class CallTools:
 
     def register(self) -> ToolRegistry:
         registry = ToolRegistry()
-        registry.register(SEND_SMS_SPEC, self._send_sms)
-        registry.register(HANGUP_SPEC, self._hangup)
+        registry.register(SEND_SMS_SPEC, self._timed("send_sms", self._send_sms))
+        registry.register(HANGUP_SPEC, self._timed("hangup_call", self._hangup))
         if config.get_bool("TOOL_QUERY_CODE_ENABLED"):
-            registry.register(QUERY_CODE_SPEC, self._query_code)
-        registry.register(SEND_DTMF_SPEC, self._send_dtmf)
+            registry.register(
+                QUERY_CODE_SPEC,
+                self._timed("query_verification_code", self._query_code),
+            )
+        registry.register(SEND_DTMF_SPEC, self._timed("send_dtmf", self._send_dtmf))
         return registry
+
+    def _timed(
+        self, tool: str, fn: Callable[[dict], dict]
+    ) -> Callable[[dict], dict]:
+        """工具耗时埋点（WIL-95 第二期）：latency 事件 stage=tool_call 带 tool 名。
+
+        原 `tool_call` 审计事件无耗时字段；这里在注册处统一计时，覆盖含早退
+        路径的完整耗时。埋点失败绝不影响工具本身（护栏同 call_agent 埋点）。
+        """
+
+        def wrapper(args: dict) -> dict:
+            t0 = time.monotonic()
+            try:
+                return fn(args)
+            finally:
+                record = self._get_record()
+                if record is not None:
+                    try:
+                        record.log_latency(
+                            "tool_call",
+                            round((time.monotonic() - t0) * 1000, 1),
+                            tool=tool,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+
+        return wrapper
 
     def _publish(self, event: dict) -> None:
         if self._hub:
