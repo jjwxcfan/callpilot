@@ -8,7 +8,7 @@ import threading
 import time
 from pathlib import Path
 from queue import Queue
-from typing import Callable
+from typing import Any, Callable
 
 import serial
 
@@ -550,6 +550,12 @@ class SerialModem:
     # 来历不明（仓库重构时带入，无注释）；对自带重试的实现是纯浪费——健康态
     # 「接听→启用」总共才 2~3s，这一秒占三分之一（WIL-104）。
     POST_ANSWER_SETTLE_SECONDS = 1.0
+
+    # 最近一次 initialize_for_voice 的结果快照，供调用方（call_agent）在通话内
+    # 读取并落 pcm_enable 事件（WIL-95 D 组：无声通/劣化通的通级指纹）。
+    # 只有会失败/会重试的实现（SIM7600 CPCMREG）覆写；Quectel 路径无该信号，
+    # 保持 None = 诚实的「未埋点」，metrics 侧记 unavailable 而非假 0。
+    last_voice_enable: dict[str, Any] | None = None
 
     def initialize_for_voice(self, audio_mode: str = "uac") -> None:
         """启用语音 PCM 通道（厂商钩子，子类按各自 AT 指令实现）。"""
@@ -1266,6 +1272,8 @@ class Sim7600Modem(SerialModem):
         # audio_bridge 修复），与音量无关；而实测这条指令本身要花 **2.3 秒**，
         # 占「接听→启用」总耗时的 83%（WIL-104）。治的是不存在的病，故移除。
         started = time.monotonic()
+        # 先清快照：中途串口异常时读取方拿到 None（未知），而非上一次的旧结果。
+        self.last_voice_enable = None
         for i in range(self._CPCMREG_ENABLE_ATTEMPTS):
             attempt_started = time.monotonic()
             ok = "OK" in self._send("AT+CPCMREG=1")
@@ -1288,9 +1296,21 @@ class Sim7600Modem(SerialModem):
                     logger.warning(
                         "PCM 启用重试 %d 次，判定模组已劣化，本通结束后请求自愈", attempts
                     )
+                self.last_voice_enable = {
+                    "ok": True,
+                    "attempts": attempts,
+                    "degraded": self._pcm_degraded,
+                }
                 return
             if i < self._CPCMREG_ENABLE_ATTEMPTS - 1:
                 time.sleep(self._CPCMREG_ENABLE_RETRY_DELAY)
+        # 全部尝试失败：通话中意味着整通无声（下行写不进 iface4）；supervisor
+        # 启动期（无活跃通话）属预期。区分交给读取方——有活跃通话才会落事件。
+        self.last_voice_enable = {
+            "ok": False,
+            "attempts": self._CPCMREG_ENABLE_ATTEMPTS,
+            "degraded": True,
+        }
         logger.info("AT+CPCMREG=1 未启用（无活跃通话时属正常，接通后 per-call 会再试）")
 
     def _send_dtmf_digit(self, ch: str) -> bool:

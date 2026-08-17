@@ -97,7 +97,8 @@ def test_missing_metrics_are_null_with_reason_never_zero():
     assert unavailable["first_audio_ms"] == "no_samples"
     # 先天测不了/未埋点的常驻原因（WIL-95 2.1 / 分期）。
     assert unavailable["e2e_latency_ms"] == "carrier_legs_unobservable"
-    assert unavailable["takeover_latency_ms"] == "not_instrumented"
+    # v3 起 takeover 时延可测：无接管的通记「没发生」而非「未埋点」。
+    assert unavailable["takeover_latency_ms"] == "no_takeover_request"
 
 
 def test_interruption_reason_forks_on_barge_in_flag():
@@ -219,6 +220,99 @@ def test_tool_latency_context_and_goal_rollup():
     assert metrics["has_task_goal"] is True
     # 任务目标原文不得进 metrics（隐私：目标可能含机主个人信息）。
     assert "确认周六" not in json.dumps(metrics, ensure_ascii=False)
+
+
+# ---- v3 新增：接起→首字 / 接管时延 / 异常断线 / pcm 指纹 ----
+
+
+def test_answered_to_first_audio_derivation():
+    """接起→首字(到达) = (greeting_sent - answered 的 t_ms 差) + first_audio_ms。"""
+    events = [
+        {"type": "answered", "ts": 10.0, "t_ms": 1000.0},
+        {"type": "greeting_sent", "ts": 10.4, "t_ms": 1400.0},
+        {"type": "first_audio", "ts": 11.0, "ms": 600},
+    ]
+    metrics = _build(events)
+    assert metrics["answered_to_first_audio_ms"] == 1000.0
+    assert "answered_to_first_audio_ms" not in metrics["unavailable"]
+
+
+def test_answered_to_first_audio_unavailable_reasons():
+    # 无 answered 标记（远程链路的 answered 事件不带 t_ms）。
+    remote = _build([
+        {"type": "answered", "ts": 10.0, "source": "remote"},
+        {"type": "first_audio", "ts": 11.0, "ms": 600},
+    ])
+    assert remote["answered_to_first_audio_ms"] is None
+    assert remote["unavailable"]["answered_to_first_audio_ms"] == "no_answered_mark"
+    # opening_mode=wait：不发开场白，无 greeting_sent。
+    wait = _build([
+        {"type": "answered", "ts": 10.0, "t_ms": 1000.0},
+        {"type": "first_audio", "ts": 11.0, "ms": 600},
+    ])
+    assert wait["unavailable"]["answered_to_first_audio_ms"] == "greeting_not_sent"
+    # 有开场白但整通没出过声。
+    silent = _build([
+        {"type": "answered", "ts": 10.0, "t_ms": 1000.0},
+        {"type": "greeting_sent", "ts": 10.4, "t_ms": 1400.0},
+    ])
+    assert silent["unavailable"]["answered_to_first_audio_ms"] == "no_first_audio"
+
+
+def test_takeover_latency_from_requested_to_committed():
+    events = [
+        {"type": "takeover_requested", "ts": 100.0, "trigger": "agent_tool"},
+        {"type": "takeover_committed", "ts": 103.5, "generation": 1},
+    ]
+    metrics = _build(events)
+    assert metrics["takeover_latency_ms"] == 3500.0
+    assert metrics["termination"]["kind"] == "takeover"
+
+
+def test_takeover_latency_unavailable_reasons():
+    none = _build([])
+    assert none["takeover_latency_ms"] is None
+    assert none["unavailable"]["takeover_latency_ms"] == "no_takeover_request"
+    # 请求了但没接通（超时/回滚）——绝不把「没发生」记成 0。
+    pending = _build([
+        {"type": "takeover_requested", "ts": 100.0},
+        {"type": "takeover_rollback", "ts": 105.0, "reason": "offer_expired"},
+    ])
+    assert pending["takeover_latency_ms"] is None
+    assert pending["unavailable"]["takeover_latency_ms"] == "takeover_not_committed"
+
+
+def test_abnormal_drop_flags_dead_media_and_error():
+    dead = _build([{"type": "dead_media_detected", "ts": 5.0, "hangup": True}])
+    assert dead["abnormal_drop"] is True
+    errored = _build([], status="failed")
+    assert errored["abnormal_drop"] is True
+    normal = _build([])
+    assert normal["abnormal_drop"] is False
+
+
+def test_pcm_enable_event_rollup():
+    """CPCMREG 启用行为是无声通/劣化通的通级指纹（文档 D 组，蜂窝形态）。"""
+    failed = _build([
+        {"type": "pcm_enable", "ts": 5.0, "ok": False, "attempts": 6,
+         "degraded": True},
+    ])
+    assert failed["pcm_enable_failed"] is True
+    assert failed["pcm_degraded"] is True
+    assert failed["pcm_enable_attempts"] == 6
+    assert "pcm_enable" not in failed["unavailable"]
+
+    healthy = _build([
+        {"type": "pcm_enable", "ts": 5.0, "ok": True, "attempts": 1,
+         "degraded": False},
+    ])
+    assert healthy["pcm_enable_failed"] is False
+    assert healthy["pcm_degraded"] is False
+
+    # 事件缺失（Quectel 路径/历史通话）：三态 None + 原因，不猜 False。
+    absent = _build([])
+    assert absent["pcm_enable_failed"] is None
+    assert absent["unavailable"]["pcm_enable"] == "no_pcm_enable_event"
 
 
 # ---- finish 落盘 ----

@@ -84,6 +84,40 @@ def test_sim7600_initialize_for_voice_retries_until_enabled(monkeypatch):
     assert sent == ["AT+CPCMREG=1"] * 3  # 到 OK 即停
 
 
+def test_sim7600_voice_enable_snapshot_success_first_try(monkeypatch):
+    """健康态一次 OK：快照 ok=True/attempts=1/degraded=False（WIL-95 v3 pcm 指纹）。"""
+    modem = make_sim7600()
+    monkeypatch.setattr(modem, "_send", lambda cmd: "OK")
+    modem.initialize_for_voice("nmea")
+    assert modem.last_voice_enable == {"ok": True, "attempts": 1, "degraded": False}
+
+
+def test_sim7600_voice_enable_snapshot_marks_degraded_on_retry(monkeypatch):
+    """要重试才成 = 劣化：快照 degraded=True，与 _pcm_degraded 恢复标记一致。"""
+    modem = make_sim7600()
+    responses = iter(["ERROR", "OK"])
+    monkeypatch.setattr(modem, "_send", lambda cmd: next(responses))
+    monkeypatch.setattr("agentcall.modem.time.sleep", lambda s: None)
+    modem.initialize_for_voice("nmea")
+    assert modem.last_voice_enable == {"ok": True, "attempts": 2, "degraded": True}
+    assert modem._pcm_degraded is True
+
+
+def test_sim7600_voice_enable_snapshot_records_total_failure(monkeypatch):
+    """全败（通话中=整通无声）：ok=False；快照总被覆写，不残留上一次的值。"""
+    modem = make_sim7600()
+    monkeypatch.setattr(modem, "_send", lambda cmd: "OK")
+    modem.initialize_for_voice("nmea")  # 先造一个成功快照
+    monkeypatch.setattr(modem, "_send", lambda cmd: "ERROR")
+    monkeypatch.setattr("agentcall.modem.time.sleep", lambda s: None)
+    modem.initialize_for_voice("nmea")
+    assert modem.last_voice_enable == {
+        "ok": False,
+        "attempts": modem._CPCMREG_ENABLE_ATTEMPTS,
+        "degraded": True,
+    }
+
+
 def test_sim7600_disable_voice_channel_sends_cpcmreg_off(monkeypatch):
     modem = make_sim7600()
     sent = []

@@ -30,7 +30,10 @@ from typing import Any
 # v1（2026-08-14）：三个逐轮时延 + 配置快照 + 基础 rollup。
 # v2（2026-08-14）：新增 termination / hangup_latency_ms / tool_call_latency_ms /
 #   contact_known / takeover / has_task_goal（WIL-95 第二期补埋点）。
-SCHEMA_VERSION = 2
+# v3（2026-08-17）：新增 answered_to_first_audio_ms（文档 A 组「接起→首字」，
+#   到达口径）/ takeover_latency_ms / abnormal_drop / pcm_enable_failed +
+#   pcm_degraded（文档 D 组异常掉话的蜂窝指纹：CPCMREG 启用行为，WIL-95 第二期收尾）。
+SCHEMA_VERSION = 3
 
 # 逐轮时延指标：events.jsonl 里 latency 事件的 stage → metrics.json 字段名。
 # 各 stage 的精确定义（2026-08-14）：
@@ -53,10 +56,11 @@ LATENCY_FIELDS = [*_LATENCY_STAGES.values(), "tool_call_latency_ms"]
 
 # 本版本先天测不了/未埋点的指标及原因——字段常驻，等埋点补上后从这里移走。
 # 打断类的原因按 barge_in 开关分岔（WIL-95 2.3），在 build 时动态填。
+# takeover_latency_ms 已于 v3 移走（takeover_requested 事件其实一直在，
+# call_agent.py _request_owner_takeover 处；原「无该事件」注释系误判）。
 _STATIC_UNAVAILABLE = {
     "e2e_latency_ms": "carrier_legs_unobservable",  # WIL-95 2.1：不要假装能测
     "scenario": "not_tagged",  # 场景矩阵②③④⑤维度标签：任务预设/判官标注，后补
-    "takeover_latency_ms": "not_instrumented",  # 无 takeover_requested 事件，后补
 }
 
 # hangup_latency 的「对话尾声」取这些事件里最晚的 ts（2026-08-14 定义 v2）：
@@ -153,6 +157,11 @@ def build_call_metrics(
     takeover: dict[str, int] = {}
     finished_ts: float | None = None
     last_activity_ts: float | None = None
+    answered_t_ms: float | None = None
+    greeting_t_ms: float | None = None
+    takeover_requested_ts: float | None = None
+    takeover_committed_ts: float | None = None
+    pcm_enable: dict[str, Any] | None = None
 
     for event in events:
         etype = event.get("type")
@@ -214,6 +223,26 @@ def build_call_metrics(
         elif isinstance(etype, str) and etype.startswith("takeover_"):
             suffix = etype[len("takeover_"):]
             takeover[suffix] = takeover.get(suffix, 0) + 1
+            # 首次请求→首次接通即接管时延；重复事件（理论上不会有）取最早的。
+            if isinstance(ts, (int, float)):
+                if suffix == "requested" and takeover_requested_ts is None:
+                    takeover_requested_ts = float(ts)
+                elif suffix == "committed" and takeover_committed_ts is None:
+                    takeover_committed_ts = float(ts)
+        elif etype == "answered":
+            t_ms = event.get("t_ms")
+            if isinstance(t_ms, (int, float)) and answered_t_ms is None:
+                answered_t_ms = float(t_ms)
+        elif etype == "greeting_sent":
+            t_ms = event.get("t_ms")
+            if isinstance(t_ms, (int, float)) and greeting_t_ms is None:
+                greeting_t_ms = float(t_ms)
+        elif etype == "pcm_enable":
+            pcm_enable = {
+                "ok": bool(event.get("ok")),
+                "attempts": event.get("attempts"),
+                "degraded": bool(event.get("degraded")),
+            }
         elif etype == "call_finished" and isinstance(ts, (int, float)):
             finished_ts = float(ts)
 
@@ -262,6 +291,54 @@ def build_call_metrics(
     if hangup_latency_ms is None:
         unavailable["hangup_latency_ms"] = "no_dialogue_activity"
 
+    # answered_to_first_audio_ms（v3，文档 A 组「Inbound 接起→首字」）：
+    # 接起(answered) → 整通首块 AI 音频**到达** = (greeting_sent - answered 的
+    # t_ms 差) + first_audio_ms。命名诚实：到达≠对方听到（播出与蜂窝腿在外）。
+    # opening_mode=wait（不发开场白）或远程链路（answered 无 t_ms）→ null + 原因。
+    answered_to_first_audio_ms: float | None = None
+    if answered_t_ms is None:
+        unavailable["answered_to_first_audio_ms"] = "no_answered_mark"
+    elif greeting_t_ms is None:
+        unavailable["answered_to_first_audio_ms"] = "greeting_not_sent"
+    elif first_audio_ms is None:
+        unavailable["answered_to_first_audio_ms"] = "no_first_audio"
+    elif greeting_t_ms < answered_t_ms:
+        unavailable["answered_to_first_audio_ms"] = "inconsistent_marks"
+    else:
+        answered_to_first_audio_ms = round(
+            (greeting_t_ms - answered_t_ms) + first_audio_ms, 1
+        )
+
+    # takeover_latency_ms（v3，文档 F 组「转接建立时延」）：首次 takeover_requested
+    # → 首次 takeover_committed。请求了没接通（超时/回滚）记 null + 原因。
+    takeover_latency_ms: float | None = None
+    if takeover_requested_ts is None:
+        unavailable["takeover_latency_ms"] = "no_takeover_request"
+    elif (
+        takeover_committed_ts is None
+        or takeover_committed_ts < takeover_requested_ts
+    ):
+        unavailable["takeover_latency_ms"] = "takeover_not_committed"
+    else:
+        takeover_latency_ms = round(
+            (takeover_committed_ts - takeover_requested_ts) * 1000, 1
+        )
+
+    # pcm_enable_failed / pcm_degraded（v3，文档 D 组异常掉话的蜂窝指纹）：
+    # 启用失败=整通无声；attempts≥阈值=模组劣化（对端听到卡顿）。事件缺失
+    # （Quectel 路径 / 历史通话）记 unavailable，不猜。
+    if pcm_enable is None:
+        unavailable["pcm_enable"] = "no_pcm_enable_event"
+
+    termination = _derive_termination(
+        status,
+        takeover=takeover,
+        dead_media_hangup=dead_media_hangup,
+        winddown_reason=winddown_reason,
+        hangup_tool_called=hangup_tool_called,
+        inbound_deadline=inbound_deadline,
+    )
+
     metrics: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         # 调用方（finish）传通话结束时刻，保持纯函数不读钟；直调时才落到 now。
@@ -281,18 +358,18 @@ def build_call_metrics(
         "tool_calls": tool_calls,
         "dtmf": {"actions": dtmf_actions, "outcomes": dtmf_outcomes},
         "barge_in_fallback": barge_in_fallback,
-        "termination": _derive_termination(
-            status,
-            takeover=takeover,
-            dead_media_hangup=dead_media_hangup,
-            winddown_reason=winddown_reason,
-            hangup_tool_called=hangup_tool_called,
-            inbound_deadline=inbound_deadline,
-        ),
+        "termination": termination,
         "hangup_latency_ms": hangup_latency_ms,
+        "answered_to_first_audio_ms": answered_to_first_audio_ms,
         "takeover": takeover,
+        "takeover_latency_ms": takeover_latency_ms,
         "contact_known": contact_known,
         "has_task_goal": has_task_goal,
+        # 非预期断线（媒体死/错误终止）；文档 D 组要求的直方图在汇总层按时长出。
+        "abnormal_drop": termination["kind"] in ("dead_media", "error"),
+        "pcm_enable_failed": None if pcm_enable is None else not pcm_enable["ok"],
+        "pcm_degraded": None if pcm_enable is None else pcm_enable["degraded"],
+        "pcm_enable_attempts": None if pcm_enable is None else pcm_enable["attempts"],
         "unavailable": unavailable,
     }
     return metrics

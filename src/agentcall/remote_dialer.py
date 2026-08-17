@@ -609,6 +609,10 @@ class RemoteWebDialerCoordinator:
             # 物理接通：此后断线守护改用「媒体轨」判据（振铃期用「控制连接」）。
             self._call_connected.set()
             self.modem.initialize_for_voice(self.runtime.audio_mode)
+            # 与本地链路同款 pcm_enable 事件（WIL-95 D 组无声通指纹）。
+            enable_info = getattr(self.modem, "last_voice_enable", None)
+            if record is not None and isinstance(enable_info, dict):
+                record.log_event("pcm_enable", **enable_info)
             bridge = self.bridge_factory(
                 mode=self.runtime.audio_mode,
                 device_keyword=self.runtime.audio_keyword,

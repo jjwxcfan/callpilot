@@ -402,6 +402,20 @@
   .met-pill { background: var(--well); border: 1px solid var(--border); border-radius: 999px;
     padding: 3px 11px; font-size: 12px; color: var(--muted); font-family: var(--mono); }
   .met-pill.bad { color: var(--err); border-color: rgba(255, 69, 58, .4); }
+  .met-sect { font-size: 12px; font-weight: 700; color: var(--muted); margin: 14px 0 4px; }
+  /* 趋势图：SVG 随容器缩放；指标切换按钮沿用 pill 形态 */
+  .met-trend-btns { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 8px; }
+  .met-trend-btn { background: var(--well); border: 1px solid var(--border); border-radius: 999px;
+    padding: 3px 11px; font-size: 12px; color: var(--muted); font-family: var(--mono); cursor: pointer; }
+  .met-trend-btn.active { color: var(--blue); border-color: rgba(10, 132, 255, .5); }
+  .met-trend-svg { width: 100%; height: auto; display: block; }
+  .met-trend-line { stroke: var(--blue); }
+  .met-trend-dot { cursor: help; }
+  .met-trend-dot.in { fill: var(--ok); }
+  .met-trend-dot.out { fill: var(--blue); }
+  .met-trend-axis { fill: var(--dim); font-size: 10px; font-family: var(--mono); }
+  .met-trend-grid { stroke: rgba(255, 255, 255, .07); }
+  .met-legend { font-size: 11px; color: var(--dim); margin-top: 2px; }
   /* 悬浮详细说明：可悬浮元素虚线下划线，气泡用 fixed 单例（防被卡片 overflow 裁剪） */
   .tip { cursor: help; border-bottom: 1px dashed var(--dim); }
   .met-tipbox {
@@ -1324,11 +1338,47 @@ const I18N = {
     met_tip_backlog: "When this turn's first reply chunk is queued, how much earlier audio is still waiting to play. Anything above 0 means the playback queue is congested — the #1 reason instruments say 1.7 s while ears hear 3 s+. Ideal is a flat 0.",
     met_lat_tool: "Tool call duration",
     met_tip_tool: "Time from a tool invocation (hang up, send SMS, take note…) to its result. Tool time is included in that turn's local response — which is why tool turns look slow.",
-    met_lat_first: "First audio of the call (answer → arrival)",
-    met_tip_first: "Whole-call first impression: from the call being answered to the first AI audio arriving. One sample per call.",
+    met_lat_first: "First audio of the call (greeting sent → arrival)",
+    met_tip_first: "From the greeting being dispatched to the first AI audio arriving. One sample per call. Does not include the answer→greeting startup chain — see the answer→first-audio row for the full user-facing wait.",
+    met_lat_ans_first: "Answer → first audio (arrival)",
+    met_tip_ans_first: "Whole-call first impression: from the call being answered to the first AI audio chunk arriving, derived from the answered/greeting marks plus first-audio. Stage-1 doc target for inbound: p95 < 1000 ms. Arrival, not playout — the speaker tail and cellular leg are outside observation. Calls with opening_mode=wait send no greeting and record no value.",
+    met_lat_takeover: "Takeover latency (request → connected)",
+    met_tip_takeover: "From the AI requesting owner takeover to the owner's media actually connected (takeover_committed). Doc group F 'transfer setup time' — the call-bridging form is inherently slower than a native carrier-side implementation, so use it for usability judgment only.",
     met_lat_hangup: "Hangup latency (last dialog event → call end)",
     met_tip_hangup: "From the last dialog activity (transcript, DTMF outcome or tool action) to the call actually ending. Event-based approximation — the playout tail is not included; a large value means the goodbye drags.",
-    met_pill_term: "end", met_tip_term: "How calls ended, counted by termination kind: agent_hangup = the AI hung up via its tool, remote_hangup = the other side hung up, and so on.",
+    met_hdr_profile: "Dialog profile", met_no_data: "no data",
+    met_prof_duration: "Call duration (s)",
+    met_tip_duration: "Whole-call duration in seconds. The distribution is a rough proxy for dialog structure (L1 single-turn vs L2 multi-turn); a cluster of short drops hints at systematic line failures (doc D asks for exactly this histogram).",
+    met_prof_turns: "Peer turns (count)",
+    met_tip_turns: "How many turns the other party spoke. Together with duration, a rough proxy for the scenario-matrix dialog-structure dimension until real scenario tags land.",
+    met_term_title: "How calls ended (kind · cause)",
+    met_hdr_kind: "Kind", met_hdr_reason: "Cause", met_hdr_count: "calls",
+    met_kind_agent_hangup: "AI hung up", met_kind_peer_hangup: "Peer hung up first",
+    met_kind_dead_media: "Dead media", met_kind_error: "Error",
+    met_kind_takeover: "Owner takeover", met_kind_not_connected: "Not connected",
+    met_tip_kind_agent_hangup: "The AI ended the call deliberately — the cause column says whether it was a natural wind-down, the hangup tool, or the inbound time limit. Whether it hung up at the right moment (early/late) needs the judge layer; these are the counts only.",
+    met_tip_kind_peer_hangup: "Inferred by elimination: the call ended with no local hangup signal, so the other side hung up first. Normal for IVR and voicemail; a high share on human calls is an experience warning (doc group D).",
+    met_tip_kind_dead_media: "Uplink audio went digitally silent and the watchdog hung up. This is the cellular fingerprint of an abnormal drop — often paired with the PCM enable failure pill below.",
+    met_tip_kind_error: "The call loop exited abnormally (exception). Counted as an abnormal drop.",
+    met_tip_kind_takeover: "The owner took the call over from the AI.",
+    met_tip_kind_not_connected: "Outbound calls that never connected (no answer, rejected or timeout). Excluded from latency stats.",
+    met_pill_dtmf: "DTMF", met_tip_dtmf: "IVR keypad activity: keys actually sent, over how many calls. The outcome pills count peer-side evidence of whether the menu really advanced — not our own send success, which was a proven false positive (WIL-72).",
+    met_tip_dtmf_out: "DTMF navigation outcome judged from the peer's next utterance (advanced / no progress / unknown). Per-level IVR breakdown comes later with scenario tags.",
+    met_pill_takeover: "takeover", met_tip_takeover_pill: "Calls where the AI requested owner takeover → how many actually connected. The gap is offers that expired or failed to bridge.",
+    met_tip_tool_pill: "How many times this tool was invoked across these calls.",
+    met_pill_abnormal: "abnormal drops", met_tip_abnormal: "Calls ending in dead media or error — unexpected line drops (doc group D). Check the duration distribution above for systematic drop timing.",
+    met_pill_pcm_failed: "silent calls (PCM enable failed)",
+    met_tip_pcm_failed: "AT+CPCMREG=1 never succeeded during the call — the peer heard nothing the whole call. This is the SIM7600 degradation fingerprint (doc D's 'abnormal drop fingerprint', cellular form). Denominator: instrumented calls only (v3+, SIM7600).",
+    met_pill_pcm_degraded: "PCM degraded",
+    met_tip_pcm_degraded: "Enabling PCM needed retries — the modem's PCM subsystem is degraded (the peer hears stutter); a USB recovery is requested after such calls.",
+    met_trend_title: "Per-call trend",
+    met_tip_trend: "One point per call, in time order. Per-turn metrics plot the call's median; whole-call metrics plot the raw value. This answers 'is it getting better over time' — per-call distributions live in the tables above. Green dots = inbound, blue = outbound.",
+    met_trend_empty: "Not enough data points for this metric.",
+    met_legend: "● inbound · ● outbound — hover a dot for the call id",
+    met_btn_local: "local response", met_btn_first_delta: "generation", met_btn_backlog: "backlog",
+    met_btn_tool: "tool", met_btn_first: "first audio", met_btn_ans_first: "answer→audio",
+    met_btn_hangup: "hangup", met_btn_takeover: "takeover",
+    met_pill_dtmf_fmt: "{a} keys / {c} calls",
     met_pill_known: "known caller", met_tip_known: "Calls where the caller was recognized as a known contact (affects greeting and strategy).",
     met_tip_combo: "The provider / turn-detection / barge-in configuration these calls ran with. Different configs are counted separately so their numbers never blend.",
     met_pill_fallback: "self-echo fallback", met_tip_fallback: "Calls where suspected self-echo (downlink audio re-captured as uplink) triggered the half-duplex fallback.",
@@ -1522,11 +1572,47 @@ const I18N = {
     met_tip_backlog: "本轮首块回复入队时，前面还排着没播完的音频时长。大于 0 即播放队列积压——「仪器测 1.7 秒、耳朵听 3 秒+」的头号元凶；理想是恒为 0。",
     met_lat_tool: "工具调用耗时",
     met_tip_tool: "工具（挂断、发短信、记录等）从调用到返回的耗时。工具时间计入该轮「本机应答」——这就是带工具的轮次显得慢的原因。",
-    met_lat_first: "整通首音频（接通→到达）",
-    met_tip_first: "整通第一印象：从接通到第一次听到 AI 声音的耗时，每通一条。",
+    met_lat_first: "整通首音频（开场白下发→到达）",
+    met_tip_first: "开场白下发到首块 AI 音频到达的耗时，每通一条。不含「接起→开场白」的启动链——完整的用户侧等待看下面「接起→首字」一行。",
+    met_lat_ans_first: "接起→首字（到达）",
+    met_tip_ans_first: "整通第一印象：从接起到首块 AI 音频到达，由 answered/greeting 标记加首音频推导。文档 Stage 1 对 inbound 的目标：p95 < 1000ms。「到达」不等于对方听到——播出尾巴与蜂窝腿在观测范围外。opening_mode=wait（不发开场白）的通话无此值。",
+    met_lat_takeover: "接管时延（请求→接通）",
+    met_tip_takeover: "AI 发起真人接管到机主媒体真正接通（takeover_committed）的耗时。文档 F 组「转接建立时延」——呼叫桥接形态先天慢于运营商网内原生实现，只作本阶段可用性判断，不外推。",
     met_lat_hangup: "挂断时延（末条对话事件→结束）",
     met_tip_hangup: "最后一条对话活动（转写 / 按键结果 / 工具动作）到通话真正结束的间隔。事件近似、不含播出尾巴；偏大说明收尾拖沓。",
-    met_pill_term: "终止", met_tip_term: "通话如何收场，按终止方式计数：agent_hangup=AI 用工具挂断，remote_hangup=对方挂断，以此类推。",
+    met_hdr_profile: "对话画像", met_no_data: "无数据",
+    met_prof_duration: "通话时长（秒）",
+    met_tip_duration: "整通时长（秒）。分布是对话结构（L1 单轮 vs L2 多轮）的粗代理；短时长扎堆提示系统性掉线（文档 D 组要求的正是这张直方图）。",
+    met_prof_turns: "对方轮次（次）",
+    met_tip_turns: "对方说话的轮数。与时长一起，在场景标签落地前充当场景矩阵「对话结构」维度的粗代理。",
+    met_term_title: "通话怎么收场（方式 · 起因）",
+    met_hdr_kind: "方式", met_hdr_reason: "起因", met_hdr_count: "通数",
+    met_kind_agent_hangup: "AI 主动挂断", met_kind_peer_hangup: "对端先挂",
+    met_kind_dead_media: "媒体死寂", met_kind_error: "异常退出",
+    met_kind_takeover: "真人接管", met_kind_not_connected: "未接通",
+    met_tip_kind_agent_hangup: "AI 有意结束通话——起因列区分自然收尾、挂断工具还是来电时限。挂得对不对（早挂/晚挂）要判官层裁决，这里只是计数。",
+    met_tip_kind_peer_hangup: "排除法推断：通话结束时本机没有任何主动挂断信号，即对方先挂。IVR/留言机场景属正常；真人场景占比偏高是体验警报（文档 D 组）。",
+    met_tip_kind_dead_media: "上行音频数字静默、守护挂断。这是异常断线的蜂窝指纹——常与下方「PCM 启用失败」并发。",
+    met_tip_kind_error: "通话主循环异常退出。计入异常断线。",
+    met_tip_kind_takeover: "机主从 AI 手里接管了通话。",
+    met_tip_kind_not_connected: "外呼未接通（无人接听/拒接/超时）。不进时延统计。",
+    met_pill_dtmf: "按键", met_tip_dtmf: "IVR 按键活动：实际发出的按键次数 / 涉及通数。旁边的结果 pill 按「对端下一句证据」统计菜单是否真的推进了——不是本机发送成功（那是已证实的假阳性，WIL-72）。",
+    met_tip_dtmf_out: "按对端下一句证据判定的按键推进结果（advanced=菜单真推进了 / no_progress=没动 / 其他=判不出）。逐层 IVR 统计等场景标签落地后补。",
+    met_pill_takeover: "接管", met_tip_takeover_pill: "AI 发起真人接管的通数 → 真正接通的通数。差值是过期或桥接失败的 offer。",
+    met_tip_tool_pill: "该工具在这批通话里被调用的总次数。",
+    met_pill_abnormal: "异常断线", met_tip_abnormal: "以媒体死寂或异常退出收场的通数——非预期断线（文档 D 组）。配合上方时长分布可发现系统性掉线时点。",
+    met_pill_pcm_failed: "无声通（PCM 启用失败）",
+    met_tip_pcm_failed: "整通 AT+CPCMREG=1 从未成功——对端全程听不到 AI。这是 SIM7600 劣化的通级指纹（文档 D 组「异常掉话指纹」的蜂窝形态）。分母只算已埋点的通（v3 起、仅 SIM7600）。",
+    met_pill_pcm_degraded: "PCM 已劣化",
+    met_tip_pcm_degraded: "启用 PCM 需要重试——模组 PCM 子系统已劣化（对端会听到卡顿）；此类通话结束后会请求 USB 自愈。",
+    met_trend_title: "逐通趋势",
+    met_tip_trend: "每通一个点、按时间排序。逐轮指标取该通中位数，整通指标取原值。回答「有没有越来越好」——通内分布看上面的表。绿点=呼入，蓝点=呼出。",
+    met_trend_empty: "该指标的数据点还不够。",
+    met_legend: "● 呼入 · ● 呼出 —— 悬浮圆点看通话 ID",
+    met_btn_local: "本机应答", met_btn_first_delta: "生成段", met_btn_backlog: "播出积压",
+    met_btn_tool: "工具", met_btn_first: "首音频", met_btn_ans_first: "接起→首字",
+    met_btn_hangup: "挂断", met_btn_takeover: "接管",
+    met_pill_dtmf_fmt: "{a} 次 / {c} 通",
     met_pill_known: "熟人", met_tip_known: "来电被识别为通讯录熟人的通数（影响开场白与策略）。",
     met_tip_combo: "该批通话运行时的 provider / 判停 / barge-in 配置组合。不同配置分开统计，数字绝不混平均。",
     met_pill_fallback: "自激兜底", met_tip_fallback: "疑似自激（下行音频被回采成上行）触发半双工兜底的通数。",
@@ -2797,9 +2883,13 @@ const MET_LAT_KEYS = {
   playout_backlog_ms: "backlog",
   tool_call_latency_ms: "tool",
   first_audio_ms: "first",
+  answered_to_first_audio_ms: "ans_first",
   hangup_latency_ms: "hangup",
+  takeover_latency_ms: "takeover",
 };
 const MET_STAT_COLS = ["n", "p50", "p95", "max"];
+// 趋势图当前选中的指标，按 schema 版本各记各的（切语言重渲染时保持选择）。
+const metTrendSel = {};
 
 function metFmt(tpl, vars) {
   return Object.entries(vars).reduce((s, [k, v]) => s.replaceAll("{" + k + "}", v), t(tpl));
@@ -2811,40 +2901,143 @@ function metTip(node, tipText) {
   return node;
 }
 
-function metStatTable(group) {
+// t() 缺键时原样返回键名；用这个包装把「查不到」折叠成 null。
+function metT(key) { return t(key) !== key ? t(key) : null; }
+
+function metStatTable(headKey, entries) {
   const table = el("table", "met-table");
   const head = el("tr");
-  head.appendChild(el("th", null, t("met_hdr_metric")));
+  head.appendChild(el("th", null, t(headKey)));
   for (const col of MET_STAT_COLS)
     head.appendChild(metTip(el("th", null, col), t("met_tip_" + col)));
   table.appendChild(head);
-  const rows = { ...group.latency, first_audio_ms: group.first_audio_ms,
-                 hangup_latency_ms: group.hangup_latency_ms };
-  // 已知字段按固定顺序，未知字段（未来 schema）原样兜底展示。
-  const fields = [...Object.keys(MET_LAT_KEYS).filter((f) => f in rows),
-                  ...Object.keys(rows).filter((f) => !(f in MET_LAT_KEYS))];
-  for (const field of fields) {
-    const key = MET_LAT_KEYS[field];
+  for (const entry of entries) {
     const row = el("tr");
     const labelCell = el("td");
-    labelCell.appendChild(metTip(el("span", null, key ? t("met_lat_" + key) : field),
-                                 key ? t("met_tip_" + key) : null));
+    labelCell.appendChild(metTip(el("span", null, entry.label), entry.tip));
     row.appendChild(labelCell);
-    const s = rows[field];
-    if (!s) {
+    if (!entry.stats) {
       const td = el("td", "na", t("met_no_sample"));
       td.colSpan = MET_STAT_COLS.length;
       row.appendChild(td);
     } else {
-      for (const col of MET_STAT_COLS) row.appendChild(el("td", null, String(s[col])));
+      for (const col of MET_STAT_COLS)
+        row.appendChild(el("td", null, String(entry.stats[col])));
     }
     table.appendChild(row);
   }
   return table;
 }
 
+function metLatencyEntries(group) {
+  const rows = { ...group.latency,
+                 first_audio_ms: group.first_audio_ms,
+                 answered_to_first_audio_ms: group.answered_to_first_audio_ms,
+                 hangup_latency_ms: group.hangup_latency_ms,
+                 takeover_latency_ms: group.takeover_latency_ms };
+  // 已知字段按固定顺序，未知字段（未来 schema）原样兜底展示。
+  const fields = [...Object.keys(MET_LAT_KEYS).filter((f) => f in rows),
+                  ...Object.keys(rows).filter((f) => !(f in MET_LAT_KEYS))];
+  return fields.map((field) => {
+    const key = MET_LAT_KEYS[field];
+    return { label: key ? t("met_lat_" + key) : field,
+             tip: key ? t("met_tip_" + key) : null, stats: rows[field] };
+  });
+}
+
 function metPill(text, tip, cls) {
   return metTip(el("span", "met-pill" + (cls ? " " + cls : ""), text), tip);
+}
+
+// 终止归因表：方式（kind）× 起因（reason）× 通数——文档 D 组要求早挂/晚挂/
+// 对端先挂/异常断线分开看，pill 计数升级成两级表。
+function metTermTable(reasonsByKind) {
+  const table = el("table", "met-table");
+  const head = el("tr");
+  head.appendChild(el("th", null, t("met_hdr_kind")));
+  head.appendChild(el("th", null, t("met_hdr_reason")));
+  head.appendChild(el("th", null, t("met_hdr_count")));
+  table.appendChild(head);
+  for (const [kind, reasons] of Object.entries(reasonsByKind)) {
+    for (const [reason, n] of Object.entries(reasons)) {
+      const row = el("tr");
+      const kindCell = el("td");
+      kindCell.appendChild(metTip(el("span", null, metT("met_kind_" + kind) || kind),
+                                  metT("met_tip_kind_" + kind)));
+      row.appendChild(kindCell);
+      row.appendChild(el("td", null, reason));
+      row.appendChild(el("td", null, String(n)));
+      table.appendChild(row);
+    }
+  }
+  return table;
+}
+
+/* 逐通趋势：每通一点（逐轮指标取该通中位数），SVG 纯前端画，无第三方库 */
+const SVG_NS = "http://www.w3.org/2000/svg";
+function svgEl(tag, attrs) {
+  const n = document.createElementNS(SVG_NS, tag);
+  for (const [k, v] of Object.entries(attrs || {})) n.setAttribute(k, v);
+  return n;
+}
+
+function metTrendSvg(trend, field) {
+  const pts = trend.filter((p) => typeof (p.values || {})[field] === "number");
+  if (pts.length < 2) return el("div", "empty", t("met_trend_empty"));
+  const W = 640, H = 170, L = 48, R = 10, T = 10, B = 20;
+  const ymax = Math.max(...pts.map((p) => p.values[field])) * 1.08 || 1;
+  const x = (i) => L + (W - L - R) * (i / (pts.length - 1));
+  const y = (v) => T + (H - T - B) * (1 - v / ymax);
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, class: "met-trend-svg" });
+  for (const frac of [0, 0.5, 1]) {
+    const v = ymax * frac;
+    svg.appendChild(svgEl("line",
+      { x1: L, y1: y(v), x2: W - R, y2: y(v), class: "met-trend-grid" }));
+    const label = svgEl("text",
+      { x: L - 6, y: y(v) + 3, "text-anchor": "end", class: "met-trend-axis" });
+    label.textContent = String(Math.round(v));
+    svg.appendChild(label);
+  }
+  svg.appendChild(svgEl("polyline", {
+    points: pts.map((p, i) => `${x(i)},${y(p.values[field])}`).join(" "),
+    fill: "none", "stroke-width": "2", class: "met-trend-line",
+  }));
+  pts.forEach((p, i) => {
+    const dot = svgEl("circle", {
+      cx: x(i), cy: y(p.values[field]), r: 4.5,
+      class: "met-trend-dot " + (p.direction === "inbound" ? "in" : "out"),
+    });
+    metTip(dot, `${p.call_id || "?"} · ${p.direction} · ${Math.round(p.values[field])} ms`);
+    svg.appendChild(dot);
+  });
+  return svg;
+}
+
+function metRenderTrend(container, trend, ver) {
+  container.textContent = "";
+  const present = new Set();
+  for (const p of trend) for (const k of Object.keys(p.values || {})) present.add(k);
+  const fields = Object.keys(MET_LAT_KEYS).filter((k) => present.has(k));
+  if (!fields.length) {
+    container.appendChild(el("div", "empty", t("met_trend_empty")));
+    return;
+  }
+  if (!fields.includes(metTrendSel[ver])) metTrendSel[ver] = fields[0];
+  const btns = el("div", "met-trend-btns");
+  for (const f of fields) {
+    const b = el("button",
+      "met-trend-btn" + (f === metTrendSel[ver] ? " active" : ""),
+      t("met_btn_" + MET_LAT_KEYS[f]));
+    b.type = "button";
+    b.addEventListener("click", () => {
+      metTrendSel[ver] = f;
+      metRenderTrend(container, trend, ver);
+    });
+    btns.appendChild(b);
+  }
+  container.appendChild(btns);
+  container.appendChild(metTrendSvg(trend, metTrendSel[ver]));
+  container.appendChild(el("div", "met-legend", t("met_legend")));
 }
 
 function renderMetricsSummary(root, s) {
@@ -2855,17 +3048,50 @@ function renderMetricsSummary(root, s) {
   for (const [ver, d] of Object.entries(s.schema_versions)) {
     root.appendChild(el("div", "met-schema", metFmt("met_schema_label", { v: ver, n: d.calls })));
     for (const [dir, g] of Object.entries(d.directions)) {
-      const dirLabel = t("met_dir_" + dir) !== "met_dir_" + dir ? t("met_dir_" + dir) : dir;
+      const dirLabel = metT("met_dir_" + dir) || dir;
       root.appendChild(el("div", "met-dir",
         `${dirLabel}（${metFmt("met_dir_calls", { n: g.calls })}）`));
-      root.appendChild(metStatTable(g));
+      root.appendChild(metStatTable("met_hdr_metric", metLatencyEntries(g)));
+      // 对话画像：时长/轮次的单位不是 ms，单独一张小表。
+      root.appendChild(metStatTable("met_hdr_profile", [
+        { label: t("met_prof_duration"), tip: t("met_tip_duration"), stats: g.duration_s },
+        { label: t("met_prof_turns"), tip: t("met_tip_turns"), stats: g.peer_turns },
+      ]));
+    }
+    if (Object.keys(d.termination_reasons || {}).length) {
+      root.appendChild(el("div", "met-sect", t("met_term_title")));
+      root.appendChild(metTermTable(d.termination_reasons));
+    }
+    if ((d.trend || []).length) {
+      root.appendChild(metTip(el("div", "met-sect", t("met_trend_title")), t("met_tip_trend")));
+      const trendBox = el("div", "met-trend");
+      root.appendChild(trendBox);
+      metRenderTrend(trendBox, d.trend, ver);
     }
     const pills = el("div", "met-pills");
-    for (const [kind, n] of Object.entries(d.terminations || {}))
-      pills.appendChild(metPill(`${t("met_pill_term")}·${kind}: ${n}`, t("met_tip_term")));
     const c = d.contact_known || {};
     if (c.known || c.unknown)
       pills.appendChild(metPill(`${t("met_pill_known")} ${c.known}/${c.known + c.unknown}`, t("met_tip_known")));
+    const dt = d.dtmf || {};
+    if (dt.actions) {
+      pills.appendChild(metPill(
+        `${t("met_pill_dtmf")} ${metFmt("met_pill_dtmf_fmt", { a: dt.actions, c: dt.calls_with_actions })}`,
+        t("met_tip_dtmf")));
+      for (const [st, n] of Object.entries(dt.outcomes || {}))
+        pills.appendChild(metPill(`${t("met_pill_dtmf")}·${st}: ${n}`, t("met_tip_dtmf_out")));
+    }
+    const tk = d.takeover || {};
+    if (tk.requested)
+      pills.appendChild(metPill(`${t("met_pill_takeover")} ${tk.committed}/${tk.requested}`, t("met_tip_takeover_pill")));
+    for (const [tool, n] of Object.entries(d.tool_calls || {}))
+      pills.appendChild(metPill(`${tool}: ${n}`, t("met_tip_tool_pill")));
+    if (d.abnormal_drop_calls)
+      pills.appendChild(metPill(`${t("met_pill_abnormal")} ${d.abnormal_drop_calls}`, t("met_tip_abnormal"), "bad"));
+    const pcm = d.pcm || {};
+    if (pcm.enable_failed)
+      pills.appendChild(metPill(`${t("met_pill_pcm_failed")} ${pcm.enable_failed}/${pcm.instrumented}`, t("met_tip_pcm_failed"), "bad"));
+    if (pcm.degraded)
+      pills.appendChild(metPill(`${t("met_pill_pcm_degraded")} ${pcm.degraded}/${pcm.instrumented}`, t("met_tip_pcm_degraded"), "bad"));
     for (const [combo, n] of Object.entries(d.config_combos || {}))
       pills.appendChild(metPill(`${combo}: ${n}`, t("met_tip_combo")));
     if (d.barge_in_fallback_calls)

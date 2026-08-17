@@ -499,6 +499,11 @@ class CallSession:
             # 挂断流程会发 AT+QPCMV=0 关闭语音通道，每通电话都要重新启用，
             # 否则第二通开始模组无 PCM 流（双向无声）。
             self.modem.initialize_for_voice(self.audio_mode)
+            # 通话内的启用结果进事件流：ok=False 即整通无声、attempts≥2 即已劣化
+            # ——WIL-95 D 组「异常掉话指纹」的蜂窝形态（CPCMREG 替代 RTP keepalive）。
+            enable_info = getattr(self.modem, "last_voice_enable", None)
+            if record is not None and isinstance(enable_info, dict):
+                record.log_event("pcm_enable", **enable_info)
 
             bridge = create_audio_bridge(
                 mode=self.audio_mode,

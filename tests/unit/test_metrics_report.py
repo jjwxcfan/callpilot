@@ -79,6 +79,64 @@ def test_summary_rolls_up_terminations_hangup_and_contact(tmp_path):
     assert stats["n"] == 2 and stats["max"] == 1200.0
 
 
+def test_summary_rolls_up_v3_additions(tmp_path):
+    """v3 汇总：归因表 / DTMF / 接管 / 工具 / pcm 指纹 / 对话画像 / 趋势序列。"""
+    _write_call(tmp_path, "a", _metrics(
+        schema_version=3, generated_at=100.0, call_id="a", duration_s=42.0,
+        peer_turns=5,
+        latency={"local_response_latency_ms": {
+            "n": 2, "median": 900.0, "p90": 1000.0, "max": 1000.0,
+            "values": [800.0, 1000.0]}},
+        dtmf={"actions": 3, "outcomes": {"advanced": 2, "no_progress": 1}},
+        tool_calls={"send_sms": 1},
+        takeover={"requested": 1, "committed": 1},
+        takeover_latency_ms=3500.0,
+        answered_to_first_audio_ms=1600.0,
+        abnormal_drop=False, pcm_enable_failed=False, pcm_degraded=False,
+    ))
+    _write_call(tmp_path, "b", _metrics(
+        schema_version=3, generated_at=50.0, call_id="b", duration_s=30.0,
+        peer_turns=1,
+        termination={"kind": "dead_media", "reason": "uplink_digital_silence"},
+        abnormal_drop=True, pcm_enable_failed=True, pcm_degraded=True,
+    ))
+    report = summarize(*collect(tmp_path))
+    vdata = report["schema_versions"]["3"]
+    assert vdata["termination_reasons"] == {
+        "peer_hangup": {"inferred_no_local_signal": 1},
+        "dead_media": {"uplink_digital_silence": 1},
+    }
+    assert vdata["dtmf"] == {
+        "calls_with_actions": 1, "actions": 3,
+        "outcomes": {"advanced": 2, "no_progress": 1},
+    }
+    assert vdata["takeover"] == {"requested": 1, "committed": 1}
+    assert vdata["tool_calls"] == {"send_sms": 1}
+    assert vdata["abnormal_drop_calls"] == 1
+    # pcm 占比分母只算已埋点的通（None/缺键的老通话不进分母）。
+    assert vdata["pcm"] == {"instrumented": 2, "enable_failed": 1, "degraded": 1}
+    group = vdata["directions"]["outbound"]
+    assert group["duration_s"]["n"] == 2 and group["duration_s"]["max"] == 42.0
+    assert group["peer_turns"]["max"] == 5.0
+    assert group["answered_to_first_audio_ms"]["n"] == 1
+    assert group["takeover_latency_ms"]["p50"] == 3500.0
+    # 趋势按 generated_at 升序，每通一点：逐轮字段取中位数，标量取原值。
+    assert [p["call_id"] for p in vdata["trend"]] == ["b", "a"]
+    a_point = vdata["trend"][1]
+    assert a_point["values"]["local_response_latency_ms"] == 900.0
+    assert a_point["values"]["answered_to_first_audio_ms"] == 1600.0
+
+
+def test_summary_tolerates_v2_calls_without_v3_fields(tmp_path):
+    """老 v2 metrics.json 无 v3 键：不报错、进 na/未埋点桶，不猜值。"""
+    _write_call(tmp_path, "old", _metrics())
+    report = summarize(*collect(tmp_path))
+    vdata = report["schema_versions"]["2"]
+    assert vdata["pcm"] == {"instrumented": 0, "enable_failed": 0, "degraded": 0}
+    assert vdata["abnormal_drop_calls"] == 0
+    assert vdata["directions"]["outbound"]["answered_to_first_audio_ms"] is None
+
+
 # ---- 判定层：复核队列与标注 ----
 
 
