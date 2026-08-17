@@ -260,6 +260,23 @@ def test_ring_urc_with_clip_carries_caller():
     assert rings == ["13600000000"]
 
 
+def test_hangup_clears_last_caller_so_withheld_call_is_not_misattributed():
+    """挂断必须清 _last_caller：隐藏号码来电的 +CLIP 是空引号、匹配不到，
+    不清的话下一通会把上一通的号码当成本通来电（转告短信会写错回拨号码）。"""
+    modem = make_modem()
+    rings: list[str | None] = []
+    modem.on_ring(rings.append)
+
+    modem._buffer = '\r\n+CLIP: "13600000000",129\r\n\r\nRING\r\n'
+    modem._process_buffer()
+    modem._buffer = "\r\nNO CARRIER\r\n"
+    modem._process_buffer()
+    modem._buffer = "\r\nRING\r\n"  # 第二通：隐藏号码，无 CLIP
+    modem._process_buffer()
+
+    assert rings == ["13600000000", None]  # 未知就是未知，不冒充上一通
+
+
 # ---- 断连自愈：_send 写失败后重连并重试 ----
 
 def test_send_reconnects_and_retries_on_io_error():

@@ -1507,6 +1507,7 @@ class CallSession:
             is_sms_target_allowed=self._sms_target_allowed,
             send_dtmf=self._send_dtmf_from_tool,
             effect_guard=lambda: self._agent_effect_allowed(generation),
+            direction=direction,
         )
         registry = tools.register()
         if (
@@ -1780,6 +1781,7 @@ class CallSession:
             self.hub,
             self.call_logger,
             extra_allowed=self.current_caller,
+            owner_number=config.get_str("OWNER_PHONE"),
             allow_any=config.get_bool("SMS_ALLOW_ANY_TARGET"),
         )
 
