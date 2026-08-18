@@ -1198,3 +1198,86 @@ def test_turn_latency_emitted_via_latency_handler(monkeypatch):
             await agent.stop()
 
     asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# 失聪看门狗（WIL-122）
+# ---------------------------------------------------------------------------
+
+_VOICED_FRAME = b"\x00\x02" * 240  # int16=512，超过有声阈值 350
+_SILENT_FRAME = b"\x00\x00" * 240
+
+
+def test_deaf_watchdog_warns_then_reconnects_on_event_silence(monkeypatch):
+    """有声上行持续但服务端零事件：先落 provider_deaf 告警，超限主动断开借道重连。"""
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+    samples: list[tuple[str, float]] = []
+    agent.set_latency_handler(lambda stage, ms: samples.append((stage, ms)))
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            ws = instances[0]
+            now = openai_agent.time.monotonic()
+            await agent.send_audio(_VOICED_FRAME)  # 喂「有声上行」时钟
+            # 事件静默超过告警阈但未到重连阈：只告警不断开
+            agent._last_event_at = now - openai_agent._DEAF_WARN_SECONDS - 1
+            await agent._deaf_tick(now)
+            assert [s for s, _ in samples] == ["provider_deaf"]
+            assert not ws.closed
+            # 再次 tick 不重复告警（同一段失聪期只告警一次）
+            await agent._deaf_tick(now)
+            assert [s for s, _ in samples] == ["provider_deaf"]
+            # 静默达到重连阈：主动 close，交给既有断线重连路径
+            agent._last_event_at = now - openai_agent._DEAF_RECONNECT_SECONDS - 1
+            await agent._deaf_tick(now)
+            assert "provider_deaf_reconnect" in [s for s, _ in samples]
+            assert ws.closed
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
+def test_deaf_watchdog_quiet_uplink_never_triggers(monkeypatch):
+    """近窗口只有纯静默上行（安静等待）：服务端久无事件也不算失聪。"""
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+    samples: list[tuple[str, float]] = []
+    agent.set_latency_handler(lambda stage, ms: samples.append((stage, ms)))
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            now = openai_agent.time.monotonic()
+            await agent.send_audio(_SILENT_FRAME)  # 静默帧不喂有声时钟
+            agent._last_event_at = now - openai_agent._DEAF_RECONNECT_SECONDS - 1
+            await agent._deaf_tick(now)
+            assert samples == []
+            assert not instances[0].closed
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
+def test_deaf_watchdog_event_resets_warned_flag(monkeypatch):
+    """任何服务端事件都喂时钟并复位告警位：恢复后再失聪要重新告警。"""
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            agent._deaf_warned = True
+            before = agent._last_event_at
+            instances[0].feed({"type": "rate_limits.updated"})
+            await _drain()
+            assert agent._deaf_warned is False
+            assert agent._last_event_at is not None
+            assert before is None or agent._last_event_at >= before
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
