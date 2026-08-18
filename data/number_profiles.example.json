@@ -227,18 +227,18 @@
     },
     {
       "id": "carrier-cs-long-queue",
-      "number": "10086",
+      "number": "611",
       "task": {
-        "zh": "长排队演练：查套餐余量并咨询降档",
-        "en": "Long-queue drill: check plan balance and ask about downgrades"
+        "zh": "长排队演练：查套餐余量并咨询更省的套餐",
+        "en": "Long-queue drill: check plan balance and ask about cheaper plans"
       },
       "label": {
-        "zh": "客服长排队演练（WIL-120）",
-        "en": "CS long-queue drill (WIL-120)"
+        "zh": "运营商客服长排队演练（WIL-120）",
+        "en": "Carrier CS long-queue drill (WIL-120)"
       },
       "scenario": {
-        "zh": "这是一次客服长排队演练：目标是穿过 IVR 转人工并完成咨询。IVR 菜单播报时静默听完再按键；进入排队/等待音乐后保持完全静默、绝不挂断、绝不对录音喊话，无论等多久；真人接入（问候、报工号）后立即礼貌回应并说明来意。",
-        "en": "This is a long-queue customer-service drill: navigate the IVR to a human agent and complete the inquiry. Listen silently through menu announcements before pressing keys; once in the hold queue or hearing waiting music, stay completely silent, never hang up, and never talk at recordings no matter how long it takes; the moment a human joins (greeting, agent ID), respond politely and state the request."
+        "zh": "这是一次运营商客服（611）长排队演练：目标是穿过 IVR 转人工并完成咨询。IVR 菜单播报时静默听完再按键或用简短英语选项；进入排队/等待音乐后保持完全静默、绝不挂断、绝不对录音喊话，无论等多久；真人接入（问候、报工号）后立即礼貌回应并说明来意。",
+        "en": "This is a carrier customer-service (611) long-queue drill: navigate the IVR to a human agent and complete the inquiry. Listen silently through menu announcements before pressing keys or saying short menu options; once in the hold queue or hearing waiting music, stay completely silent, never hang up, and never talk at recordings no matter how long it takes; the moment a human joins (greeting, agent ID), respond politely and state the request."
       },
       "opening_mode": "wait",
       "max_call_seconds": 3600,

@@ -35,10 +35,11 @@ def test_bundled_seed_has_public_hotline_profiles_without_private_data():
         "95566",
         "12315",
         "12345",
-        "10086",  # WIL-120 一期：客服长排队演练种子（carrier-cs-long-queue）
+        "611",  # WIL-120：客服长排队演练种子（美国线路，AT&T 客服 611）
     ]
     assert not re.search(r"(?<!\d)1[3-9]\d{9}(?!\d)", raw)
     allowed_numbers = {
+        "611",
         "10000",
         "10086",
         "10010",
