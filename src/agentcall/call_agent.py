@@ -248,6 +248,9 @@ class CallSession:
         self._prompt_gen_opening_mode = "say"
         self._prompt_gen_dtmf_spoken_followup = False
         self._result_verification_mode = "none"
+        # WIL-120 一期：profile 级长通话覆盖。None=跟随全局 OUTBOUND_MAX_SECONDS。
+        self._profile_max_call_seconds: int | None = None
+        self._profile_wrap_up_judge = True
         self._dtmf_lock = threading.RLock()
         # 上行媒体互斥：drain 的「取空队列再写桥」与 DTMF 的「清队列再入双音」
         # 必须原子，否则清队列会清了个空、语音仍抢在双音前面写进桥。
@@ -364,6 +367,8 @@ class CallSession:
         self._prompt_gen_opening_mode = "say"
         self._prompt_gen_dtmf_spoken_followup = False
         self._result_verification_mode = "none"
+        self._profile_max_call_seconds = None
+        self._profile_wrap_up_judge = True
         self._cancel_spoken_dtmf_followups(clear_recent=True)
         self._stop_dtmf_judge(join_timeout=0.0)
         self._stop_triage_judge(join_timeout=0.0)
@@ -891,9 +896,16 @@ class CallSession:
         last_play_at = 0.0
         loop_started = time.monotonic()
         # 外呼硬时限：LLM 收尾裁判失灵/漏判时的最后防线（到点道别挂断）。
-        outbound_max_seconds = (
-            float(config.get_int("OUTBOUND_MAX_SECONDS")) if self._outbound_number else 0.0
-        )
+        # profile 可覆盖（WIL-120 一期）：长通话（客服排队 30 分钟+）是场景属性，
+        # 只给点名的预设放开；0=不限时，其余外呼保持全局安全默认。
+        outbound_max_seconds = 0.0
+        if self._outbound_number:
+            if self._profile_max_call_seconds is not None:
+                outbound_max_seconds = float(self._profile_max_call_seconds)
+            else:
+                outbound_max_seconds = float(
+                    config.get_int("OUTBOUND_MAX_SECONDS")
+                )
         inbound_max_seconds = (
             float(config.get_int("INBOUND_MAX_SECONDS"))
             if self._outbound_number is None
@@ -909,11 +921,32 @@ class CallSession:
             )
         # 收尾裁判（仅外呼）：接通后先给 grace 让通话进正题，之后每 interval 让文本模型
         # 看对话判「继续/收尾」——理解任意措辞（治打转/太早撤），不靠关键词枚举。
-        judge_enabled = self._outbound_number is not None
+        # profile 可显式关闭裁判（WIL-120 一期）：排队循环音会被误判「打转」。
+        # 二期换 hold 冻结后收回这个一刀切开关。
+        judge_enabled = (
+            self._outbound_number is not None and self._profile_wrap_up_judge
+        )
         judge_grace = config.get_float("WRAP_UP_JUDGE_GRACE_SECONDS")
         judge_interval = config.get_float("WRAP_UP_JUDGE_INTERVAL_SECONDS")
         last_judge_at = loop_started
-        goal = self._outbound_task(agent_language()) if judge_enabled else ""
+        if record is not None and self._outbound_number is not None:
+            # 生效时限随通落盘（WIL-95 归因惯例）：没有这条，长通话演练的
+            # 指标就无法区分「配置放开了」和「默认 150s 恰好没触发」。
+            try:
+                record.log_event(
+                    "call_limits",
+                    outbound_max_seconds=outbound_max_seconds,
+                    wrap_up_judge=judge_enabled,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        # goal 只看方向、不看裁判开关：profile 关掉收尾裁判时 task_goal 证据
+        # 仍须落盘（WIL-95 §4——离线判官对长排队通话照样要裁「目的是否达成」）。
+        goal = (
+            self._outbound_task(agent_language())
+            if self._outbound_number is not None
+            else ""
+        )
         if record is not None and goal:
             # 任务目标随通落盘（WIL-95 §4 证据层）：判官离线裁决「目的是否达成」
             # 必须知道目的是什么；不落盘则历史通话永远无法重算。
@@ -1958,6 +1991,14 @@ class CallSession:
             if result.get("result_verification") == "carrier_sms"
             else "none"
         )
+        # 长通话覆盖（WIL-120 一期）：仅 profile 来源提供；动态生成结果无此键。
+        max_seconds = result.get("max_call_seconds")
+        self._profile_max_call_seconds = (
+            max_seconds
+            if isinstance(max_seconds, int) and not isinstance(max_seconds, bool)
+            else None
+        )
+        self._profile_wrap_up_judge = result.get("wrap_up_judge") is not False
         if result.get("ok") and str(result.get("scenario", "")).strip():
             return str(result["scenario"])
         return None

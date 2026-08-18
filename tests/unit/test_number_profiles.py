@@ -35,6 +35,7 @@ def test_bundled_seed_has_public_hotline_profiles_without_private_data():
         "95566",
         "12315",
         "12345",
+        "10086",  # WIL-120 一期：客服长排队演练种子（carrier-cs-long-queue）
     ]
     assert not re.search(r"(?<!\d)1[3-9]\d{9}(?!\d)", raw)
     allowed_numbers = {
@@ -639,3 +640,118 @@ def test_bundled_seed_has_sms_verified_china_mobile_billing_profile():
     assert profile["opening_mode"] == "wait"
     assert profile["result_verification"] == "carrier_sms"
     assert "官方短信" in profile["scenario"]["zh"]
+
+
+# ---- WIL-120 一期：长通话字段 ----
+
+
+def test_max_call_seconds_defaults_none_and_roundtrips(tmp_path):
+    path = tmp_path / "number_profiles.json"
+    path.write_text(
+        json.dumps(
+            {"profiles": [{"number": "10000", "scenario": "default"}]},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    # 缺省 = None（跟随全局），与 0（不限时）语义不同。
+    hit = number_profiles.lookup_profile("10000", "", path=path)
+    assert hit["max_call_seconds"] is None
+    assert hit["wrap_up_judge"] is True
+
+    created = number_profiles.create_profile(
+        {
+            "number": "10086",
+            "scenario": {"zh": "长排队演练"},
+            "match_mode": "number",
+            "max_call_seconds": 3600,
+            "wrap_up_judge": False,
+        },
+        path=path,
+    )
+    assert created["max_call_seconds"] == 3600
+    assert created["wrap_up_judge"] is False
+    hit = number_profiles.lookup_profile("10086", "", path=path)
+    assert hit["max_call_seconds"] == 3600
+    assert hit["wrap_up_judge"] is False
+
+
+def test_max_call_seconds_zero_means_unlimited_and_persists(tmp_path):
+    path = tmp_path / "number_profiles.json"
+    created = number_profiles.create_profile(
+        {
+            "number": "10086",
+            "scenario": "IVR",
+            "match_mode": "number",
+            "max_call_seconds": 0,
+        },
+        path=path,
+    )
+    assert created["max_call_seconds"] == 0
+    assert number_profiles.lookup_profile("10086", "", path=path)[
+        "max_call_seconds"
+    ] == 0
+
+
+@pytest.mark.parametrize("bad", [-1, 7201, "3600", 3.5, True])
+def test_max_call_seconds_rejects_out_of_range_and_wrong_types(bad, tmp_path):
+    with pytest.raises(
+        number_profiles.ProfileValidationError, match="max_call_seconds"
+    ):
+        number_profiles.create_profile(
+            {
+                "number": "10086",
+                "scenario": "IVR",
+                "match_mode": "number",
+                "max_call_seconds": bad,
+            },
+            path=tmp_path / "number_profiles.json",
+        )
+
+
+def test_wrap_up_judge_rejects_non_boolean(tmp_path):
+    with pytest.raises(
+        number_profiles.ProfileValidationError, match="wrap_up_judge"
+    ):
+        number_profiles.create_profile(
+            {
+                "number": "10086",
+                "scenario": "IVR",
+                "match_mode": "number",
+                "wrap_up_judge": "false",
+            },
+            path=tmp_path / "number_profiles.json",
+        )
+
+
+def test_invalid_max_call_seconds_in_json_falls_back_to_global(tmp_path):
+    """手改 JSON 塞了非法值：当未设置处理（用全局），绝不猜。"""
+    path = tmp_path / "number_profiles.json"
+    path.write_text(
+        json.dumps(
+            {"profiles": [{
+                "number": "10000", "scenario": "x",
+                "max_call_seconds": 99999, "wrap_up_judge": "yes",
+            }]},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    hit = number_profiles.lookup_profile("10000", "", path=path)
+    assert hit["max_call_seconds"] is None
+    # 非 False 的任何值都当 True（默认开裁判）——fail-safe 方向。
+    assert hit["wrap_up_judge"] is True
+
+
+def test_bundled_seed_long_queue_drill_profile():
+    """示例种子里的长排队演练条目（WIL-120 一期验收锚点）。"""
+    seed = number_profiles.bundled_seed_file()
+    data = json.loads(seed.read_text(encoding="utf-8"))
+    drill = [
+        item for item in data.get("profiles", [])
+        if isinstance(item, dict) and item.get("id") == "carrier-cs-long-queue"
+    ]
+    assert len(drill) == 1
+    assert drill[0]["max_call_seconds"] == 3600
+    assert drill[0]["wrap_up_judge"] is False
+    assert drill[0]["opening_mode"] == "wait"

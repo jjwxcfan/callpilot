@@ -707,6 +707,33 @@ def test_prompt_profile_applies_carrier_sms_verification_mode():
     assert session._result_verification_mode == "carrier_sms"
 
 
+def test_prompt_profile_applies_long_call_overrides():
+    """WIL-120 一期：profile 的 max_call_seconds / wrap_up_judge 进 session。"""
+    session = make_service(FakeModem()).session
+    session._prompt_gen_result = {
+        "ok": True,
+        "scenario": "长排队演练",
+        "max_call_seconds": 3600,
+        "wrap_up_judge": False,
+    }
+    assert session._apply_prompt_gen_result() == "长排队演练"
+    assert session._profile_max_call_seconds == 3600
+    assert session._profile_wrap_up_judge is False
+
+    # 动态生成结果无这两个键：回落默认（跟随全局 + 裁判开）。
+    session._prompt_gen_result = {"ok": True, "scenario": "普通外呼"}
+    session._apply_prompt_gen_result()
+    assert session._profile_max_call_seconds is None
+    assert session._profile_wrap_up_judge is True
+
+    # 布尔 True 伪装的 int（JSON 手改）不当作秒数。
+    session._prompt_gen_result = {
+        "ok": True, "scenario": "x", "max_call_seconds": True,
+    }
+    session._apply_prompt_gen_result()
+    assert session._profile_max_call_seconds is None
+
+
 # ---- P2-1 批量外呼：入队顺序拨打 + 白名单 + 状态查询 ----
 
 def test_batch_dial_dials_in_order(tmp_path, monkeypatch):

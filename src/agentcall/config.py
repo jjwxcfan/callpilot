@@ -364,6 +364,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("REPEAT_SUPPRESS_SIMILARITY", "复读抑制相似度阈值", "float", "0.9"),
     # 外呼硬时限（秒）：LLM 收尾裁判失灵/漏判时的最后防线，到点自动道别挂断；
     # 0 = 不限制。（正常收尾由 summarizer.judge_wrap_up 提前判定。）
+    # 长通话场景（客服排队）不改这里——用 number_profiles 的 max_call_seconds
+    # 按场景覆盖（WIL-120 一期），全局保持安全默认。
     ConfigSpec("OUTBOUND_MAX_SECONDS", "外呼最长时长（秒）", "int", "150"),
     # 来电缺失 NO CARRIER 且 CLCC 轮询也停活时的会话级最后防线。
     ConfigSpec("INBOUND_MAX_SECONDS", "来电最长时长（秒）", "int", "1800"),
@@ -707,6 +709,8 @@ _NUMERIC_RANGES: dict[str, tuple[float, float, bool]] = {
     "DTMF_TONE_MS": (0, 2000, True),          # >0 且 ≤2000ms
     "DTMF_TONE_AMPLITUDE": (0.0, 1.0, True),  # (0, 1]
     "INBOUND_MAX_SECONDS": (0, 86400, True),   # >0 且 ≤24h
+    # 0=不限时合法（number_profiles 的 max_call_seconds 可按场景覆盖，WIL-120）。
+    "OUTBOUND_MAX_SECONDS": (0, 86400, False),  # ≥0 且 ≤24h
 }
 
 

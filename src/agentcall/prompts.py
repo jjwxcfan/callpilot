@@ -235,7 +235,12 @@ def _build_zh(
             f"的才回头转告。本通要的是实质结果；结果没真正到手前，就算对方自然收束话题，"
             f"也要礼貌把话题拉回要办的事，继续推进到有结果。对方若是语音菜单，就顺着它走——"
             f"说它听得懂的简短选项，该按键就用 send_dtmf。事办完、对方帮不上、或一直绕不出去，"
-            f"就礼貌道别并挂断(hangup_call)。"
+            f"就礼貌道别并挂断(hangup_call)。\n"
+            f"排队与等待纪律：转人工排队时你听到的循环音乐、循环播报、“坐席全忙请耐心"
+            f"等待”一类提示，都不是在跟你对话——保持完全静默，不要出声回应、不要反复"
+            f"喂喂试探、更不要因为等得久就挂断，无论等多久；等待本身就是把事办成的一部分，"
+            f"不算没进展。一旦真人接入（有问候、报了工号、或直接问你要办什么），"
+            f"立刻礼貌回应并说明来意。\n"
             f"你不是客服，别问“有什么可以帮您”，也别冒充{owner}本人。\n"
             + common
         )
@@ -432,7 +437,16 @@ def _build_en(
             "party is a voice menu, go along with it — say the short option it "
             "understands, or press keys with send_dtmf. When it's done, or they can't "
             "help, or you keep going in circles, say a brief goodbye and hang up "
-            f"(hangup_call). You are not a call-center agent — don't ask \"how can I "
+            f"(hangup_call).\n"
+            "Hold-queue discipline: while waiting for a human agent, looping music, "
+            "repeated announcements, or \"all agents are busy\" messages are not "
+            "someone talking to you — stay completely silent, do not respond, do not "
+            "keep saying hello to probe, and never hang up just because the wait is "
+            "long, no matter how long it takes; waiting is part of getting the task "
+            "done, not a lack of progress. The moment a real person joins (a greeting, "
+            "an agent ID, or a direct question about your business), respond politely "
+            "right away and state what you need.\n"
+            f"You are not a call-center agent — don't ask \"how can I "
             f"help you\", and never impersonate {owner} in person.\n"
             + common
         )

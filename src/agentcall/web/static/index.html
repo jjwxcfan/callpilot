@@ -1010,6 +1010,19 @@
                     </label>
                   </div>
                 </div>
+                <div class="profile-topline">
+                  <div class="profile-field">
+                    <label for="profileMaxCallSeconds" class="tip" data-i18n="profile_max_call_seconds" data-i18n-tip="profile_max_call_seconds_tip"></label>
+                    <input id="profileMaxCallSeconds" type="number" min="0" max="7200" step="1" data-i18n-ph="profile_max_call_seconds_ph" />
+                  </div>
+                  <div class="profile-enabled-field">
+                    <span class="profile-switch-label tip" id="profileWrapUpJudgeLabel" data-i18n="profile_wrap_up_judge" data-i18n-tip="profile_wrap_up_judge_tip"></span>
+                    <label class="switch" for="profileWrapUpJudge">
+                      <input id="profileWrapUpJudge" type="checkbox" aria-labelledby="profileWrapUpJudgeLabel" />
+                      <span class="knob"></span>
+                    </label>
+                  </div>
+                </div>
                 <div class="profile-languages">
                   <fieldset class="profile-language">
                     <legend data-i18n="profile_lang_zh"></legend>
@@ -1289,6 +1302,10 @@ const I18N = {
     profile_label: "Dropdown label", profile_task: "Matching task", profile_scenario: "Scenario strategy", profile_opening: "First sentence",
     profile_opening_mode: "Opening mode", profile_opening_mode_say: "Say immediately (default)", profile_opening_mode_wait: "Wait for IVR menu", profile_dtmf_spoken_followup: "Recover spoken keypress",
     profile_result_verification: "Result verification", profile_result_verification_none: "Transcript only", profile_result_verification_carrier_sms: "Official carrier SMS",
+    profile_max_call_seconds: "Max call length (s)", profile_max_call_seconds_ph: "empty = global default",
+    profile_max_call_seconds_tip: "Per-scenario override of the global outbound time limit (default 150 s). 0 = unlimited, up to 7200. Long calls (30+ min support queues) are a scenario property — only open this up for presets that need it (WIL-120 phase 1).",
+    profile_wrap_up_judge: "Wrap-up judge",
+    profile_wrap_up_judge_tip: "The LLM judge that decides when an outbound call should wrap up. Turn OFF for long hold-queue scenarios — looping hold music gets misjudged as \"going in circles\" and the call is ended early. Phase 2 will replace this switch with hold-state freezing.",
     profile_save: "Save", profile_cancel: "Cancel", profile_duplicate: "Duplicate", profile_delete: "Delete",
     profile_saving: "Saving…", profile_saved: "Preset saved", profile_deleted: "Preset deleted",
     profile_need_number: "Enter a dialable phone number.", profile_need_scenario: "Add a scenario strategy in at least one language.",
@@ -1523,6 +1540,10 @@ const I18N = {
     profile_label: "下拉显示名称", profile_task: "匹配任务", profile_scenario: "场景策略", profile_opening: "第一句话",
     profile_opening_mode: "开场模式", profile_opening_mode_say: "直接说开场白（默认）", profile_opening_mode_wait: "等待 IVR 菜单播报", profile_dtmf_spoken_followup: "补发已口述按键",
     profile_result_verification: "结果校验", profile_result_verification_none: "仅通话听写", profile_result_verification_carrier_sms: "运营商官方短信",
+    profile_max_call_seconds: "时长上限（秒）", profile_max_call_seconds_ph: "留空=跟随全局",
+    profile_max_call_seconds_tip: "按场景覆盖全局外呼时长上限（默认 150 秒）。0=不限时，最大 7200。长通话（客服排队 30 分钟+）是场景属性——只给需要的预设放开（WIL-120 一期）。",
+    profile_wrap_up_judge: "收尾裁判",
+    profile_wrap_up_judge_tip: "判断外呼何时该收尾挂断的 LLM 裁判。长排队场景请关闭——循环等待音会被误判成「对话打转」而提前挂断。二期会换成 hold 状态冻结后收回此开关。",
     profile_save: "保存", profile_cancel: "取消", profile_duplicate: "复制", profile_delete: "删除",
     profile_saving: "保存中…", profile_saved: "预设已保存", profile_deleted: "预设已删除",
     profile_need_number: "请输入可以拨打的电话号码。", profile_need_scenario: "请至少填写一种语言的场景策略。",
@@ -1688,6 +1709,8 @@ function applyI18n() {
   document.documentElement.lang = LANG === "zh" ? "zh-CN" : "en";
   document.querySelectorAll("[data-i18n]").forEach((n) => { n.textContent = t(n.dataset.i18n); });
   document.querySelectorAll("[data-i18n-ph]").forEach((n) => { n.placeholder = t(n.dataset.i18nPh); });
+  // 悬浮详解通用化：data-i18n-tip 声明式接入 met-tipbox 单例（处理器挂在 document）。
+  document.querySelectorAll("[data-i18n-tip]").forEach((n) => { n.dataset.tip = t(n.dataset.i18nTip); });
   $("slogan").textContent = t("slogan");
   renderLangMenu();
   $("stateText").textContent = t("st_" + callStatus) !== "st_" + callStatus ? t("st_" + callStatus) : callStatus;
@@ -2061,6 +2084,7 @@ function blankManagedProfile() {
     id: "", enabled: true, number: "", match_mode: "exact",
     label: { ...blank }, task: { ...blank }, scenario: { ...blank }, opening: { ...blank },
     opening_mode: "say", dtmf_spoken_followup: false, result_verification: "none",
+    max_call_seconds: null, wrap_up_judge: true,
   };
 }
 
@@ -2177,6 +2201,10 @@ function openProfileEditor(profile) {
   $("profileResultVerification").value = (
     item.result_verification === "carrier_sms" ? "carrier_sms" : "none"
   );
+  $("profileMaxCallSeconds").value = (
+    Number.isInteger(item.max_call_seconds) ? String(item.max_call_seconds) : ""
+  );
+  $("profileWrapUpJudge").checked = item.wrap_up_judge !== false;
   $("profileDelete").hidden = !item.id;
   $("profileToast").className = "toast profile-toast";
   $("profileToast").textContent = "";
@@ -2205,6 +2233,9 @@ function readProfileForm() {
     opening_mode: $("profileOpeningMode").value,
     dtmf_spoken_followup: $("profileDtmfSpokenFollowup").checked,
     result_verification: $("profileResultVerification").value,
+    max_call_seconds: $("profileMaxCallSeconds").value.trim() === ""
+      ? null : Number($("profileMaxCallSeconds").value),
+    wrap_up_judge: $("profileWrapUpJudge").checked,
   };
 }
 
