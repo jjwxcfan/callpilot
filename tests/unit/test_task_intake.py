@@ -158,3 +158,21 @@ def test_intake_step_fail_closed_when_correction_also_fails(monkeypatch):
         [{"role": "user", "content": "x"}], owner="李明", lang="zh"
     )
     assert result["ok"] is False and result["ready"] is False
+
+
+def test_intake_step_passes_through_sanitized_options(monkeypatch):
+    """追问轮的 options 透传（≤4 个、去空白）；收口轮强制为空。"""
+    monkeypatch.setattr(task_intake, "text_backend_for_agent", lambda: "qwen")
+    monkeypatch.setattr(task_intake, "select_text_model", lambda *a: "m")
+
+    monkeypatch.setattr(task_intake, "call_text_model", lambda *a, **k: (
+        '{"reply": "打哪个号？", "options": ["611 客服", " 我提供号码 ", "", "a", "b", "c"],'
+        ' "ready": false, "draft": null}', None))
+    asking = intake_step([{"role": "user", "content": "打 ATT"}], owner="李明", lang="zh")
+    assert asking["options"] == ["611 客服", "我提供号码", "a", "b"]
+
+    monkeypatch.setattr(task_intake, "call_text_model", lambda *a, **k: (
+        '{"reply": "开始", "options": ["残留选项"], "ready": true, "draft": {'
+        '"number": "611", "task": "查流量"}}', None))
+    final = intake_step([{"role": "user", "content": "开始"}], owner="李明", lang="zh")
+    assert final["ready"] is True and final["options"] == []

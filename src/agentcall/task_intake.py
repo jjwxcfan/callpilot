@@ -61,11 +61,17 @@ _SYSTEM = {
         "作罢，缺着收口。\n"
         "追问方式：一次只问一两个最关键的缺口，别列问卷。**机主一旦表达开始的"
         "意思（「开始」「就这样」「够了」「打吧」等任何说法），本轮必须 ready=true"
-        "出草稿，缺什么留空——再追问任何问题都是错误**。机主说的约束类要求"
+        "出草稿，缺什么留空——再追问任何问题都是错误**。同样，你自己说出「开始/准备好了/马上安排」这类话"
+        "的那一轮，必须同时 ready=true 带上 draft——说要开始却不出草稿是错误。"
+        "机主说的约束类要求"
         "（如「别办理任何业务」「不要改套餐」）放进 blacklist，不要只写进 scenario。"
         "金额、期限等数字必须用机主原话，绝不替机主编造或取整。\n"
+        "问机主问题时，尽量在 options 里给 2-4 个最可能的候选答案（每个几个字，"
+        "可一键选择），机主也随时可以自己打字；开放性问题就不给 options。"
+        "选项要具体可选（『611 客服』『我提供号码』），不要『其他』这种废选项。\n"
         "每轮只输出严格合法的 JSON，无任何多余文字：\n"
-        '{{"reply": "对机主说的话", "ready": true/false, "draft": null 或 '
+        '{{"reply": "对机主说的话", "options": ["候选1", "候选2"] 或 [], '
+        '"ready": true/false, "draft": null 或 '
         '{{"number": "...", "task": "...", "label": "...", "scenario": "...", '
         '"task_package": {{"verification": {{...}}, "negotiation": {{...}}, '
         '"preauth": {{...}}, "blacklist": [...]}}}}}}\n'
@@ -101,12 +107,20 @@ _SYSTEM = {
         "questionnaires. **The moment the owner signals to start (\"go "
         "ahead\", \"that's enough\", \"just call\", any phrasing), this "
         "turn MUST return ready=true with the draft, leaving gaps empty — "
-        "asking anything further is an error.** Constraints the owner states "
+        "asking anything further is an error.** Likewise, any turn where YOU "
+        "announce starting (\"okay, starting now\") must itself carry "
+        "ready=true with the draft — announcing without a draft is an error. "
+        "Constraints the owner states "
         "(\"don't change anything on the account\") go into blacklist, not "
         "only into the scenario prose. Numbers (prices, terms) must be the "
         "owner's own words — never invent or round them.\n"
+        "When asking the owner a question, offer 2-4 likely answers in "
+        "`options` (a few words each, one-tap choices); the owner can always "
+        "type freely instead. Skip options for open-ended questions. Options "
+        "must be concrete choices, never filler like \"other\".\n"
         "Every turn output strictly valid JSON and nothing else:\n"
-        '{{"reply": "what you say to the owner", "ready": true/false, '
+        '{{"reply": "what you say to the owner", "options": ["choice1", '
+        '"choice2"] or [], "ready": true/false, '
         '"draft": null or {{"number": "...", "task": "...", "label": "...", '
         '"scenario": "...", "task_package": {{"verification": {{...}}, '
         '"negotiation": {{...}}, "preauth": {{...}}, "blacklist": [...]}}}}}}\n'
@@ -191,7 +205,8 @@ def intake_step(
             m if m["role"] == "user" else {
                 "role": "assistant",
                 "content": json.dumps(
-                    {"reply": m["content"], "ready": False, "draft": None},
+                    {"reply": m["content"], "options": [],
+                     "ready": False, "draft": None},
                     ensure_ascii=False,
                 ),
             }
@@ -213,6 +228,7 @@ def intake_step(
             return {
                 "ok": False,
                 "reply": _RETRY_REPLY[lang],
+                "options": [],
                 "ready": False,
                 "draft": None,
                 "error": error,
@@ -248,6 +264,7 @@ def intake_step(
             return {
                 "ok": False,
                 "reply": _RETRY_REPLY[lang],
+                "options": [],
                 "ready": False,
                 "draft": None,
                 "error": "unparseable_model_output",
@@ -255,10 +272,17 @@ def intake_step(
         draft = (
             _sanitize_draft(data.get("draft")) if data.get("ready") else None
         )
+        raw_options = data.get("options")
+        options = (
+            [str(o).strip()[:60] for o in raw_options if str(o).strip()][:4]
+            if isinstance(raw_options, list) and draft is None
+            else []
+        )
         # ready 但草稿不合格（号码非法等）→ 降级为未就绪，绝不放坏草稿过去。
         return {
             "ok": True,
             "reply": reply[:1000],
+            "options": options,
             "ready": draft is not None,
             "draft": draft,
             "error": None,
@@ -268,6 +292,7 @@ def intake_step(
         return {
             "ok": False,
             "reply": _RETRY_REPLY[lang],
+            "options": [],
             "ready": False,
             "draft": None,
             "error": f"{type(exc).__name__}: {exc}",
