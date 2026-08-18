@@ -19,8 +19,9 @@ push 授权等)放在 gitignored 的 `CLAUDE.local.md`,不入库。
 - **不写死本机信息**：真实姓名 / 号码只在本地 `.env` 与 gitignored 配置；测试用 李明 / Alex / 占位号。
 - **绝不提交**：`.env`、`dist/`、`build/signing/`、证书私钥、`.codex_dialog.md` 等会话产物、
   `data/number_profiles.json`（本地真实预设）。
-- **非平凡改动不直推 main**（2026-08-18 起）：每个 issue 开分支（用 Linear 生成的分支名）、
-  push 后开 PR、CI 绿即可 merge；直推 main 仅限文档/注释/种子数据级平凡改动。
+- **非平凡改动不直推 main**（2026-08-18 起）：按**一次可合并的交付**开分支——多期 issue
+  一期一条（Linear 生成的分支名加 `-phaseN` 后缀），单期 issue 一条即可；push 后开 PR、
+  CI 绿即可 merge；不留跨期长命分支。直推 main 仅限文档/注释/种子数据级平凡改动。
 - **交付级验证**：push 后回读 `git log origin/main -1`；服务改动重启 + 健康检查；通话链路
   改动真机拨测。测试全绿 ≠ 交付完成。
 
