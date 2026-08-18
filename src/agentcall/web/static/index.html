@@ -111,6 +111,8 @@
     max-height: 40vh; overflow-y: auto; white-space: pre-wrap;
   }
   .confirm-card .cc-acts { display: flex; gap: 10px; margin-top: 16px; }
+  /* display:flex 会压过 hidden 属性的 UA 样式——显式补回（2026-08-18 真机发现） */
+  .confirm-card .cc-acts[hidden] { display: none; }
   .confirm-card .cc-acts .btn { flex: 1; }
   .confirm-card .cc-note { font-size: 11px; color: var(--dim); margin-top: 10px; }
   /* 对话式建单（WIL-120 三期 b）：GPT 式聊天框 + 任务确认卡 */

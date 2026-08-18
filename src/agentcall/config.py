@@ -385,6 +385,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("RECORDING_RETENTION_DAYS", "录音保留天数", "int", "30"),
     ConfigSpec("SUMMARY_ENABLED", "通话摘要开关", "bool", "true"),
     ConfigSpec("SUMMARY_MODEL", "摘要模型", "str", ""),
+    # 对话建单模型（WIL-120 三期 b）：留空 = provider 强档默认（openai=gpt-4o）
+    ConfigSpec("INTAKE_MODEL", "对话建单模型", "str", ""),
     # 摘要 API 超时秒数（真机实测 15s 对长转写不够用），调试项不进面板。
     ConfigSpec("SUMMARY_TIMEOUT", "摘要超时（秒）", "float", "30",
                editable=False, hidden=True),

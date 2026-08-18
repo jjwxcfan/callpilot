@@ -94,3 +94,67 @@ def test_intake_step_fail_closed_on_garbage_and_error(monkeypatch):
 
     errored = _step(monkeypatch, None, error="超时")
     assert errored["ok"] is False and errored["ready"] is False
+
+
+def test_intake_step_wraps_history_assistant_turns_as_json(monkeypatch):
+    """历史 assistant 消息须包成 JSON 形态喂模型——防多轮后模仿裸文本跑偏。"""
+    captured = {}
+
+    def fake_call(messages, **kw):
+        captured["messages"] = messages
+        return '{"reply": "ok", "ready": false, "draft": null}', None
+
+    monkeypatch.setattr(task_intake, "call_text_model", fake_call)
+    monkeypatch.setattr(task_intake, "text_backend_for_agent", lambda: "qwen")
+    monkeypatch.setattr(task_intake, "select_text_model", lambda *a: "m")
+    intake_step(
+        [
+            {"role": "assistant", "content": "要打给谁？"},
+            {"role": "user", "content": "打 AT&T 问流量"},
+        ],
+        owner="李明", lang="zh",
+    )
+    sent = captured["messages"]
+    assistant_turns = [m for m in sent if m["role"] == "assistant"]
+    assert assistant_turns, "历史里应有 assistant 轮"
+    import json as _json
+    parsed = _json.loads(assistant_turns[0]["content"])
+    assert parsed["reply"] == "要打给谁？" and parsed["ready"] is False
+    # user 轮保持原文
+    assert {"role": "user", "content": "打 AT&T 问流量"} in sent
+
+
+def test_intake_step_auto_corrects_non_json_once(monkeypatch):
+    """第一次输出跑偏成纯文本 → 自动纠偏重试；第二次合法则正常返回。"""
+    outputs = iter([
+        ("好的，我帮您问一下移动流量。", None),  # 跑偏（真机复现形态）
+        ('{"reply": "请问账户户名是？", "ready": false, "draft": null}', None),
+    ])
+    calls = {"n": 0}
+
+    def fake_call(messages, **kw):
+        calls["n"] += 1
+        return next(outputs)
+
+    monkeypatch.setattr(task_intake, "call_text_model", fake_call)
+    monkeypatch.setattr(task_intake, "text_backend_for_agent", lambda: "qwen")
+    monkeypatch.setattr(task_intake, "select_text_model", lambda *a: "m")
+    result = intake_step(
+        [{"role": "user", "content": "打 AT&T 问流量"}], owner="李明", lang="zh"
+    )
+    assert calls["n"] == 2
+    assert result["ok"] is True
+    assert result["reply"] == "请问账户户名是？"
+
+
+def test_intake_step_fail_closed_when_correction_also_fails(monkeypatch):
+    outputs = iter([("裸文本一", None), ("裸文本二", None)])
+    monkeypatch.setattr(
+        task_intake, "call_text_model", lambda *a, **k: next(outputs)
+    )
+    monkeypatch.setattr(task_intake, "text_backend_for_agent", lambda: "qwen")
+    monkeypatch.setattr(task_intake, "select_text_model", lambda *a: "m")
+    result = intake_step(
+        [{"role": "user", "content": "x"}], owner="李明", lang="zh"
+    )
+    assert result["ok"] is False and result["ready"] is False
