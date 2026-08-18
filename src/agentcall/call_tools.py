@@ -11,10 +11,12 @@ from __future__ import annotations
 import logging
 import re
 import time
+import uuid
 from typing import TYPE_CHECKING, Callable
 
 from . import config
 from .agents.tools import (
+    ASK_OWNER_SPEC,
     HANGUP_SPEC,
     QUERY_CODE_SPEC,
     SEND_DTMF_SPEC,
@@ -136,6 +138,10 @@ class CallTools:
                 self._timed("query_verification_code", self._query_code),
             )
         registry.register(SEND_DTMF_SPEC, self._timed("send_dtmf", self._send_dtmf))
+        if self._direction == "outbound":
+            # 机主确认环（WIL-120 二期）：外呼专用。inbound 的对应机制是
+            # takeover（把电话整个交给机主），语义不同，不共用。
+            registry.register(ASK_OWNER_SPEC, self._timed("ask_owner", self._ask_owner))
         return registry
 
     def _timed(
@@ -428,6 +434,73 @@ class CallTools:
 
     def _send_dtmf_via_modem(self, digits: str) -> tuple[bool, str]:
         return self._modem.send_dtmf(digits), "qvts"
+
+    def _ask_owner(self, args: dict) -> dict:
+        """工具处理：把决定推给机主确认，阻塞等答复（WIL-120 二期 Path A）。
+
+        运行在工具线程（openai: to_thread / qwen: worker 线程），阻塞等待
+        不影响音频主循环；模型在等 function_call_output 期间不说话——所以
+        提示词要求 AI **调用前**先对通话对方说「稍等，我确认一下」。
+        超时=拒绝（fail-closed）：机主没看到 ≠ 同意。
+        """
+        stale = self._stale_effect_result("ask_owner", args)
+        if stale is not None:
+            return stale
+        question = str(args.get("question") or "").strip()
+        if not question:
+            return {"success": False, "message": "question 不能为空"}
+        question = question[:500]
+        timeout = float(config.get_int("OWNER_CONFIRM_TIMEOUT_SECONDS"))
+        confirm_id = uuid.uuid4().hex
+        if self._hub is None:
+            return {"success": False, "message": "确认通道不可用"}
+        self._hub.publish(
+            {
+                "type": "owner_confirm_request",
+                "id": confirm_id,
+                "question": question,
+                "timeout_s": timeout,
+            }
+        )
+        response = self._hub.wait_for_event(
+            lambda e: (
+                e.get("type") == "owner_confirm_response"
+                and e.get("id") == confirm_id
+            ),
+            timeout=timeout,
+        )
+        if response is None:
+            decision = "timeout"
+        else:
+            decision = (
+                "approved"
+                if response.get("choice") == "approve"
+                else "declined"
+            )
+        # 关闭事件：无论怎么结束都发，UI 据此收卡（含另一个标签页里超时的卡）。
+        self._hub.publish(
+            {
+                "type": "owner_confirm_closed",
+                "id": confirm_id,
+                "decision": decision,
+            }
+        )
+        # 审计不含 question 原文（可能带机主账户细节，同 WIL-95 §7 口径）。
+        self._audit_tool(
+            "ask_owner",
+            args={"question_chars": len(question)},
+            result={"success": True, "decision": decision},
+        )
+        messages = {
+            "approved": "机主同意了",
+            "declined": "机主不同意",
+            "timeout": "机主暂时没回应，按不同意处理；请对方把方案记录在案",
+        }
+        return {
+            "success": True,
+            "decision": decision,
+            "message": messages[decision],
+        }
 
     def _query_code(self, args: dict) -> dict:
         """工具处理：从最近收到的短信里查验证码。"""

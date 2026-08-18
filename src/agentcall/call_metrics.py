@@ -33,7 +33,9 @@ from typing import Any
 # v3（2026-08-17）：新增 answered_to_first_audio_ms（文档 A 组「接起→首字」，
 #   到达口径）/ takeover_latency_ms / abnormal_drop / pcm_enable_failed +
 #   pcm_degraded（文档 D 组异常掉话的蜂窝指纹：CPCMREG 启用行为，WIL-95 第二期收尾）。
-SCHEMA_VERSION = 3
+# v4（2026-08-18）：新增 hold_seconds / hold_periods（WIL-120 二期：收尾裁判
+#   判 on_hold 的 hold_started/hold_ended 事件聚合；文档 G 组「排队等待检测」）。
+SCHEMA_VERSION = 4
 
 # 逐轮时延指标：events.jsonl 里 latency 事件的 stage → metrics.json 字段名。
 # 各 stage 的精确定义（2026-08-14）：
@@ -162,6 +164,10 @@ def build_call_metrics(
     takeover_requested_ts: float | None = None
     takeover_committed_ts: float | None = None
     pcm_enable: dict[str, Any] | None = None
+    hold_open_ts: float | None = None
+    hold_seconds_total = 0.0
+    hold_periods = 0
+    wrap_up_judge_on: bool | None = None
 
     for event in events:
         etype = event.get("type")
@@ -243,6 +249,21 @@ def build_call_metrics(
                 "attempts": event.get("attempts"),
                 "degraded": bool(event.get("degraded")),
             }
+        elif etype == "call_limits":
+            value = event.get("wrap_up_judge")
+            if isinstance(value, bool):
+                wrap_up_judge_on = value
+        elif etype == "hold_started":
+            if hold_open_ts is None and isinstance(ts, (int, float)):
+                hold_open_ts = float(ts)
+        elif etype == "hold_ended":
+            hold_periods += 1
+            seconds = event.get("seconds")
+            if isinstance(seconds, (int, float)):
+                hold_seconds_total += max(0.0, float(seconds))
+            elif hold_open_ts is not None and isinstance(ts, (int, float)):
+                hold_seconds_total += max(0.0, float(ts) - hold_open_ts)
+            hold_open_ts = None
         elif etype == "call_finished" and isinstance(ts, (int, float)):
             finished_ts = float(ts)
 
@@ -330,6 +351,24 @@ def build_call_metrics(
     if pcm_enable is None:
         unavailable["pcm_enable"] = "no_pcm_enable_event"
 
+    # hold_seconds（v4）：通话结束仍未退出 hold（挂在排队里被硬时限收尾）时，
+    # 未闭合区间按 call_finished 时刻收口——不然最惨的排队一秒都记不上。
+    if hold_open_ts is not None:
+        close_ts = finished_ts if finished_ts is not None else last_activity_ts
+        if close_ts is not None and close_ts > hold_open_ts:
+            hold_seconds_total += close_ts - hold_open_ts
+            hold_periods += 1
+    hold_seconds: float | None = None
+    if direction != "outbound":
+        unavailable["hold_seconds"] = "outbound_only"
+    elif wrap_up_judge_on is False:
+        # 裁判被 profile 显式关闭 = hold 检测不在场，0 会被读成「没排过队」。
+        unavailable["hold_seconds"] = "hold_detection_disabled"
+    elif wrap_up_judge_on is None:
+        unavailable["hold_seconds"] = "no_call_limits_event"
+    else:
+        hold_seconds = round(hold_seconds_total, 1)
+
     termination = _derive_termination(
         status,
         takeover=takeover,
@@ -367,6 +406,8 @@ def build_call_metrics(
         "has_task_goal": has_task_goal,
         # 非预期断线（媒体死/错误终止）；文档 D 组要求的直方图在汇总层按时长出。
         "abnormal_drop": termination["kind"] in ("dead_media", "error"),
+        "hold_seconds": hold_seconds,
+        "hold_periods": hold_periods if hold_seconds is not None else None,
         "pcm_enable_failed": None if pcm_enable is None else not pcm_enable["ok"],
         "pcm_degraded": None if pcm_enable is None else pcm_enable["degraded"],
         "pcm_enable_attempts": None if pcm_enable is None else pcm_enable["attempts"],

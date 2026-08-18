@@ -1595,3 +1595,33 @@ def test_meta_exposes_unknown_sim_block():
 
     sim = api(app, fn)["sim"]
     assert sim["present"] is False and sim["carrier"] == "未知"
+
+
+# ---- WIL-120 二期：/api/call/owner_confirm ----
+
+
+def test_owner_confirm_publishes_response_event():
+    service = FakeService()
+    service.hub = FakeHub()
+    app = make_app(service)
+
+    async def fn(client):
+        good = await client.post(
+            "/api/call/owner_confirm",
+            json={"id": "a" * 32, "choice": "approve"},
+        )
+        bad_id = await client.post(
+            "/api/call/owner_confirm",
+            json={"id": "not-hex", "choice": "approve"},
+        )
+        bad_choice = await client.post(
+            "/api/call/owner_confirm",
+            json={"id": "a" * 32, "choice": "maybe"},
+        )
+        return good.status, bad_id.status, bad_choice.status
+
+    good, bad_id, bad_choice = api(app, fn)
+    assert good == 200 and bad_id == 400 and bad_choice == 400
+    assert service.hub.events == [
+        {"type": "owner_confirm_response", "id": "a" * 32, "choice": "approve"}
+    ]

@@ -242,7 +242,7 @@
       },
       "opening_mode": "wait",
       "max_call_seconds": 3600,
-      "wrap_up_judge": false,
+      "wrap_up_judge": true,
       "opening": {
         "zh": "你好，我想咨询一下我这边套餐的情况。",
         "en": "Hi, I'd like to ask about the plan on my account."

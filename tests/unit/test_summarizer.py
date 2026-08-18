@@ -304,6 +304,28 @@ def test_judge_wrap_up_and_continue_decisions(monkeypatch):
     assert judge_wrap_up(_JUDGE_TR, "查流量")["decision"] == "continue"
 
 
+def test_judge_on_hold_decision_recognized(monkeypatch):
+    """WIL-120 二期：排队等待是第三态——既不收尾也不算打转。"""
+    from agentcall.summarizer import judge_wrap_up
+
+    monkeypatch.setenv("SUMMARY_MODEL", "qwen-test")
+    monkeypatch.setattr(
+        dashscope.Generation, "call",
+        staticmethod(lambda **kw: make_response(
+            '{"decision":"on_hold","reason":"循环等待音"}'
+        )),
+    )
+    r = judge_wrap_up(_JUDGE_TR, "查流量")
+    assert r["decision"] == "on_hold" and r["ok"] is True
+
+    # 未知判定值仍回落 continue（保守）。
+    monkeypatch.setattr(
+        dashscope.Generation, "call",
+        staticmethod(lambda **kw: make_response('{"decision":"maybe","reason":"?"}')),
+    )
+    assert judge_wrap_up(_JUDGE_TR, "查流量")["decision"] == "continue"
+
+
 def test_judge_wrap_up_uses_openai_backend_and_degrades_on_401(monkeypatch):
     from agentcall.summarizer import judge_wrap_up
 

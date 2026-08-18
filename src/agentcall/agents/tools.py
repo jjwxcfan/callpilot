@@ -103,6 +103,33 @@ QUERY_CODE_SPEC: dict[str, Any] = {
 }
 
 
+ASK_OWNER_SPEC: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "ask_owner",
+        "description": (
+            "把一个需要机主拿主意的决定推送给机主确认，等机主答复（约一分钟）。"
+            "仅在对方给出的方案/报价超出你被授权的范围、或事情确实必须机主本人"
+            "决定时调用；调用前先对通话对方说明「稍等，我跟机主确认一下」。"
+            "question 里把要决定的事说完整（方案内容、价格、期限等关键数字），"
+            "机主看到的就是这段文字。返回机主的决定：approved（同意）、"
+            "declined（不同意）或 timeout（没回应——按不同意处理，并请对方"
+            "把方案记录在案以便后续跟进）。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "要机主决定的事项，含关键数字与条款，一段话说完整。",
+                }
+            },
+            "required": ["question"],
+        },
+    },
+}
+
+
 REQUEST_OWNER_TAKEOVER_SPEC: dict[str, Any] = {
     "type": "function",
     "function": {
@@ -127,6 +154,8 @@ TERMINAL_TOOLS: frozenset[str] = frozenset({"hangup_call"})
 SILENT_AFTER_TOOLS: frozenset[str] = frozenset(
     {"send_dtmf", "request_owner_takeover"}
 )
+# ask_owner 不进 SILENT_AFTER_TOOLS：拿到机主决定后模型要立刻把结果转达给
+# 通话对方（接受报价/婉拒），沉默反而失礼。
 _DTMF_LOG_MODES: frozenset[str] = frozenset(
     {"inband", "qvts", "both", "unknown"}
 )
@@ -181,6 +210,21 @@ _EN_TEXT: dict[tuple[str, str | None], str] = {
     ),
     ("request_owner_takeover", None): (
         "Hand the live call over to the owner's phone."
+    ),
+    ("ask_owner", None): (
+        "Push a decision to the owner and wait (about a minute) for their "
+        "answer. Call it only when an offer or decision exceeds what you are "
+        "authorized to accept, or truly needs the owner personally; tell the "
+        "other party \"one moment, let me check with the account holder\" "
+        "BEFORE calling. Put the full decision in `question` (plan, price, "
+        "term — the key numbers); that text is exactly what the owner sees. "
+        "Returns the owner's decision: approved, declined, or timeout (treat "
+        "timeout as declined and ask the rep to note the offer on the account "
+        "for follow-up)."
+    ),
+    ("ask_owner", "question"): (
+        "The decision for the owner, complete in one passage with the key "
+        "numbers and terms."
     ),
 }
 

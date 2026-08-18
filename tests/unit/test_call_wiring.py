@@ -1814,3 +1814,35 @@ def test_bounded_reconnect_reports_error(tmp_path, monkeypatch, caplog):
     with caplog.at_level(_logging.WARNING):
         assert service._reconnect_modem_bounded() is False
     assert "重建连接失败" in caplog.text
+
+
+# ---- WIL-120 二期：hold 状态机（收尾裁判 on_hold 驱动） ----
+
+
+def test_wrap_up_judge_on_hold_transitions(monkeypatch):
+    """on_hold 进入、continue/wrap_up 退出；失败结果不动状态；hold 期间复读卡死豁免。"""
+    session = make_service(FakeModem()).session
+
+    def run_judge(result):
+        monkeypatch.setattr(
+            "agentcall.call_agent.judge_wrap_up", lambda *a, **k: result
+        )
+        asyncio.run(session._run_wrap_up_judge([], "查流量"))
+
+    run_judge({"ok": True, "decision": "on_hold", "reason": "循环等待音"})
+    assert session._on_hold is True
+
+    # hold 期间复读抑制的「卡死收尾」被豁免（等待音循环不是会话卡死）。
+    session._request_repeat_stuck_wrap_up("重复播报")
+    assert session._wrap_up_requested is False
+
+    # 裁判失败（ok=False）不把排队踢回普通计时。
+    run_judge({"ok": False, "decision": "continue", "reason": "timeout"})
+    assert session._on_hold is True
+
+    run_judge({"ok": True, "decision": "continue", "reason": "真人接入"})
+    assert session._on_hold is False
+
+    # 非 hold 状态下复读卡死收尾照常生效。
+    session._request_repeat_stuck_wrap_up("复读卡死")
+    assert session._wrap_up_requested is True

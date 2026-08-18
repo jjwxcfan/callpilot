@@ -309,6 +309,7 @@ def build_app(
         "/api/remote_dialer/devices/{device_id}", _remote_dialer_device_revoke
     )
     app.router.add_post("/api/call/batch_dial", _batch_dial)
+    app.router.add_post("/api/call/owner_confirm", _owner_confirm)
     app.router.add_get("/api/call/queue", _queue_status)
     app.router.add_get("/api/number_profiles", _number_profiles)
     app.router.add_get("/api/number_profiles/manage", _number_profiles_manage)
@@ -809,6 +810,24 @@ async def _remote_cloud_enroll(request: web.Request) -> web.Response:
         {"ok": True, "edge_id": stored.edge_id},
         headers={"Cache-Control": "no-store"},
     )
+
+
+async def _owner_confirm(request: web.Request) -> web.Response:
+    """机主确认卡答复（WIL-120 二期）：把选择发回事件流，ask_owner 工具在等它。"""
+    service = require_service(request)
+    data = await read_json(request)
+    confirm_id = data.get("id")
+    choice = data.get("choice")
+    if not isinstance(confirm_id, str) or not re.fullmatch(r"[0-9a-f]{32}", confirm_id):
+        return web.json_response({"ok": False, "error": "id 格式不合法"}, status=400)
+    if choice not in ("approve", "decline"):
+        return web.json_response(
+            {"ok": False, "error": "choice 只能是 approve 或 decline"}, status=400
+        )
+    service.hub.publish(
+        {"type": "owner_confirm_response", "id": confirm_id, "choice": choice}
+    )
+    return web.json_response({"ok": True})
 
 
 async def _batch_dial(request: web.Request) -> web.Response:

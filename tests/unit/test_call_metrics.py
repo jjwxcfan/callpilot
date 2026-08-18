@@ -315,6 +315,57 @@ def test_pcm_enable_event_rollup():
     assert absent["unavailable"]["pcm_enable"] == "no_pcm_enable_event"
 
 
+# ---- v4 新增：排队等待（hold） ----
+
+
+def test_hold_seconds_aggregated_from_events():
+    events = [
+        {"type": "call_limits", "ts": 1.0, "outbound_max_seconds": 3600.0,
+         "wrap_up_judge": True},
+        {"type": "hold_started", "ts": 10.0},
+        {"type": "hold_ended", "ts": 130.0, "seconds": 120.0},
+        {"type": "hold_started", "ts": 200.0},
+        {"type": "hold_ended", "ts": 230.0, "seconds": 30.0},
+    ]
+    metrics = _build(events)
+    assert metrics["hold_seconds"] == 150.0
+    assert metrics["hold_periods"] == 2
+    assert "hold_seconds" not in metrics["unavailable"]
+
+
+def test_hold_open_interval_closes_at_call_finished():
+    """挂在排队里被硬时限收尾：未闭合区间按 call_finished 收口，不能丢。"""
+    events = [
+        {"type": "call_limits", "ts": 1.0, "wrap_up_judge": True},
+        {"type": "hold_started", "ts": 100.0},
+        {"type": "call_finished", "ts": 400.0, "status": "completed"},
+    ]
+    metrics = _build(events)
+    assert metrics["hold_seconds"] == 300.0
+    assert metrics["hold_periods"] == 1
+
+
+def test_hold_zero_is_valid_only_when_detection_ran():
+    # 裁判开着、没排过队：0 是有效读数。
+    ran = _build([
+        {"type": "call_limits", "ts": 1.0, "wrap_up_judge": True},
+    ])
+    assert ran["hold_seconds"] == 0.0
+    # 裁判被 profile 关掉：检测不在场，记 null + 原因，绝不记 0。
+    off = _build([
+        {"type": "call_limits", "ts": 1.0, "wrap_up_judge": False},
+    ])
+    assert off["hold_seconds"] is None
+    assert off["unavailable"]["hold_seconds"] == "hold_detection_disabled"
+    # 老事件流（无 call_limits）：无从判断，同样 null。
+    legacy = _build([])
+    assert legacy["hold_seconds"] is None
+    assert legacy["unavailable"]["hold_seconds"] == "no_call_limits_event"
+    # 来电：hold 检测是外呼专属。
+    inbound = _build([], direction="inbound")
+    assert inbound["unavailable"]["hold_seconds"] == "outbound_only"
+
+
 # ---- finish 落盘 ----
 
 

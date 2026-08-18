@@ -81,6 +81,38 @@
     animation: breathe 1.5s ease-in-out infinite;
   }
   .state-chip.ended { border-color: rgba(255, 69, 58, .4); color: var(--err); }
+  /* 排队等待徽章（WIL-120 二期）：hold 事件驱动，mm:ss 前端本地计时 */
+  .hold-badge {
+    display: none; align-items: center; gap: 6px; margin-left: 8px;
+    padding: 3px 11px; border-radius: 999px; font-size: 12px;
+    font-family: var(--mono); color: var(--warn);
+    background: var(--warn-dim); border: 1px solid rgba(255, 214, 10, .4);
+  }
+  .hold-badge.show { display: inline-flex; }
+  /* 机主确认卡（WIL-120 二期 Path A）：fixed 覆层，60s 倒计时，超时=拒绝 */
+  .confirm-overlay {
+    position: fixed; inset: 0; z-index: 300; display: none;
+    align-items: center; justify-content: center;
+    background: rgba(5, 8, 14, .66); backdrop-filter: blur(6px);
+  }
+  .confirm-overlay.show { display: flex; }
+  .confirm-card {
+    width: min(92vw, 460px); border-radius: 20px; padding: 22px;
+    background: var(--surface-strong); border: 1px solid var(--border-strong);
+    box-shadow: 0 24px 64px rgba(0, 0, 0, .6);
+  }
+  .confirm-card h3 { font-size: 15px; margin-bottom: 4px; }
+  .confirm-card .cc-count {
+    font-family: var(--mono); font-size: 12px; color: var(--warn); margin-bottom: 10px;
+  }
+  .confirm-card .cc-question {
+    font-size: 14px; line-height: 1.65; padding: 12px 14px; border-radius: 12px;
+    background: var(--well); border: 1px solid var(--border);
+    max-height: 40vh; overflow-y: auto; white-space: pre-wrap;
+  }
+  .confirm-card .cc-acts { display: flex; gap: 10px; margin-top: 16px; }
+  .confirm-card .cc-acts .btn { flex: 1; }
+  .confirm-card .cc-note { font-size: 11px; color: var(--dim); margin-top: 10px; }
   .state-chip.ended .sdot { background: var(--err); }
   .state-chip .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
   .recording-badge {
@@ -797,6 +829,7 @@
       <span class="sdot"></span><span id="stateText">待命</span><span class="num" id="stateNum"></span>
       <span class="recording-badge" id="recordingBadge">REC</span>
     </span>
+    <span class="hold-badge" id="holdBadge">☕ <span data-i18n="hold_badge"></span> <span id="holdTimer">0:00</span></span>
     <div class="quick-acts" id="quickActs">
       <button class="btn sm ghost" id="keypadBtn">⌗ <span data-i18n="keypad"></span></button>
       <button class="btn sm danger" id="hangupBtn" data-i18n="hangup"></button>
@@ -1367,6 +1400,8 @@ const I18N = {
     met_prof_duration: "Call duration (s)",
     met_tip_duration: "Whole-call duration in seconds. The distribution is a rough proxy for dialog structure (L1 single-turn vs L2 multi-turn); a cluster of short drops hints at systematic line failures (doc D asks for exactly this histogram).",
     met_prof_turns: "Peer turns (count)",
+    met_prof_hold: "Hold time (s)",
+    met_tip_hold: "Seconds spent in a hold queue, as judged by the hold-aware wrap-up judge (on_hold verdict). Only measured on outbound calls with the judge enabled; doc group G 'queue-wait detection'.",
     met_tip_turns: "How many turns the other party spoke. Together with duration, a rough proxy for the scenario-matrix dialog-structure dimension until real scenario tags land.",
     met_term_title: "How calls ended (kind · cause)",
     met_hdr_kind: "Kind", met_hdr_reason: "Cause", met_hdr_count: "calls",
@@ -1399,6 +1434,12 @@ const I18N = {
     met_pill_known: "known caller", met_tip_known: "Calls where the caller was recognized as a known contact (affects greeting and strategy).",
     met_tip_combo: "The provider / turn-detection / barge-in configuration these calls ran with. Different configs are counted separately so their numbers never blend.",
     met_pill_fallback: "self-echo fallback", met_tip_fallback: "Calls where suspected self-echo (downlink audio re-captured as uplink) triggered the half-duplex fallback.",
+    hold_badge: "On hold",
+    confirm_title: "The assistant needs your decision",
+    confirm_countdown: "Auto-decline in {s}s",
+    confirm_approve: "Approve", confirm_decline: "Decline", confirm_me: "Let me talk",
+    confirm_me_tip: "Joins you into the live call via 3-way calling — coming in WIL-120 phase 4 (needs the AT+CHLD probe on real hardware first).",
+    confirm_note: "No response counts as decline: the assistant will politely pass and ask the rep to note the offer on the account.",
     hist_title: "Call History", hist_sub: "Click to expand timeline", empty_history: "No call records",
     hist_clear: "Clear all", hist_clear_title: "Clear all call history?",
     hist_clear_msg: "Finished call records and recordings will be deleted. Active calls are kept.",
@@ -1605,6 +1646,8 @@ const I18N = {
     met_prof_duration: "通话时长（秒）",
     met_tip_duration: "整通时长（秒）。分布是对话结构（L1 单轮 vs L2 多轮）的粗代理；短时长扎堆提示系统性掉线（文档 D 组要求的正是这张直方图）。",
     met_prof_turns: "对方轮次（次）",
+    met_prof_hold: "排队等待（秒）",
+    met_tip_hold: "由 hold-aware 收尾裁判（on_hold 判定）测得的排队等待秒数。仅外呼且裁判开启时可测；对应文档 G 组「排队等待检测」。",
     met_tip_turns: "对方说话的轮数。与时长一起，在场景标签落地前充当场景矩阵「对话结构」维度的粗代理。",
     met_term_title: "通话怎么收场（方式 · 起因）",
     met_hdr_kind: "方式", met_hdr_reason: "起因", met_hdr_count: "通数",
@@ -1637,6 +1680,12 @@ const I18N = {
     met_pill_known: "熟人", met_tip_known: "来电被识别为通讯录熟人的通数（影响开场白与策略）。",
     met_tip_combo: "该批通话运行时的 provider / 判停 / barge-in 配置组合。不同配置分开统计，数字绝不混平均。",
     met_pill_fallback: "自激兜底", met_tip_fallback: "疑似自激（下行音频被回采成上行）触发半双工兜底的通数。",
+    hold_badge: "排队等待",
+    confirm_title: "AI 需要你拿主意",
+    confirm_countdown: "{s} 秒后自动按「不同意」处理",
+    confirm_approve: "同意", confirm_decline: "不同意", confirm_me: "我来说",
+    confirm_me_tip: "通过三方通话把你并入当前通话——WIL-120 四期上线（先要真机 AT+CHLD 探针确认支持）。",
+    confirm_note: "超时不回应 = 不同意：AI 会礼貌回绝，并请对方把方案记录在案。",
     hist_title: "通话历史", hist_sub: "点击展开事件时间线", empty_history: "暂无通话记录",
     hist_clear: "清除全部", hist_clear_title: "清除全部通话历史？",
     hist_clear_msg: "已结束的通话记录和录音会被删除，进行中的通话会保留。",
@@ -1946,7 +1995,79 @@ function handleEvent(ev) {
     addSms(ev);
   } else if (ev.type === "call_summary") {
     loadHistory(); loadRecent();
+  } else if (ev.type === "hold") {
+    setHoldBadge(!!ev.active);
+  } else if (ev.type === "owner_confirm_request") {
+    showConfirmCard(ev);
+  } else if (ev.type === "owner_confirm_closed") {
+    hideConfirmCard(ev.id);
   }
+}
+
+/* ========= 排队徽章 + 机主确认卡（WIL-120 二期） ========= */
+let holdTimerId = null, holdStartedAt = 0;
+function setHoldBadge(active) {
+  const badge = $("holdBadge");
+  if (active) {
+    holdStartedAt = Date.now();
+    badge.classList.add("show");
+    if (holdTimerId) clearInterval(holdTimerId);
+    holdTimerId = setInterval(() => {
+      const sec = Math.floor((Date.now() - holdStartedAt) / 1000);
+      $("holdTimer").textContent = `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
+    }, 1000);
+    $("holdTimer").textContent = "0:00";
+  } else {
+    badge.classList.remove("show");
+    if (holdTimerId) { clearInterval(holdTimerId); holdTimerId = null; }
+  }
+}
+
+let confirmCardState = null;  // { id, deadline, timerId, overlay }
+function hideConfirmCard(id) {
+  if (!confirmCardState) return;
+  if (id && confirmCardState.id !== id) return;
+  clearInterval(confirmCardState.timerId);
+  confirmCardState.overlay.remove();
+  confirmCardState = null;
+}
+async function answerConfirmCard(choice) {
+  if (!confirmCardState) return;
+  const id = confirmCardState.id;
+  try {
+    await postJson("/api/call/owner_confirm", { id, choice });
+  } catch (err) { console.warn("[confirm] 提交失败", err); }
+  hideConfirmCard(id);
+}
+function showConfirmCard(ev) {
+  hideConfirmCard();  // 同屏只留最新一张（工具层同时只会有一个在等）
+  const overlay = el("div", "confirm-overlay show");
+  const card = el("div", "confirm-card");
+  card.appendChild(el("h3", null, t("confirm_title")));
+  const count = el("div", "cc-count");
+  card.appendChild(count);
+  card.appendChild(el("div", "cc-question", String(ev.question || "")));
+  const acts = el("div", "cc-acts");
+  const approveBtn = el("button", "btn primary", t("confirm_approve"));
+  approveBtn.addEventListener("click", () => answerConfirmCard("approve"));
+  const declineBtn = el("button", "btn danger", t("confirm_decline"));
+  declineBtn.addEventListener("click", () => answerConfirmCard("decline"));
+  const meBtn = el("button", "btn ghost", t("confirm_me"));
+  meBtn.disabled = true;
+  metTip(meBtn, t("confirm_me_tip"));
+  acts.appendChild(approveBtn); acts.appendChild(declineBtn); acts.appendChild(meBtn);
+  card.appendChild(acts);
+  card.appendChild(el("div", "cc-note", t("confirm_note")));
+  overlay.appendChild(card);
+  document.body.appendChild(overlay);
+  const deadline = Date.now() + Number(ev.timeout_s || 60) * 1000;
+  const tick = () => {
+    const left = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+    count.textContent = metFmt("confirm_countdown", { s: left });
+    if (left <= 0) hideConfirmCard(ev.id);  // 超时后端自会按拒绝处理，前端收卡即可
+  };
+  tick();
+  confirmCardState = { id: ev.id, deadline, timerId: setInterval(tick, 500), overlay };
 }
 let ws;
 function connect() {
@@ -3087,6 +3208,7 @@ function renderMetricsSummary(root, s) {
       root.appendChild(metStatTable("met_hdr_profile", [
         { label: t("met_prof_duration"), tip: t("met_tip_duration"), stats: g.duration_s },
         { label: t("met_prof_turns"), tip: t("met_tip_turns"), stats: g.peer_turns },
+        { label: t("met_prof_hold"), tip: t("met_tip_hold"), stats: g.hold_seconds },
       ]));
     }
     if (Object.keys(d.termination_reasons || {}).length) {
