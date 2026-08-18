@@ -126,6 +126,8 @@
   .intake-msg.assistant { align-self: flex-start; background: var(--well);
     border: 1px solid var(--border); }
   .intake-msg.pending { color: var(--dim); font-style: italic; }
+  .preset-row { display: flex; gap: 8px; align-items: center; }
+  .preset-row .preset-select { flex: 1; min-width: 0; }
   .intake-options { display: flex; flex-wrap: wrap; gap: 8px; align-self: flex-start; }
   .intake-opt { background: var(--blue-dim); border: 1px solid rgba(10, 132, 255, .45);
     border-radius: 999px; padding: 6px 14px; font-size: 13px; color: var(--text);
@@ -892,7 +894,10 @@
             <div class="dial-col">
               <div class="col-label" data-i18n="dial_label"></div>
               <div class="col-label preset-label" data-i18n="preset_label"></div>
-              <select id="dialPreset" class="preset-select"></select>
+              <div class="preset-row">
+                <select id="dialPreset" class="preset-select"></select>
+                <button class="btn sm danger" id="dialPresetDelete" type="button" hidden data-i18n="preset_delete"></button>
+              </div>
               <input id="dialNumber" class="dial-input" type="text" data-i18n-ph="ph_number" />
               <input id="dialTask" class="task-input" type="text" data-i18n-ph="ph_task" />
               <div class="remote-cloud" id="remoteCloudPanel">
@@ -1462,6 +1467,9 @@ const I18N = {
     met_pill_known: "known caller", met_tip_known: "Calls where the caller was recognized as a known contact (affects greeting and strategy).",
     met_tip_combo: "The provider / turn-detection / barge-in configuration these calls ran with. Different configs are counted separately so their numbers never blend.",
     met_pill_fallback: "self-echo fallback", met_tip_fallback: "Calls where suspected self-echo (downlink audio re-captured as uplink) triggered the half-duplex fallback.",
+    preset_delete: "Delete", preset_delete_title: "Delete this preset?",
+    preset_delete_msg: "\"{name}\" will be removed from the task library. Call history is not affected.",
+    preset_deleted: "Preset deleted.", preset_delete_fail: "Delete failed: ",
     intake_open: "Chat to set up a call",
     intake_title: "Set up a call by chatting",
     intake_greeting: "Tell me what call you want made — who to call, what to get done, and any limits (e.g. \"call Xfinity, my bill jumped from $50 to $93, get it back near $55, no contracts\").",
@@ -1722,6 +1730,9 @@ const I18N = {
     met_pill_known: "熟人", met_tip_known: "来电被识别为通讯录熟人的通数（影响开场白与策略）。",
     met_tip_combo: "该批通话运行时的 provider / 判停 / barge-in 配置组合。不同配置分开统计，数字绝不混平均。",
     met_pill_fallback: "自激兜底", met_tip_fallback: "疑似自激（下行音频被回采成上行）触发半双工兜底的通数。",
+    preset_delete: "删除", preset_delete_title: "删除这个预设？",
+    preset_delete_msg: "「{name}」将从任务库移除，不影响通话历史。",
+    preset_deleted: "预设已删除。", preset_delete_fail: "删除失败：",
     intake_open: "对话建单",
     intake_title: "聊着把外呼任务建出来",
     intake_greeting: "告诉我要打给谁、办什么事、有什么底线（比如「帮我打 Xfinity，账单从 50 涨到 93 了，谈回 55 左右，别签合约」）。",
@@ -2234,6 +2245,7 @@ async function intakeSaveAndDial(dialAfter) {
       $("dialNumber").value = d.number;
       $("dialTask").value = d.task;
       dialPresetId = res.profile.id; dialPresetHint = d.task;
+      if (typeof syncDialPresetDelete === "function") syncDialPresetDelete();
       doDial();
     } else {
       setToast("dialToast", "ok", t("intake_saved"));
@@ -2753,9 +2765,40 @@ function applyDialPreset() {
   $("dialNumber").value = String(profile.number || "");
   $("dialTask").value = String(profile.task || "");
 }
-$("dialPreset").addEventListener("change", applyDialPreset);
+function syncDialPresetDelete() {
+  // 只有带稳定 id 的预设可从这里删（legacy 无 id 条目去任务库处理）。
+  $("dialPresetDelete").hidden = !dialPresetId;
+}
+$("dialPreset").addEventListener("change", () => { applyDialPreset(); syncDialPresetDelete(); });
+$("dialPresetDelete").addEventListener("click", async () => {
+  if (!dialPresetId) return;
+  const profile = dialProfiles.find((item) => String(item.id || "") === dialPresetId);
+  const name = String(profile?.label || profile?.task || profile?.number || "");
+  const choice = await showModal({
+    tone: "danger",
+    title: t("preset_delete_title"),
+    message: metFmt("preset_delete_msg", { name }),
+    actions: [
+      { key: "ok", label: t("preset_delete"), kind: "danger" },
+      { key: "cancel", label: t("modal_cancel"), kind: "ghost" },
+    ],
+  });
+  if (choice !== "ok") return;
+  try {
+    const r = await fetch(`/api/number_profiles/${encodeURIComponent(dialPresetId)}`, { method: "DELETE" });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    dialPresetHint = null; dialPresetId = null;
+    $("dialPreset").value = "";
+    await loadDialPresets();
+    if (typeof loadManagedProfiles === "function") loadManagedProfiles();
+    setToast("dialToast", "ok", t("preset_deleted"));
+  } catch (e) {
+    setToast("dialToast", "err", t("preset_delete_fail") + (e.message || ""));
+  }
+  syncDialPresetDelete();
+});
 // 手动改号码=脱离预设；改事项框（子主题）不清命中键，仍走选中预设的策略框架
-$("dialNumber").addEventListener("input", () => { dialPresetHint = null; dialPresetId = null; $("dialPreset").value = ""; });
+$("dialNumber").addEventListener("input", () => { dialPresetHint = null; dialPresetId = null; $("dialPreset").value = ""; syncDialPresetDelete(); });
 
 async function doDial() {
   const number = $("dialNumber").value.trim();
