@@ -342,6 +342,16 @@ class CallSession:
         self._dead_media_seconds = 0.0
         self._dead_media_hangup = False
         self._dead_media_reported = False
+        # 「近失」静音段：攒够阈值前又收到真实音频时，这里留下那段长度供调用方
+        # 落事件（取走即清）。观测模式要回答的问题是「活着的通话会不会出现 60 秒
+        # 精确静音」，而只记越过阈值的那次是答不了的——见 _dead_media_expired。
+        self._dead_media_recovered_run: float | None = None
+        # 本通见过的最长精确静音段：通话结束时落一次，保证「静音后直接挂断」
+        # 这种形态也留下数据点——只在恢复时记的话，样本会系统性偏向「没出现过
+        # 长静音」，而那正是决定要不要默认开启自动挂断时最不能有的偏差。
+        self._dead_media_max_run = 0.0
+        # run_in_executor 的 future 引用：不留会被 GC 掉（快照是 fire-and-forget）。
+        self._snapshot_task: object | None = None
         # 最近一次 Agent 音频采样率，供收尾兜底计算丢弃时长。
         self._agent_output_rate = 24000
 
@@ -1095,7 +1105,24 @@ class CallSession:
             )
 
             pcm_8k = bridge.read_modem_chunk()
-            if self._dead_media_expired(pcm_8k, now) and not self._dead_media_reported:
+            dead_media = self._dead_media_expired(pcm_8k, now)
+            recovered_run = self._dead_media_recovered_run
+            if recovered_run is not None:
+                # 反例（活着的通话出现长段精确静音）与正例同样值钱，见上面的注释。
+                self._dead_media_recovered_run = None
+                logger.info(
+                    "上行纯数字静音 %.0f 秒后又收到真实音频（阈值 %.0f 秒）——"
+                    "通话仍在，本段计入误判风险观测",
+                    recovered_run,
+                    self._dead_media_seconds,
+                )
+                if record is not None:
+                    record.log_event(
+                        "dead_media_recovered",
+                        silent_seconds=round(recovered_run, 1),
+                        threshold_seconds=round(self._dead_media_seconds, 1),
+                    )
+            if dead_media and not self._dead_media_reported:
                 # 检测**总是**落事件；是否据此挂断另有开关（见 _dead_media_expired）。
                 self._dead_media_reported = True
                 logger.warning(
@@ -1109,6 +1136,17 @@ class CallSession:
                         "dead_media_detected",
                         silent_seconds=round(self._dead_media_silent_seconds, 1),
                         hangup=self._dead_media_hangup,
+                    )
+                    # 判死即先把录音抢落一份：不挂断时（默认）会话还能挂到
+                    # INBOUND_MAX_SECONDS（30 分钟）才收尾，期间任何重启都会让
+                    # 整通记录连同证据一起消失——2026-08-06 那通正是靠手动挂断
+                    # 才抢回录音，2026-08-12 01:29 那通同样只剩手动一条路。
+                    # 判错了也无害：继续录，finish() 仍以完整版覆盖。
+                    # 不 await：判死**可能是误判**（对方按静音/hold），这时通话
+                    # 还活着，而长通话的快照要写几十 MB——await 会让媒体主循环
+                    # 停止读上行那么久，真人那头就是一段死寂。留引用防 GC。
+                    self._snapshot_task = asyncio.get_running_loop().run_in_executor(
+                        None, record.snapshot, "dead_media"
                     )
                 if self._dead_media_hangup:
                     break
@@ -1146,6 +1184,15 @@ class CallSession:
             uplink_pre_stats.maybe_log(gain=agent_uplink_gain)
             uplink_post_stats.maybe_log(gain=agent_uplink_gain)
             await asyncio.sleep(0.01)
+        # 每通固定落一个数据点：只在「静音后又恢复」时记的话，「静音 40 秒后
+        # 对方直接挂断」这种同样常见的形态一条都收不到，样本会系统性偏向
+        # 「活跃通话不会出现长静音」——正好偏向「可以默认开启自动挂断」。
+        if record is not None and self._dead_media_seconds > 0:
+            record.log_event(
+                "dead_media_max_run",
+                silent_seconds=round(self._dead_media_max_run, 1),
+                threshold_seconds=round(self._dead_media_seconds, 1),
+            )
         return bridge
 
     async def _handoff_to_mobile(
@@ -1314,6 +1361,9 @@ class CallSession:
         self._dead_media_hangup = config.get_bool("DEAD_MEDIA_HANGUP")
         self._dead_media_silent_seconds = 0.0
         self._dead_media_reported = False
+        # 这两个同样要按通清：留到下一通就是把别人的静音段算到这通头上。
+        self._dead_media_recovered_run = None
+        self._dead_media_max_run = 0.0
         self._hangup_delay_seconds = config.get_float("HANGUP_TOOL_DELAY_SECONDS")
 
     def _begin_record(self, direction: str, number: str | None) -> CallRecord | None:
@@ -2519,12 +2569,25 @@ class CallSession:
             return False
         if any(pcm_8k):
             # 任意非零字节即视为有真实音频（含底噪），重新计时。
+            # 清零前先留下够长的那段：这通**还活着**（真实音频回来了），却出现过
+            # 接近阈值的精确静音——正是 DEAD_MEDIA_HANGUP 默认值所缺的那类数据
+            # （config.py 的门槛是「攒够真实数据再决定」）。只记越过阈值的那次，
+            # 观测模式永远回答不了自己提的问题：静默清零把反例全吃掉了。
+            if self._dead_media_silent_seconds >= self._dead_media_seconds / 2:
+                self._dead_media_recovered_run = self._dead_media_silent_seconds
+                # 判死之后又活过来 = 上次判死是误判，探测器必须重新武装：否则
+                # 这通剩下的时间里对端**真的**挂断时，越过阈值也会被 reported
+                # 闸门吞掉——恰恰在已经证明会误判的那通里彻底失去保护。
+                self._dead_media_reported = False
             self._dead_media_silent_seconds = 0.0
             return False
         # 累计的是**收到的静音音频时长**，不是墙上时钟（2026-08-06 Codex 评审 P1）。
         # 按墙上时钟算的话，「静音 50 秒 + 半双工屏蔽无帧 20 秒 + 一块静音」就会
         # 立刻越过 60 秒阈值——而实际只收到 50 秒静音，与注释说的语义自相矛盾。
         self._dead_media_silent_seconds += len(pcm_8k) / (MODEM_RATE * 2)
+        self._dead_media_max_run = max(
+            self._dead_media_max_run, self._dead_media_silent_seconds
+        )
         return self._dead_media_silent_seconds >= self._dead_media_seconds
 
     def _check_turn_length(

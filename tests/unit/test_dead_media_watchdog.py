@@ -149,3 +149,160 @@ def test_hangup_action_is_off_by_default():
     from agentcall import config
 
     assert config.get_spec("DEAD_MEDIA_HANGUP").default == "false"
+
+
+# ---- 近失观测：让「是否默认开启挂断」这个问题真的能被回答 ----
+
+
+def test_recovered_long_silence_is_recorded():
+    """活着的通话出现长段精确静音 = 一个将来会误挂断的反例，必须留痕。
+
+    观测模式（DEAD_MEDIA_HANGUP=false）要回答的是「活跃通话里到底会不会出现
+    60 秒精确静音」。可 `_dead_media_expired` 收到真实音频就静默清零，反例
+    全被吃掉——只记越过阈值的正例，永远攒不出决策所需的另一半数据。
+    """
+    s = make_session(timeout=60.0)
+    feed_silence(s, 45.0)  # 过半阈值但没越线
+    assert s._dead_media_expired(NOISE, now=45.0) is False, "通话还活着"
+    assert s._dead_media_recovered_run is not None, "近失静音段必须留痕"
+    assert s._dead_media_recovered_run == pytest.approx(45.0, abs=0.1)
+
+
+def test_short_silence_is_not_reported_as_nearmiss():
+    """短静音是通话常态（换气、IVR 间隙），留痕会淹掉真正的信号。"""
+    s = make_session(timeout=60.0)
+    feed_silence(s, 5.0)
+    assert s._dead_media_expired(NOISE, now=5.0) is False
+    assert s._dead_media_recovered_run is None
+
+
+def test_recovered_run_is_consumed_once():
+    """取走即清：同一段近失不能每块音频都重复落一次事件。"""
+    s = make_session(timeout=60.0)
+    feed_silence(s, 45.0)
+    s._dead_media_expired(NOISE, now=45.0)
+    assert s._dead_media_recovered_run is not None
+    s._dead_media_recovered_run = None
+    assert s._dead_media_expired(NOISE, now=46.0) is False
+    assert s._dead_media_recovered_run is None, "真实音频不该反复触发近失"
+
+
+# ---- 接线：断言**可观测行为**（事件 + snapshot 调用），不是私有字段 ----
+#
+# 上面那几个测试只断言 `_dead_media_recovered_run`，把 _run_agent_loop 里的落
+# 事件与 snapshot 调用整段删掉它们照样绿——本仓库已经在这个坑里栽过
+# （见 test_dtmf_outcome_evidence.py 的「生产上没有任何调用者」）。
+# 所以这里驱动真实的 _run_agent_loop，断言外部真正看得见的东西。
+
+
+class _RecordSpy:
+    """只记录被调用了什么：事件与 snapshot。"""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict]] = []
+        self.snapshots: list[str] = []
+
+    def log_event(self, type: str, **fields) -> None:  # noqa: A002
+        self.events.append((type, fields))
+
+    def write_uplink(self, pcm: bytes) -> None:
+        pass
+
+    def write_downlink(self, pcm: bytes) -> None:
+        pass
+
+    def snapshot(self, reason: str) -> None:
+        self.snapshots.append(reason)
+
+    def events_of(self, type: str) -> list[dict]:  # noqa: A002
+        return [f for t, f in self.events if t == type]
+
+
+def _drive_loop(monkeypatch, chunks: list[bytes], *, timeout: float, hangup=False):
+    """把给定的上行块喂进真实 _run_agent_loop，返回 RecordSpy。"""
+    import asyncio
+
+    from fakes import FakeAgent, FakeAudioBridge, FakeModem
+
+    from agentcall.call_agent import CallAgentService
+
+    service = CallAgentService(
+        modem_port="unused",
+        audio_keyword="unused",
+        provider="qwen",
+        modem=FakeModem(),  # type: ignore[arg-type]
+    )
+    bridge = FakeAudioBridge()
+    for chunk in chunks:
+        bridge.feed_uplink(chunk)
+
+    record = _RecordSpy()
+    agent = FakeAgent()
+    session = service.session
+    session._active = True
+    session._hangover_seconds = 0.0
+    session._dead_media_seconds = timeout
+    session._dead_media_hangup = hangup
+    session._dead_media_silent_seconds = 0.0
+    session._dead_media_reported = False
+    session._dead_media_recovered_run = None
+    session._dead_media_max_run = 0.0
+
+    # 喂完就停，避免空转
+    async def stop_when_drained(pcm: bytes) -> None:
+        if not bridge.uplink:
+            session._active = False
+
+    monkeypatch.setattr(agent, "send_audio", stop_when_drained)
+    asyncio.run(
+        session._run_agent_loop(agent, bridge, record, [])  # type: ignore[arg-type]
+    )
+    return record
+
+
+def test_loop_emits_recovered_event(monkeypatch):
+    """静音够久后真实音频回来 → 必须落一条 dead_media_recovered 事件。
+
+    删掉 _run_agent_loop 里那段落事件的代码，本测试必须变红。
+    """
+    chunks = [SILENCE] * 300 + [NOISE] * 5  # 6 秒静音（阈值 4）后恢复
+    record = _drive_loop(monkeypatch, chunks, timeout=4.0)
+
+    recovered = record.events_of("dead_media_recovered")
+    assert len(recovered) == 1, f"应恰好一条，实得 {record.events}"
+    assert recovered[0]["silent_seconds"] == pytest.approx(6.0, abs=0.2)
+    assert recovered[0]["threshold_seconds"] == 4.0
+
+
+def test_loop_snapshots_recording_on_detection(monkeypatch):
+    """判死 → 必须落 dead_media_detected 并调用 record.snapshot()。
+
+    快照是「重启也不丢证据」的全部价值所在；没有这条断言，
+    删掉 snapshot 调用测试照样绿。
+    """
+    record = _drive_loop(monkeypatch, [SILENCE] * 300, timeout=4.0)
+
+    assert record.events_of("dead_media_detected"), "判死必须落事件"
+    assert record.snapshots == ["dead_media"], "判死必须抢救录音"
+
+
+def test_recovery_rearms_the_detector(monkeypatch):
+    """判死→恢复→再判死：第二次仍要落事件。
+
+    否则「已经证明会误判」的那通通话，在对端**真的**挂断时反而失去保护。
+    """
+    chunks = [SILENCE] * 300 + [NOISE] * 5 + [SILENCE] * 300
+    record = _drive_loop(monkeypatch, chunks, timeout=4.0)
+
+    assert len(record.events_of("dead_media_detected")) == 2, "恢复后必须重新武装"
+    assert len(record.snapshots) == 2
+
+
+def test_loop_always_emits_max_run_data_point(monkeypatch):
+    """静音后直接结束（没有恢复）也要留下数据点，否则样本有系统性偏差。"""
+    record = _drive_loop(monkeypatch, [SILENCE] * 100, timeout=60.0)
+
+    max_run = record.events_of("dead_media_max_run")
+    assert len(max_run) == 1, "每通固定一条"
+    assert max_run[0]["silent_seconds"] == pytest.approx(2.0, abs=0.2)
+    assert not record.events_of("dead_media_recovered"), "没恢复就不该有恢复事件"

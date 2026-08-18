@@ -479,3 +479,127 @@ def test_answered_outbound_numbers_falls_back_to_legacy_events(tmp_path):
     (missed / "events.jsonl").write_text(json.dumps({"type": "call_started"}) + "\n", encoding="utf-8")
 
     assert clog.answered_outbound_numbers() == {"10000"}
+
+
+# ---- 僵尸会话的证据抢救：snapshot（WIL-100）----
+
+
+def test_snapshot_persists_recording_before_finish(tmp_path):
+    """录音在 finish() 前全在内存里，会话僵住就等于证据悬在进程内。
+
+    2026-08-06 那通僵尸十分钟，录音目录直到手动挂断前一直是空的；
+    2026-08-12 01:29 那通同样只能手动收尾。媒体判死后默认不挂断，会话
+    可能再挂到 INBOUND_MAX_SECONDS（30 分钟）——期间重启就全没了。
+    """
+    clog = CallLogger(tmp_path, recording_enabled=True)
+    record = clog.begin_call("inbound", "13500000000")
+    record.log_event("dead_media_detected", silent_seconds=60.0, hangup=False)
+    record.write_uplink(b"\x01\x02" * 160)
+
+    record.snapshot("dead_media")
+
+    # 还没 finish，但证据已经在盘上了
+    for name in ("events.jsonl", "uplink.wav"):
+        assert (record.path / name).exists(), name
+    with wave.open(str(record.path / "uplink.wav"), "rb") as wf:
+        assert wf.getnframes() == 160
+    assert any(e["type"] == "dead_media_detected" for e in read_events(record.path))
+
+
+def test_snapshot_does_not_end_the_call(tmp_path):
+    """判错也无害：通话继续时录音照常追加，finish() 以完整版覆盖快照。"""
+    clog = CallLogger(tmp_path, recording_enabled=True)
+    record = clog.begin_call("inbound", "13500000000")
+    record.write_uplink(b"\x01\x02" * 160)
+
+    record.snapshot("dead_media")
+    # 通话其实还活着——继续录
+    record.write_uplink(b"\x05\x06" * 160)
+    record.finish("completed")
+
+    with wave.open(str(record.path / "uplink.wav"), "rb") as wf:
+        assert wf.getnframes() == 320, "finish() 必须覆盖成完整录音，不是快照那半截"
+
+
+def test_snapshot_after_finish_is_noop(tmp_path):
+    """收尾后迟到的快照不能把已落盘的完整记录截断。"""
+    clog = CallLogger(tmp_path, recording_enabled=True)
+    record = clog.begin_call("inbound", "13500000000")
+    record.write_uplink(b"\x01\x02" * 160)
+    record.finish("completed")
+
+    record.snapshot("late")
+
+    with wave.open(str(record.path / "uplink.wav"), "rb") as wf:
+        assert wf.getnframes() == 160
+
+
+def test_snapshot_cannot_truncate_a_finished_record(tmp_path):
+    """快照在 finish() 之后落地，绝不能用陈旧的半截覆盖完整录音。
+
+    竞态（Codex 评审 P1）：snapshot 在 _lock 内拷完就松锁，若此时 finish()
+    跑完整轮（置位 + 写完整 wav + call_finished + meta.json），快照再抢到
+    _disk_lock 就会把它们全盖回旧状态——meta 说 640 字节、wav 只有一半、
+    events.jsonl 丢掉 call_finished。所以进 _disk_lock 后必须重查 _finished。
+    """
+    clog = CallLogger(tmp_path, recording_enabled=True)
+    record = clog.begin_call("inbound", "13500000000")
+    record.write_uplink(b"\x01\x02" * 160)
+
+    # 模拟「快照已拷贝完成、正要写盘」时 finish() 抢先跑完
+    started = threading.Event()
+    release = threading.Event()
+    original = record._disk_lock
+
+    class GatedLock:
+        def __enter__(self):
+            started.set()
+            release.wait(5)
+            return original.__enter__()
+
+        def __exit__(self, *a):
+            return original.__exit__(*a)
+
+    def run_snapshot():
+        record._disk_lock = GatedLock()  # type: ignore[assignment]
+        record.snapshot("dead_media")
+
+    t = threading.Thread(target=run_snapshot)
+    t.start()
+    assert started.wait(5), "快照线程未进入写盘阶段"
+
+    record._disk_lock = original  # finish() 用真锁
+    record.write_uplink(b"\x03\x04" * 160)  # 通话其实还在继续
+    record.finish("completed")
+    release.set()
+    t.join(5)
+
+    with wave.open(str(record.path / "uplink.wav"), "rb") as wf:
+        assert wf.getnframes() == 320, "完整录音被陈旧快照截断了"
+    types = [e["type"] for e in read_events(record.path)]
+    assert "call_finished" in types, "call_finished 被快照覆盖丢失"
+
+
+def test_snapshot_writes_provisional_meta_so_ui_can_see_it(tmp_path):
+    """没有 meta.json 的目录 list_calls 直接跳过——抢救了却看不见等于没救。"""
+    clog = CallLogger(tmp_path, recording_enabled=True)
+    record = clog.begin_call("inbound", "13500000000")
+    record.write_uplink(b"\x01\x02" * 160)
+    record.snapshot("dead_media")
+
+    calls = clog.list_calls(limit=10)
+    assert [c["id"] for c in calls] == [record.id], "快照后的通话必须在历史里可见"
+    assert calls[0]["status"] == "snapshot"
+
+    record.finish("completed")
+    assert clog.list_calls(limit=10)[0]["status"] == "completed", "finish 须覆盖临时 meta"
+
+
+def test_snapshot_leaves_no_tmp_files(tmp_path):
+    """原子写：.tmp 必须被 replace 掉，不留垃圾。"""
+    clog = CallLogger(tmp_path, recording_enabled=True)
+    record = clog.begin_call("inbound", "13500000000")
+    record.write_uplink(b"\x01\x02" * 160)
+    record.snapshot("dead_media")
+
+    assert not list(record.path.glob("*.tmp")), "快照留下了 .tmp 残file"
