@@ -93,10 +93,15 @@ _JUDGE_SYSTEM = {
         "而不是换个说法再问一遍同一件事。\n"
         "- continue（继续）：对方还没针对所问的事给出明确答复（在查询中、答非所问、"
         "被打断、只是客套），实质结果还没真正到手。\n"
+        "- on_hold（排队等待）：当前对面不是真人在对话，而是等待状态——循环播放的"
+        "音乐、重复的语音播报、「坐席全忙请耐心等待」一类提示、转接前的静默。"
+        "同样的播报内容反复出现是最典型的特征。排队等待不是打转也不是卡死，"
+        "等多久都不该收尾；真人接入（有问候、报了工号、直接回应所问的事）后"
+        "才回到 continue/wrap_up 的判断。\n"
         "拿不准时倾向继续：只有确信已拿到结果（含明确的否定答复）、或确信卡死，"
         "才判 wrap_up。\n"
         "只输出严格合法的 JSON，无任何多余文字："
-        '{{"decision": "continue" 或 "wrap_up", "reason": "一句话理由"}}'
+        '{{"decision": "continue"、"wrap_up" 或 "on_hold", "reason": "一句话理由"}}'
     ),
     "en": (
         "You are supervising an ongoing OUTBOUND call by {owner}'s phone assistant. "
@@ -114,10 +119,17 @@ _JUDGE_SYSTEM = {
         "- continue: the other side has not yet given a definite answer to the "
         "question (still looking it up, answered something else, got cut off, or "
         "was merely being polite) — the substance isn't in hand yet.\n"
+        "- on_hold: nobody is actually talking to the assistant right now — the "
+        "line is in a waiting state: looping hold music, repeated announcements, "
+        "\"all agents are busy\" messages, or transfer silence. The same "
+        "announcement recurring is the telltale sign. Being on hold is neither "
+        "going in circles nor stuck; no matter how long it lasts, do not wrap up. "
+        "Once a human joins (a greeting, an agent ID, a direct response to the "
+        "request), go back to judging continue/wrap_up.\n"
         "When in doubt, lean continue: only wrap_up once you truly have the result "
         "(including a definite negative answer) or it's clearly stuck.\n"
-        'Output only strict JSON, no extra text: {{"decision": "continue" or '
-        '"wrap_up", "reason": "one short sentence"}}'
+        'Output only strict JSON, no extra text: {{"decision": "continue", '
+        '"wrap_up" or "on_hold", "reason": "one short sentence"}}'
     ),
 }
 
@@ -167,8 +179,11 @@ def judge_wrap_up(
             return {"ok": False, "decision": "continue", "reason": error}
         data = parse_json_payload(text) if text else None
         reason = str((data or {}).get("reason", ""))[:120]
-        if (data or {}).get("decision") == "wrap_up":
-            return {"ok": True, "decision": "wrap_up", "reason": reason}
+        decision = (data or {}).get("decision")
+        # on_hold（WIL-120 二期）：排队等待既不收尾也不算打转——主循环据此
+        # 冻结收尾并驱动 UI 排队状态；无法解析时仍回落 continue（保守）。
+        if decision in ("wrap_up", "on_hold"):
+            return {"ok": True, "decision": decision, "reason": reason}
         return {"ok": True, "decision": "continue", "reason": reason}
     except Exception as exc:  # noqa: BLE001 —— 契约：绝不抛出
         logger.debug("收尾裁判异常（默认继续）: %s", exc)

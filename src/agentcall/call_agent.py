@@ -138,10 +138,21 @@ DTMF_SPOKEN_FOLLOWUP_DELAY_SECONDS = 3.0
 DTMF_RECENT_SEND_WINDOW_SECONDS = 5.0
 _EXTERNAL_TOOL_RESULT_TIMEOUT_SECONDS = 2.0
 _INBOUND_TAKEOVER_OFFER_TTL_SECONDS = 30.0
-_INBOUND_TAKEOVER_HOLD_TEXT = "请稍等，我确认一下，马上帮您转接。"
+# 固定垫话按 AGENT_LANGUAGE 取（WIL-120 二期顺手修：原为写死中文，en 通话下
+# AI 会突然冒中文）。不进模型自由生成——这几句是系统兜底话术，必须可预期。
+_INBOUND_TAKEOVER_HOLD_TEXT = {
+    "zh": "请稍等，我确认一下，马上帮您转接。",
+    "en": "One moment please, let me check — I'll transfer you right away.",
+}
 _INBOUND_TAKEOVER_MEDIA_TIMEOUT_SECONDS = 15.0
-_INBOUND_TRIAGE_CLARIFY_TEXT = "请简单确认一下，您是有具体事情找本人，还是一般业务介绍？"
-_INBOUND_TRIAGE_REJECT_TEXT = "谢谢您的来电，目前不需要这项服务。再见。"
+_INBOUND_TRIAGE_CLARIFY_TEXT = {
+    "zh": "请简单确认一下，您是有具体事情找本人，还是一般业务介绍？",
+    "en": "Just to confirm — do you have a specific matter for them personally, or is this a general offer?",
+}
+_INBOUND_TRIAGE_REJECT_TEXT = {
+    "zh": "谢谢您的来电，目前不需要这项服务。再见。",
+    "en": "Thanks for calling — this service isn't needed right now. Goodbye.",
+}
 
 
 class _CallSessionMediaRouter:
@@ -234,6 +245,10 @@ class CallSession:
         # 请求收尾标志 + 理由 + 在途裁判 task（每通重置）。
         self._wrap_up_requested = False
         self._wrap_up_reason = ""
+        # hold 状态（WIL-120 二期）：收尾裁判判 on_hold 进入、判其他退出。
+        # 时间戳用 time.time()（与事件 ts 同钟），秒数聚合在 metrics 层做。
+        self._on_hold = False
+        self._hold_started_ts = 0.0
         self._judge_task: asyncio.Task | None = None
         # 会话级可调参数：每通会话开始时从 config 重新读取，支持不重启改参。
         self._hangover_seconds = HALF_DUPLEX_HANGOVER_SECONDS
@@ -356,6 +371,8 @@ class CallSession:
         self._preset_hint = preset_hint
         self._preset_id = preset_id
         self._wrap_up_requested = False  # 每通重置收尾裁判状态
+        self._on_hold = False
+        self._hold_started_ts = 0.0
         self._wrap_up_reason = ""
         self._judge_task = None
         self._prompt_gen_thread = None
@@ -875,7 +892,7 @@ class CallSession:
         if not should_speak:
             return
         try:
-            await agent.say(_INBOUND_TAKEOVER_HOLD_TEXT)
+            await agent.say(_INBOUND_TAKEOVER_HOLD_TEXT[agent_language()])
             # Flush the one permitted hold line before closing the AI gate; the
             # regular loop deliberately drops queued AI audio after this point.
             self._drain_agent_audio(bridge)
@@ -1736,7 +1753,7 @@ class CallSession:
                     continue
                 self._triage_clarification_spoken = True
                 try:
-                    await agent.say(_INBOUND_TRIAGE_CLARIFY_TEXT)
+                    await agent.say(_INBOUND_TRIAGE_CLARIFY_TEXT[agent_language()])
                     self._drain_agent_audio(bridge)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
@@ -1762,7 +1779,7 @@ class CallSession:
                 # free-form policy. Fence immediately after its audio is flushed.
                 self._clear_outgoing_audio()
                 try:
-                    await agent.say(_INBOUND_TRIAGE_REJECT_TEXT)
+                    await agent.say(_INBOUND_TRIAGE_REJECT_TEXT[agent_language()])
                     self._drain_agent_audio(bridge)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
@@ -1882,11 +1899,36 @@ class CallSession:
                 reason=str(result.get("reason", ""))[:200],
                 ok=bool(result.get("ok")),
             )
-        if result.get("decision") == "wrap_up":
+        decision = result.get("decision")
+        # hold 转换（WIL-120 二期）：on_hold 进入；裁判成功返回其他判定即退出
+        # （失败结果不动状态——网络抖动不该把排队踢回普通计时）。
+        if decision == "on_hold" and not self._on_hold:
+            self._on_hold = True
+            self._hold_started_ts = time.time()
+            if record is not None:
+                record.log_event("hold_started")
+            self._publish({"type": "hold", "active": True})
+            logger.info("收尾裁判判定进入排队等待（%s）", result.get("reason", ""))
+        elif (
+            self._on_hold
+            and result.get("ok")
+            and decision in ("continue", "wrap_up")
+        ):
+            held = max(0.0, time.time() - self._hold_started_ts)
+            self._on_hold = False
+            if record is not None:
+                record.log_event("hold_ended", seconds=round(held, 1))
+            self._publish({"type": "hold", "active": False})
+            logger.info("排队等待结束（%.0fs），恢复正常判定", held)
+        if decision == "wrap_up":
             self._wrap_up_requested = True
             self._wrap_up_reason = result.get("reason", "")
 
     def _request_repeat_stuck_wrap_up(self, reason: str) -> None:
+        if self._on_hold:
+            # 排队等待中的「重复」是等待音循环，不是会话卡死（WIL-120 二期）。
+            logger.info("复读抑制在排队等待期触发，忽略: %s", reason)
+            return
         logger.warning("复读抑制判定会话卡死，准备收尾: %s", reason)
         self._wrap_up_requested = True
         self._wrap_up_reason = reason

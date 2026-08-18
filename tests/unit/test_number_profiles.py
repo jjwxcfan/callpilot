@@ -753,5 +753,6 @@ def test_bundled_seed_long_queue_drill_profile():
     ]
     assert len(drill) == 1
     assert drill[0]["max_call_seconds"] == 3600
-    assert drill[0]["wrap_up_judge"] is False
+    # 二期起裁判 hold-aware，种子改回开启；时长上限留作安全网（WIL-120）。
+    assert drill[0]["wrap_up_judge"] is True
     assert drill[0]["opening_mode"] == "wait"

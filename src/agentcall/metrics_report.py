@@ -151,6 +151,10 @@ def summarize(metrics: list[dict[str, Any]], skipped: list[str]) -> dict[str, An
                 # 对话画像：时长（秒）与对方轮次——L1/L2/L3 结构的粗代理。
                 "duration_s": _describe_pooled(_scalar_values(group, "duration_s")),
                 "peer_turns": _describe_pooled(_scalar_values(group, "peer_turns")),
+                # v4：排队等待秒数（hold-aware 裁判测得；0=真没排队，是有效读数）。
+                "hold_seconds": _describe_pooled(
+                    _scalar_values(group, "hold_seconds")
+                ),
             }
         combos: dict[str, int] = {}
         terminations: dict[str, int] = {}

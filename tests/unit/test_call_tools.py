@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from fakes import FakeModem
 
@@ -590,3 +591,85 @@ def test_tool_specs_keep_chinese_by_default(monkeypatch):
     registry = ToolRegistry()
     registry.register(SEND_SMS_SPEC, lambda args: {})
     assert "收件手机号码" in str(registry.specs()[0])
+
+
+# ---- WIL-120 二期：ask_owner 机主确认环 ----
+
+
+def test_ask_owner_registered_only_for_outbound():
+    outbound, _, _ = make_tools(direction="outbound")
+    assert "ask_owner" in outbound.register()._tools
+    inbound, _, _ = make_tools(direction="inbound")
+    assert "ask_owner" not in inbound.register()._tools
+
+
+def test_ask_owner_approved_and_declined(monkeypatch):
+    monkeypatch.setenv("OWNER_CONFIRM_TIMEOUT_SECONDS", "5")
+    hub = make_hub()
+    record = SpyRecord()
+
+    # 先把答复灌进 history：wait_for_event 先扫历史，立即命中不真等。
+    import threading
+
+    def answer(choice):
+        def worker():
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                history = hub.history()
+                answered = {
+                    e.get("id") for e in history
+                    if e.get("type") == "owner_confirm_response"
+                }
+                pending = [
+                    e for e in history
+                    if e.get("type") == "owner_confirm_request"
+                    and e.get("id") not in answered
+                ]
+                if pending:
+                    hub.publish({
+                        "type": "owner_confirm_response",
+                        "id": pending[-1]["id"],
+                        "choice": choice,
+                    })
+                    return
+                time.sleep(0.02)
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        return t
+
+    tools, _, _ = make_tools(hub=hub, record=record, direction="outbound")
+    registry = tools.register()
+
+    t = answer("approve")
+    result = registry.dispatch("ask_owner", {"question": "月费 55 刀方案，接受吗？"})
+    t.join()
+    assert result["success"] is True and result["decision"] == "approved"
+
+    t = answer("decline")
+    result = registry.dispatch("ask_owner", {"question": "月费 70 刀方案，接受吗？"})
+    t.join()
+    assert result["decision"] == "declined"
+
+    # 关闭事件总会广播（UI 据此收卡）。
+    closed = [e for e in hub.history() if e.get("type") == "owner_confirm_closed"]
+    assert len(closed) == 2
+    # 审计不含 question 原文（同 WIL-95 §7 口径）。
+    audits = [f for (etype, f) in record.events if etype == "tool_call"
+              and f.get("tool") == "ask_owner"]
+    assert audits and all("55" not in str(f) for f in audits)
+
+
+def test_ask_owner_timeout_is_declined_fail_closed(monkeypatch):
+    monkeypatch.setenv("OWNER_CONFIRM_TIMEOUT_SECONDS", "1")
+    hub = make_hub()
+    tools, _, _ = make_tools(hub=hub, direction="outbound")
+    started = time.monotonic()
+    result = tools.register().dispatch("ask_owner", {"question": "x"})
+    assert time.monotonic() - started >= 0.9
+    assert result["success"] is True and result["decision"] == "timeout"
+
+
+def test_ask_owner_rejects_empty_question():
+    tools, _, _ = make_tools(hub=make_hub(), direction="outbound")
+    result = tools.register().dispatch("ask_owner", {"question": "  "})
+    assert result["success"] is False
