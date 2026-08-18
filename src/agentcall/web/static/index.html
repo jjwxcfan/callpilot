@@ -1478,6 +1478,7 @@ const I18N = {
     intake_ph: "Describe the task, or answer the question…",
     intake_send: "Send", intake_close: "Close",
     intake_note: "When enough is gathered you'll get a task card to review — nothing is dialed until you press the button. Saved as a preset in the task library either way.",
+    intake_cost_note: "💳 This chat calls the {provider} API with your own key — usage is billed to your account (roughly a cent per turn; the phone call itself costs more).",
     intake_saved: "Saved to the task library.",
     intake_save_fail: "Save failed: ",
     intake_dial_now: "Save & dial", intake_save_only: "Save as preset",
@@ -1741,6 +1742,7 @@ const I18N = {
     intake_ph: "描述任务，或回答上面的问题…",
     intake_send: "发送", intake_close: "关闭",
     intake_note: "信息攒够后会出一张任务确认卡——你按下按钮前不会拨任何电话。两种保存方式都会存进任务库成为预设。",
+    intake_cost_note: "💳 本对话调用你绑定的 {provider} API key，按量计费（约每轮 1 美分；之后的通话本身费用更高）。",
     intake_saved: "已存入任务库。",
     intake_save_fail: "保存失败：",
     intake_dial_now: "保存并拨打", intake_save_only: "仅存为预设",
@@ -2287,6 +2289,9 @@ function intakeOpen() {
   inputRow.appendChild(input); inputRow.appendChild(sendBtn); inputRow.appendChild(closeBtn);
   card.appendChild(inputRow);
   card.appendChild(el("div", "cc-note", t("intake_note")));
+  const provider = ($("provider")?.textContent || "").trim();
+  card.appendChild(el("div", "cc-note", metFmt("intake_cost_note",
+    { provider: provider && provider !== "-" ? provider : "AI" })));
   intakeOverlay.appendChild(card);
   document.body.appendChild(intakeOverlay);
   intakeMessages.push({ role: "assistant", content: t("intake_greeting") });
