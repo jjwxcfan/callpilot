@@ -161,6 +161,32 @@ def parse_sms_pdu(pdu: str) -> tuple[str | None, str, str] | None:
         return None
 
 
+# CLCC stat 码 → 可读状态（3GPP TS 27.007）；未知码原样数字化，不猜。
+_CLCC_STATES = {
+    0: "active", 1: "held", 2: "dialing",
+    3: "alerting", 4: "incoming", 5: "waiting",
+}
+
+
+def parse_clcc_lines(response: str) -> list[dict[str, object]]:
+    """解析 ``AT+CLCC`` 响应为通话列表（纯函数，供 list_calls 与单测）。
+
+    解析不动的行跳过；multiparty 位（mpty）用于确认 CHLD=3 后确实并成了
+    多方通话——这是 Path B「并入成功」的唯一模组侧证据（WIL-120 四期）。
+    """
+    calls: list[dict[str, object]] = []
+    for match in CLCC_PATTERN.finditer(response or ""):
+        stat = int(match.group("stat"))
+        calls.append({
+            "index": int(match.group("idx")),
+            "direction": "outgoing" if match.group("dir") == "0" else "incoming",
+            "state": _CLCC_STATES.get(stat, str(stat)),
+            "multiparty": match.group("mpty") == "1",
+            "number": match.group("number") or "",
+        })
+    return calls
+
+
 def _looks_like_pdu(body: str) -> bool:
     compact = re.sub(r"\s+", "", body)
     return len(compact) >= 20 and bool(re.fullmatch(r"[0-9A-Fa-f]+", compact))
@@ -669,6 +695,53 @@ class SerialModem:
 
     def is_call_connected(self) -> bool:
         return self._call_connected_event.is_set()
+
+    # ---- 三方通话原语（WIL-120 四期 Path B）----
+    # 3GPP TS 22.030 补充业务标准指令，非厂商专有。⚠️ 真机未验证：固件是否
+    # 完整实现、运营商线路是否开通多方通话业务，都要先跑 scripts/chld_probe.py
+    # 探针确认（AT+CHLD=? 能力查询 + 通话中 hold/resume 实测），探针通过前
+    # 这些方法不得接入生产链路（「我来说」按钮保持置灰）。
+
+    def query_chld_capabilities(self) -> str:
+        """查询模组支持的 CHLD 操作集（``AT+CHLD=?``，空闲态安全）。"""
+        return self._send("AT+CHLD=?")
+
+    def hold_toggle(self) -> bool:
+        """``AT+CHLD=2``：保持当前通话 / 在保持与恢复间切换。
+
+        标准语义是「把 active 置 held、把 held 置 active」——只有一路通话时
+        即 hold/resume 切换。返回模组是否应答 OK；真实状态以 list_calls 为准
+        （运营商侧可能应答 OK 但业务未开通，探针要抓的正是这种）。
+        """
+        return "OK" in self._send("AT+CHLD=2")
+
+    def merge_calls(self) -> bool:
+        """``AT+CHLD=3``：把保持中的通话并入当前通话（多方通话）。
+
+        前提：一路 active + 一路 held。网络侧混音，音频仍是一路 PCM，
+        宿主侧无需任何改动。返回是否应答 OK。
+        """
+        return "OK" in self._send("AT+CHLD=3")
+
+    def dial_second(self, number: str) -> str:
+        """通话中拨第二路（Path B：拨机主第二号码）。
+
+        调用方须**先** hold_toggle() 保持第一路再拨；本方法刻意不复用
+        ``dial()``——那里会清接通状态/CLCC 计数，第二路拨号不能扰动
+        第一路的在线判定。
+        """
+        number = (number or "").strip()
+        if not number:
+            raise ValueError("第二路号码为空")
+        return self._send(f"ATD{number};")
+
+    def list_calls(self) -> list[dict[str, object]]:
+        """``AT+CLCC`` 列出当前所有通话；解析失败的行跳过不猜。
+
+        返回项：``{"index", "direction", "state", "multiparty", "number"}``；
+        state 语义（3GPP）：active/held/dialing/alerting/incoming/waiting。
+        """
+        return parse_clcc_lines(self._send("AT+CLCC"))
 
     def send_dtmf(self, digits: str) -> bool:
         """通话中发送 DTMF 按键音（AT+QVTS），用于 IVR 菜单导航。

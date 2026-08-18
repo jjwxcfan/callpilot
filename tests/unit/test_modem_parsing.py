@@ -1020,3 +1020,62 @@ def test_settle_delay_shorter_for_sim7600_than_quectel():
 
     assert make_modem().POST_ANSWER_SETTLE_SECONDS == 1.0
     assert Sim7600Modem("/dev/null-not-used").POST_ANSWER_SETTLE_SECONDS < 0.5
+
+
+# ---- WIL-120 四期：三方通话原语（真机验证 gate 在 chld_probe） ----
+
+
+def test_parse_clcc_lines_maps_states_and_multiparty():
+    from agentcall.modem import parse_clcc_lines
+
+    response = (
+        '+CLCC: 1,0,1,0,0,"18005551234",129\r\n'
+        '+CLCC: 2,0,0,0,1,"16125550000",129\r\n'
+        "OK"
+    )
+    calls = parse_clcc_lines(response)
+    assert calls == [
+        {"index": 1, "direction": "outgoing", "state": "held",
+         "multiparty": False, "number": "18005551234"},
+        {"index": 2, "direction": "outgoing", "state": "active",
+         "multiparty": True, "number": "16125550000"},
+    ]
+    # 未知 stat 码原样数字化，不猜语义。
+    weird = parse_clcc_lines("+CLCC: 1,1,7,0,0")
+    assert weird[0]["state"] == "7" and weird[0]["direction"] == "incoming"
+    # 空/纯 OK/坏行：安静返回空表。
+    assert parse_clcc_lines("OK") == []
+    assert parse_clcc_lines("") == []
+    assert parse_clcc_lines("+CLCC: garbage") == []
+
+
+def test_three_way_primitives_send_standard_chld_commands(monkeypatch):
+    modem = make_sim7600()
+    sent = []
+    monkeypatch.setattr(
+        modem, "_send",
+        lambda cmd: sent.append(cmd) or (
+            '+CLCC: 1,0,0,0,0,"611",129\r\nOK' if cmd == "AT+CLCC" else "OK"
+        ),
+    )
+    assert modem.hold_toggle() is True
+    assert modem.merge_calls() is True
+    modem.query_chld_capabilities()
+    calls = modem.list_calls()
+    assert sent == ["AT+CHLD=2", "AT+CHLD=3", "AT+CHLD=?", "AT+CLCC"]
+    assert calls[0]["number"] == "611" and calls[0]["state"] == "active"
+
+
+def test_dial_second_does_not_disturb_first_call_state(monkeypatch):
+    """第二路拨号绝不复用 dial()：不清接通事件/CLCC 计数（第一路仍在线）。"""
+    modem = make_sim7600()
+    sent = []
+    monkeypatch.setattr(modem, "_send", lambda cmd: sent.append(cmd) or "OK")
+    modem._call_connected_event.set()  # 第一路在线
+    modem.dial_second("16125550000")
+    assert sent == ["ATD16125550000;"]
+    assert modem.is_call_connected() is True  # 未被清掉
+
+    import pytest as _pytest
+    with _pytest.raises(ValueError):
+        modem.dial_second("  ")
