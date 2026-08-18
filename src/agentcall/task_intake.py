@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -32,6 +33,9 @@ from .prompt_gen import (
 logger = logging.getLogger(__name__)
 
 _INTAKE_TIMEOUT_SECONDS = 12.0  # 交互式：比 prompt_gen 的 5s 宽、比摘要的 30s 紧
+# 建单是面向机主的多轮结构化对话，比摘要/裁判难——不跟 SUMMARY_MODEL 的便宜
+# 默认档（2026-08-18 真机：gpt-4o-mini 追问蠢 + JSON 纪律差），各 provider 用强档。
+_INTAKE_DEFAULT_BY_PROVIDER = {"openai": "gpt-4o", "qwen": "qwen-plus"}
 _MAX_MESSAGES = 40
 _MAX_CONTENT_CHARS = 2000
 # 追问阶段回复要短；出草稿那轮 JSON 较长（含 task_package），给足余量。
@@ -48,11 +52,26 @@ _SYSTEM = {
         "- verification（核身信息：户名、地址、账号等，客服核身才用得上；"
         "机主不想给就不勉强，注明缺失即可）\n"
         "- blacklist（绝不同意的操作，如开通增值业务、改联系方式）\n"
-        "追问方式：一次只问一两个最关键的缺口，别列问卷；机主明显不耐烦或说"
-        "「够了/就这样/开始打」就立刻收口出草稿，缺的字段留空。金额、期限等"
-        "数字必须用机主原话，绝不替机主编造或取整。\n"
+        "号码规则：机主没给对方号码时，你**知道的公开客服号可以直接提议并确认**"
+        "——比如美国运营商自家客服是 611、知名公司的官方客服热线你记得的就报出来"
+        "（『AT&T 客服是 611，直接打这个可以吗？』），不要反过来让机主查；"
+        "确实不知道或没把握的号码，诚实说不确定、请机主提供，**绝不编造号码**。\n"
+        "核身信息（户名/地址/账号等）：**绝不主动索要**。最多在快收口时提一句"
+        "『客服如果要核身可能用到户名或账号，现在不给也行』；机主没兴趣就立即"
+        "作罢，缺着收口。\n"
+        "追问方式：一次只问一两个最关键的缺口，别列问卷。**机主一旦表达开始的"
+        "意思（「开始」「就这样」「够了」「打吧」等任何说法），本轮必须 ready=true"
+        "出草稿，缺什么留空——再追问任何问题都是错误**。同样，你自己说出「开始/准备好了/马上安排」这类话"
+        "的那一轮，必须同时 ready=true 带上 draft——说要开始却不出草稿是错误。"
+        "机主说的约束类要求"
+        "（如「别办理任何业务」「不要改套餐」）放进 blacklist，不要只写进 scenario。"
+        "金额、期限等数字必须用机主原话，绝不替机主编造或取整。\n"
+        "问机主问题时，尽量在 options 里给 2-4 个最可能的候选答案（每个几个字，"
+        "可一键选择），机主也随时可以自己打字；开放性问题就不给 options。"
+        "选项要具体可选（『611 客服』『我提供号码』），不要『其他』这种废选项。\n"
         "每轮只输出严格合法的 JSON，无任何多余文字：\n"
-        '{{"reply": "对机主说的话", "ready": true/false, "draft": null 或 '
+        '{{"reply": "对机主说的话", "options": ["候选1", "候选2"] 或 [], '
+        '"ready": true/false, "draft": null 或 '
         '{{"number": "...", "task": "...", "label": "...", "scenario": "...", '
         '"task_package": {{"verification": {{...}}, "negotiation": {{...}}, '
         '"preauth": {{...}}, "blacklist": [...]}}}}}}\n'
@@ -73,19 +92,49 @@ _SYSTEM = {
         "- verification (identity facts a rep may ask for: name, address, "
         "account number; skip anything the owner declines to share)\n"
         "- blacklist (actions never to agree to)\n"
+        "Phone number rule: when the owner hasn't given the target number, "
+        "**propose public numbers you know and confirm** — e.g. a US carrier's "
+        "own customer service is 611, and well-known companies' official "
+        "hotlines you remember (\"AT&T customer service is 611 — shall I just "
+        "call that?\"); never bounce the lookup back to the owner. If you are "
+        "not sure of a number, say so honestly and ask the owner for it — "
+        "**never fabricate a number**.\n"
+        "Verification facts (name/address/account): **never ask for them "
+        "proactively**. At most, when about to finalize, mention once that "
+        "\"the rep may ask for the account holder name or number — fine to "
+        "skip for now\"; drop it immediately if the owner isn't interested.\n"
         "Ask for at most one or two missing essentials per turn — no "
-        "questionnaires. If the owner gets impatient or says \"that's "
-        "enough / just call\", finalize immediately with what you have. "
-        "Numbers (prices, terms) must be the owner's own words — never "
-        "invent or round them.\n"
+        "questionnaires. **The moment the owner signals to start (\"go "
+        "ahead\", \"that's enough\", \"just call\", any phrasing), this "
+        "turn MUST return ready=true with the draft, leaving gaps empty — "
+        "asking anything further is an error.** Likewise, any turn where YOU "
+        "announce starting (\"okay, starting now\") must itself carry "
+        "ready=true with the draft — announcing without a draft is an error. "
+        "Constraints the owner states "
+        "(\"don't change anything on the account\") go into blacklist, not "
+        "only into the scenario prose. Numbers (prices, terms) must be the "
+        "owner's own words — never invent or round them.\n"
+        "When asking the owner a question, offer 2-4 likely answers in "
+        "`options` (a few words each, one-tap choices); the owner can always "
+        "type freely instead. Skip options for open-ended questions. Options "
+        "must be concrete choices, never filler like \"other\".\n"
         "Every turn output strictly valid JSON and nothing else:\n"
-        '{{"reply": "what you say to the owner", "ready": true/false, '
+        '{{"reply": "what you say to the owner", "options": ["choice1", '
+        '"choice2"] or [], "ready": true/false, '
         '"draft": null or {{"number": "...", "task": "...", "label": "...", '
         '"scenario": "...", "task_package": {{"verification": {{...}}, '
         '"negotiation": {{...}}, "preauth": {{...}}, "blacklist": [...]}}}}}}\n'
         "When ready=true the draft must be usable as-is: a dialable number, a "
         "one-sentence task, a short label, a 1-3 sentence scenario strategy "
         "for the phone AI, and whatever dossier sections you gathered."
+    ),
+}
+
+_REFORMAT_NUDGE = {
+    "zh": "你刚才的输出不是约定的 JSON。把同样的意思重新只用约定的 JSON 结构输出，不要任何其他文字。",
+    "en": (
+        "Your last output was not the agreed JSON. Restate the same content "
+        "strictly as the agreed JSON structure, with no other text."
     ),
 }
 
@@ -144,10 +193,28 @@ def intake_step(
     lang = "en" if lang == "en" else "zh"
     try:
         provider = text_backend_for_agent()
-        model = select_text_model(provider, config.get_str("SUMMARY_MODEL"))
+        model = select_text_model(
+            provider,
+            config.get_str("INTAKE_MODEL")
+            or _INTAKE_DEFAULT_BY_PROVIDER.get(provider, ""),
+        )
+        # 历史里的 assistant 消息重新包成 JSON 形态：模型在多轮后会模仿历史里
+        # 自己的输出样式——若历史示范是裸文本，第二轮起就漂出 JSON 契约
+        # （2026-08-18 真机复现：轮数=4 时返回 28-40 字符纯文本）。
+        history = [
+            m if m["role"] == "user" else {
+                "role": "assistant",
+                "content": json.dumps(
+                    {"reply": m["content"], "options": [],
+                     "ready": False, "draft": None},
+                    ensure_ascii=False,
+                ),
+            }
+            for m in messages
+        ]
         chat = [
             {"role": "system", "content": _SYSTEM[lang].format(owner=owner)},
-            *messages,
+            *history,
         ]
         text, error = call_text_model(
             chat,
@@ -161,6 +228,7 @@ def intake_step(
             return {
                 "ok": False,
                 "reply": _RETRY_REPLY[lang],
+                "options": [],
                 "ready": False,
                 "draft": None,
                 "error": error,
@@ -168,14 +236,35 @@ def intake_step(
         data = parse_json_payload(text or "")
         reply = str((data or {}).get("reply") or "").strip()
         if not data or not reply:
+            # 自动纠偏一次：把跑偏的输出塞回去，明确要求重新只出 JSON。
+            logger.info(
+                "建单对话输出跑偏（轮数=%d，长度=%d），纠偏重试一次",
+                len(messages),
+                len(text or ""),
+            )
+            correction = chat + [
+                {"role": "assistant", "content": (text or "")[:500]},
+                {"role": "user", "content": _REFORMAT_NUDGE[lang]},
+            ]
+            text, error = call_text_model(
+                correction,
+                provider=provider,
+                model=model,
+                timeout=_INTAKE_TIMEOUT_SECONDS,
+                max_tokens=_MAX_TOKENS,
+            )
+            data = parse_json_payload(text or "") if error is None else None
+            reply = str((data or {}).get("reply") or "").strip()
+        if not data or not reply:
             logger.warning(
-                "建单对话输出不可解析（轮数=%d，长度=%d）",
+                "建单对话输出不可解析（轮数=%d，长度=%d，已纠偏重试）",
                 len(messages),
                 len(text or ""),
             )
             return {
                 "ok": False,
                 "reply": _RETRY_REPLY[lang],
+                "options": [],
                 "ready": False,
                 "draft": None,
                 "error": "unparseable_model_output",
@@ -183,10 +272,17 @@ def intake_step(
         draft = (
             _sanitize_draft(data.get("draft")) if data.get("ready") else None
         )
+        raw_options = data.get("options")
+        options = (
+            [str(o).strip()[:60] for o in raw_options if str(o).strip()][:4]
+            if isinstance(raw_options, list) and draft is None
+            else []
+        )
         # ready 但草稿不合格（号码非法等）→ 降级为未就绪，绝不放坏草稿过去。
         return {
             "ok": True,
             "reply": reply[:1000],
+            "options": options,
             "ready": draft is not None,
             "draft": draft,
             "error": None,
@@ -196,6 +292,7 @@ def intake_step(
         return {
             "ok": False,
             "reply": _RETRY_REPLY[lang],
+            "options": [],
             "ready": False,
             "draft": None,
             "error": f"{type(exc).__name__}: {exc}",

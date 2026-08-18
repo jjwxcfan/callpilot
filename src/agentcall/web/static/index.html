@@ -111,6 +111,8 @@
     max-height: 40vh; overflow-y: auto; white-space: pre-wrap;
   }
   .confirm-card .cc-acts { display: flex; gap: 10px; margin-top: 16px; }
+  /* display:flex 会压过 hidden 属性的 UA 样式——显式补回（2026-08-18 真机发现） */
+  .confirm-card .cc-acts[hidden] { display: none; }
   .confirm-card .cc-acts .btn { flex: 1; }
   .confirm-card .cc-note { font-size: 11px; color: var(--dim); margin-top: 10px; }
   /* 对话式建单（WIL-120 三期 b）：GPT 式聊天框 + 任务确认卡 */
@@ -124,6 +126,11 @@
   .intake-msg.assistant { align-self: flex-start; background: var(--well);
     border: 1px solid var(--border); }
   .intake-msg.pending { color: var(--dim); font-style: italic; }
+  .intake-options { display: flex; flex-wrap: wrap; gap: 8px; align-self: flex-start; }
+  .intake-opt { background: var(--blue-dim); border: 1px solid rgba(10, 132, 255, .45);
+    border-radius: 999px; padding: 6px 14px; font-size: 13px; color: var(--text);
+    cursor: pointer; }
+  .intake-opt:hover { filter: brightness(1.2); }
   .intake-input-row { display: flex; gap: 8px; margin-top: 10px; }
   .intake-input-row input { flex: 1; }
   .intake-draft { margin-top: 10px; padding: 12px 14px; border-radius: 12px;
@@ -2121,13 +2128,14 @@ function showConfirmCard(ev) {
 
 /* ========= 对话式建单（WIL-120 三期 b）========= */
 let intakeMessages = [];   // {role, content} 全量历史，服务端无状态
+let intakeOptions = [];    // 最新一条 assistant 追问附带的候选选项（点击即发送）
 let intakeDraft = null;
 let intakeOverlay = null;
 let intakeBusy = false;
 
 function intakeClose() {
   if (intakeOverlay) { intakeOverlay.remove(); intakeOverlay = null; }
-  intakeMessages = []; intakeDraft = null; intakeBusy = false;
+  intakeMessages = []; intakeOptions = []; intakeDraft = null; intakeBusy = false;
 }
 
 function intakeRenderLog(log) {
@@ -2136,6 +2144,20 @@ function intakeRenderLog(log) {
     log.appendChild(el("div", "intake-msg " + m.role, m.content));
   if (intakeBusy)
     log.appendChild(el("div", "intake-msg assistant pending", t("intake_thinking")));
+  // 选项 chips（像 Claude Code 的问题弹窗）：点击即作为回答发送；自由输入仍可用。
+  if (!intakeBusy && intakeOptions.length) {
+    const row = el("div", "intake-options");
+    for (const opt of intakeOptions) {
+      const chip = el("button", "intake-opt", opt);
+      chip.type = "button";
+      chip.addEventListener("click", () => {
+        const input = intakeOverlay?.querySelector(".intake-input-row input");
+        if (input) { input.value = opt; input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })); }
+      });
+      row.appendChild(chip);
+    }
+    log.appendChild(row);
+  }
   log.scrollTop = log.scrollHeight;
 }
 
@@ -2173,7 +2195,7 @@ async function intakeSend(input, log, draftBox, actions) {
   if (!text || intakeBusy) return;
   input.value = "";
   intakeMessages.push({ role: "user", content: text });
-  intakeBusy = true; intakeDraft = null;
+  intakeBusy = true; intakeDraft = null; intakeOptions = [];
   intakeRenderLog(log); intakeRenderDraft(draftBox); actions.hidden = true;
   try {
     const { httpOk, res } = await postJson("/api/intake/chat",
@@ -2181,6 +2203,7 @@ async function intakeSend(input, log, draftBox, actions) {
     intakeBusy = false;
     if (!httpOk) throw new Error(res.error || "intake failed");
     intakeMessages.push({ role: "assistant", content: res.reply });
+    intakeOptions = Array.isArray(res.options) ? res.options : [];
     if (res.ready && res.draft) {
       intakeDraft = res.draft;
       actions.hidden = false;
