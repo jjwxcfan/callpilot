@@ -21,6 +21,7 @@ from .agents.tools import (
     QUERY_CODE_SPEC,
     SEND_DTMF_SPEC,
     SEND_SMS_SPEC,
+    WAIT_SMS_SPEC,
     ToolRegistry,
 )
 from .rate_limit import acquire_sms_send_slot
@@ -136,6 +137,9 @@ class CallTools:
             registry.register(
                 QUERY_CODE_SPEC,
                 self._timed("query_verification_code", self._query_code),
+            )
+            registry.register(
+                WAIT_SMS_SPEC, self._timed("wait_for_sms", self._wait_for_sms)
             )
         registry.register(SEND_DTMF_SPEC, self._timed("send_dtmf", self._send_dtmf))
         if self._direction == "outbound":
@@ -529,6 +533,50 @@ class CallTools:
             result={"success": False, "hit": False},
         )
         return result
+
+    def _wait_for_sms(self, args: dict) -> dict:
+        """工具处理：阻塞等一条**新**短信（WIL-120 三期）。
+
+        时间窗从调用时刻起算——不吃通话前的旧短信（query_verification_code
+        的已知坑：会捞到历史验证码）。跑在工具线程，不阻塞音频主循环。
+        """
+        stale = self._stale_effect_result("wait_for_sms", args)
+        if stale is not None:
+            return stale
+        if self._hub is None:
+            return {"success": False, "message": "短信通道不可用"}
+        timeout = float(config.get_int("WAIT_SMS_TIMEOUT_SECONDS"))
+        started = time.time()
+        event = self._hub.wait_for_event(
+            # 1s 余量：模组上报与工具调度之间的时钟毛边，不至于漏掉刚到的那条。
+            lambda e: (
+                e.get("type") == "sms_in"
+                and isinstance(e.get("ts"), (int, float))
+                and e["ts"] >= started - 1.0
+            ),
+            timeout=timeout,
+        )
+        if event is None:
+            self._audit_tool(
+                "wait_for_sms", args={}, result={"success": False, "hit": False}
+            )
+            return {
+                "success": False,
+                "message": f"等了 {timeout:g} 秒没有新短信到达",
+            }
+        text = str(event.get("text") or "")
+        code_match = re.search(r"(?<!\d)(\d{4,8})(?!\d)", text)
+        # 审计只记有无，不记短信内容/验证码值（WIL-95 §7 口径）。
+        self._audit_tool(
+            "wait_for_sms", args={}, result={"success": True, "hit": True}
+        )
+        return {
+            "success": True,
+            "sms_text": text,
+            "sender": event.get("sender"),
+            "code": code_match.group(1) if code_match else None,
+            "message": "新短信已到达",
+        }
 
     def _find_latest_code(self) -> tuple[str | None, str | None, str | None]:
         """在已收到的短信中查找最近的数字验证码。

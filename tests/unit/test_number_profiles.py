@@ -756,3 +756,84 @@ def test_bundled_seed_long_queue_drill_profile():
     # 二期起裁判 hold-aware，种子改回开启；时长上限留作安全网（WIL-120）。
     assert drill[0]["wrap_up_judge"] is True
     assert drill[0]["opening_mode"] == "wait"
+
+
+# ---- WIL-120 三期：task_package ----
+
+
+def test_task_package_roundtrips_through_create_and_lookup(tmp_path):
+    path = tmp_path / "number_profiles.json"
+    package = {
+        "verification": {"户名": "李明", "服务地址": "示例路 1 号"},
+        "negotiation": {"现价": "$93/mo", "目标价": "$55/mo"},
+        "preauth": {"月费上限": "$70", "合约期上限": "0 个月"},
+        "blacklist": ["开通任何增值业务"],
+    }
+    created = number_profiles.create_profile(
+        {
+            "number": "18005551234",
+            "scenario": "账单谈判",
+            "match_mode": "number",
+            "task_package": package,
+        },
+        path=path,
+    )
+    assert created["task_package"] == package
+    hit = number_profiles.lookup_profile("18005551234", "", path=path)
+    assert hit["task_package"] == package
+    # 无任务包的 profile：字段存在且为 None（调用方不用 hasattr 探测）。
+    number_profiles.create_profile(
+        {"number": "10000", "scenario": "x", "match_mode": "number"},
+        path=path,
+    )
+    assert number_profiles.lookup_profile("10000", "", path=path)[
+        "task_package"
+    ] is None
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "not-a-dict",
+        {"unknown_section": {}},
+        {"verification": "not-a-dict"},
+        {"blacklist": "not-a-list"},
+        {"blacklist": [123]},
+        {"negotiation": {"k": "v" * 201}},
+        {"preauth": {str(i): "v" for i in range(17)}},
+    ],
+)
+def test_task_package_rejects_malformed_payloads(bad, tmp_path):
+    with pytest.raises(
+        number_profiles.ProfileValidationError, match="task_package"
+    ):
+        number_profiles.create_profile(
+            {
+                "number": "10086",
+                "scenario": "x",
+                "match_mode": "number",
+                "task_package": bad,
+            },
+            path=tmp_path / "number_profiles.json",
+        )
+
+
+def test_task_package_lenient_read_skips_invalid_parts(tmp_path):
+    """手改 JSON 塞进非法段：call 时宽松读取——坏段丢弃、好段保留，不炸通话。"""
+    path = tmp_path / "number_profiles.json"
+    path.write_text(
+        json.dumps({"profiles": [{
+            "number": "10000", "scenario": "x",
+            "task_package": {
+                "negotiation": {"目标": "降费", "": "空键丢弃"},
+                "verification": "整段非法",
+                "blacklist": ["  ", "有效项"],
+            },
+        }]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    hit = number_profiles.lookup_profile("10000", "", path=path)
+    assert hit["task_package"] == {
+        "negotiation": {"目标": "降费"},
+        "blacklist": ["有效项"],
+    }

@@ -120,6 +120,81 @@ def _now_str(lang: str) -> str:
     return f"{now:%Y年%m月%d日 %H:%M}（{_WEEKDAYS_ZH[now.weekday()]}）"
 
 
+def task_package_instructions(
+    package: dict | None, owner: str, lang: str = "zh"
+) -> str:
+    """任务包（WIL-120 三期）→ 系统提示词段；空包返回空串。
+
+    隐私边界：这些值只进模型上下文，绝不进 events/metrics/日志（WIL-95 §7）。
+    敏感项识别交给模型（场景描述），不做关键词表。
+    """
+    if not package:
+        return ""
+    lines: list[str] = []
+    verification = package.get("verification") or {}
+    negotiation = package.get("negotiation") or {}
+    preauth = package.get("preauth") or {}
+    blacklist = package.get("blacklist") or []
+    if lang == "en":
+        lines.append(
+            f"Task dossier provided by {owner} — these are the facts; never "
+            "invent or alter any number in them:"
+        )
+        if verification:
+            lines.append(
+                "[Verification facts] Provide an item ONLY when the other party "
+                "asks for it to verify identity — never volunteer the whole "
+                "list. For sensitive items (ID digits, last-4 of a government "
+                "number and the like), give them only if explicitly required "
+                "and verification cannot proceed otherwise."
+            )
+            lines += [f"- {k}: {v}" for k, v in verification.items()]
+        if negotiation:
+            lines.append(
+                "[Negotiation brief] Your leverage and targets — use them, "
+                "don't read them out:"
+            )
+            lines += [f"- {k}: {v}" for k, v in negotiation.items()]
+        if preauth:
+            lines.append(
+                "[Authorized range] You may directly accept only within ALL of "
+                "the following. Anything beyond any item: call ask_owner first "
+                "and never accept on your own:"
+            )
+            lines += [f"- {k}: {v}" for k, v in preauth.items()]
+        if blacklist:
+            lines.append(
+                "[Never agree to] Decline these outright, every time, even if "
+                "bundled into an otherwise good offer; ask_owner does not "
+                "override this list:"
+            )
+            lines += [f"- {item}" for item in blacklist]
+    else:
+        lines.append(f"以下是{owner}提供的本通任务资料——事实以此为准，绝不编造或改动其中任何数字：")
+        if verification:
+            lines.append(
+                "【核身信息】仅在对方为核验身份要求时按需提供对应项，绝不主动整体报出；"
+                "证件号等敏感项只有在对方明确要求、且不提供就无法继续时才给。"
+            )
+            lines += [f"- {k}：{v}" for k, v in verification.items()]
+        if negotiation:
+            lines.append("【谈判要点】你的底牌与目标——用来谈，不要念给对方：")
+            lines += [f"- {k}：{v}" for k, v in negotiation.items()]
+        if preauth:
+            lines.append(
+                "【授权范围】以下所有条件同时满足时你才可以直接答应；"
+                "任何一项超出，必须先 ask_owner 问机主，不得自行答应："
+            )
+            lines += [f"- {k}：{v}" for k, v in preauth.items()]
+        if blacklist:
+            lines.append(
+                "【绝不同意】以下操作一律当场婉拒，即使被打包进看似划算的方案里；"
+                "ask_owner 也不覆盖这张清单："
+            )
+            lines += [f"- {item}" for item in blacklist]
+    return "\n".join(lines) + "\n"
+
+
 def build_instructions(
     direction: str,
     owner: str,
@@ -129,8 +204,9 @@ def build_instructions(
     scenario: str | None = None,
     takeover_preference: str | None = None,
     triage_pending: bool = False,
+    task_package: dict | None = None,
 ) -> str:
-    """构造会话系统提示词；``task`` 仅在外呼（direction="outbound"）时使用。"""
+    """构造会话系统提示词；``task``/``task_package`` 仅在外呼时使用。"""
     lang = normalize_lang(lang)
     if lang == "en":
         return _build_en(
@@ -141,6 +217,7 @@ def build_instructions(
             scenario,
             takeover_preference,
             triage_pending,
+            task_package,
         )
     return _build_zh(
         direction,
@@ -150,6 +227,7 @@ def build_instructions(
         scenario,
         takeover_preference,
         triage_pending,
+        task_package,
     )
 
 
@@ -182,6 +260,7 @@ def _build_zh(
     scenario: str | None = None,
     takeover_preference: str | None = None,
     triage_pending: bool = False,
+    task_package: dict | None = None,
 ) -> str:
     style = config.get_str("VOICE_STYLE").strip()
     style_line = f"机主希望的说话风格：{style}。\n" if style else ""
@@ -217,6 +296,7 @@ def _build_zh(
         scenario_value = (scenario or "").strip()
         has_scenario = bool(scenario_value)
         scenario_text = f"本通场景与开场策略：{scenario_value}\n" if has_scenario else ""
+        package_text = task_package_instructions(task_package, owner, "zh")
         opening_strategy = (
             "开场完全按上面的《本通场景与开场策略》来决定要不要自我介绍、"
             "第一句说什么，不要默认先自报身份"
@@ -227,6 +307,7 @@ def _build_zh(
             f"你是{owner}的{persona}，正在替{owner}给对方打这通电话。\n"
             + topic
             + scenario_text
+            + package_text
             + f"这件事是{owner}的（围绕{owner}名下的账户/情况）：你是主叫，对方是帮你办事"
             f"的人——可能是人工客服，也可能是自动语音菜单。所以说的是“帮{owner}查/办"
             f"{owner}这边的X”，不是“查您的X”，别把对方当成被服务的人。\n"
@@ -363,6 +444,7 @@ def _build_en(
     scenario: str | None = None,
     takeover_preference: str | None = None,
     triage_pending: bool = False,
+    task_package: dict | None = None,
 ) -> str:
     style = config.get_str("VOICE_STYLE").strip()
     style_line = f"Preferred speaking style: {style}.\n" if style else ""
@@ -417,6 +499,7 @@ def _build_en(
             if has_scenario
             else ""
         )
+        package_text = task_package_instructions(task_package, owner, "en")
         opening_strategy = (
             "defer the opening entirely to the scenario strategy above, including "
             "whether to introduce yourself and what first sentence to say; do not "
@@ -428,6 +511,7 @@ def _build_en(
             f"You are {owner}'s {persona}, making this call on {owner}'s behalf.\n"
             + topic
             + scenario_text
+            + package_text
             + f"This is {owner}'s business (about {owner}'s own account/situation): YOU "
             f"are the caller, and the other party is whoever helps you get it done — "
             f"maybe a human agent, maybe an automated voice menu. So you say \"please "

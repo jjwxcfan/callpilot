@@ -521,3 +521,45 @@ def test_inbound_prompt_tells_model_not_to_recite_or_repeat_identity():
     assert "not a checklist to recite" in en
     assert "one of them at a time" in en
     assert "never repeat it in later turns" in en
+
+
+# ---- WIL-120 三期：任务包注入 ----
+
+
+def test_task_package_injected_into_outbound_instructions():
+    from agentcall.prompts import build_instructions
+
+    package = {
+        "verification": {"户名": "李明"},
+        "negotiation": {"目标价": "$55/mo"},
+        "preauth": {"月费上限": "$70"},
+        "blacklist": ["开通增值业务"],
+    }
+    zh = build_instructions(
+        "outbound", "李明", "AI 助理", "谈账单", "zh", task_package=package
+    )
+    assert "核身信息" in zh and "户名：李明" in zh
+    assert "目标价：$55/mo" in zh
+    assert "月费上限：$70" in zh and "ask_owner" in zh
+    assert "开通增值业务" in zh
+
+    en = build_instructions(
+        "outbound", "Alex", "AI assistant", "negotiate bill", "en",
+        task_package=package,
+    )
+    assert "Verification facts" in en and "Authorized range" in en
+    assert "Never agree to" in en and "$55/mo" in en
+
+    # 空包/None：不产生任何任务资料段。
+    empty = build_instructions("outbound", "李明", "AI 助理", "谈账单", "zh")
+    assert "任务资料" not in empty
+
+
+def test_task_package_ignored_for_inbound():
+    from agentcall.prompts import build_instructions
+
+    text = build_instructions(
+        "inbound", "李明", "AI 助理", "", "zh",
+        task_package={"negotiation": {"目标价": "$55"}},
+    )
+    assert "$55" not in text
