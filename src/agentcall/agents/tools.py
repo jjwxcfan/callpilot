@@ -103,6 +103,22 @@ QUERY_CODE_SPEC: dict[str, Any] = {
 }
 
 
+WAIT_SMS_SPEC: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "wait_for_sms",
+        "description": (
+            "等待一条**新**短信到达并返回内容（最多等约一分钟）。适用于刚请求"
+            "对方发送验证码/确认短信、短信还没到的场景——与 query_verification_code"
+            "（查已收到的历史短信）互补。返回短信全文、发件号码，以及其中的数字"
+            "验证码（若能识别）。等待期间你不能说话，所以调用前先对对方说一句"
+            "「稍等，我看一下短信」。"
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+
 ASK_OWNER_SPEC: dict[str, Any] = {
     "type": "function",
     "function": {
@@ -225,6 +241,15 @@ _EN_TEXT: dict[tuple[str, str | None], str] = {
     ("ask_owner", "question"): (
         "The decision for the owner, complete in one passage with the key "
         "numbers and terms."
+    ),
+    ("wait_for_sms", None): (
+        "Wait for a NEW incoming SMS and return it (up to about a minute). Use "
+        "when a verification/confirmation text was just requested and has not "
+        "arrived yet — complements query_verification_code, which searches "
+        "already-received messages. Returns the full text, the sender, and the "
+        "numeric code if one can be recognized. You cannot speak while "
+        "waiting, so tell the other party \"one moment, let me check the "
+        "text\" before calling."
     ),
 }
 

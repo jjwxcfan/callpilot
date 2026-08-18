@@ -238,6 +238,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # 机主确认环（WIL-120 二期 Path A）：ask_owner 工具等 Web 确认卡答复的
     # 窗口；超时=拒绝（fail-closed，机主没看到不等于同意）。
     ConfigSpec("OWNER_CONFIRM_TIMEOUT_SECONDS", "机主确认等待窗口（秒）", "int", "60"),
+    # wait_for_sms 工具（WIL-120 三期）：等新短信（OTP/确认短信）的窗口。
+    ConfigSpec("WAIT_SMS_TIMEOUT_SECONDS", "等新短信窗口（秒）", "int", "60"),
     ConfigSpec(
         "INBOUND_TAKEOVER_PREFERENCE",
         "来电真人接管偏好",
@@ -715,6 +717,7 @@ _NUMERIC_RANGES: dict[str, tuple[float, float, bool]] = {
     # 0=不限时合法（number_profiles 的 max_call_seconds 可按场景覆盖，WIL-120）。
     "OUTBOUND_MAX_SECONDS": (0, 86400, False),  # ≥0 且 ≤24h
     "OWNER_CONFIRM_TIMEOUT_SECONDS": (0, 600, True),  # >0 且 ≤10min
+    "WAIT_SMS_TIMEOUT_SECONDS": (0, 600, True),       # >0 且 ≤10min
 }
 
 

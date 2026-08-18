@@ -246,6 +246,18 @@
       "opening": {
         "zh": "你好，我想咨询一下我这边套餐的情况。",
         "en": "Hi, I'd like to ask about the plan on my account."
+      },
+      "task_package": {
+        "negotiation": {
+          "目标": "了解更低月费的套餐选项与当前套餐的差价"
+        },
+        "preauth": {
+          "办理权限": "只咨询与查询，不办理任何变更"
+        },
+        "blacklist": [
+          "办理任何套餐变更、增值业务或合约",
+          "修改账户联系方式或服务密码"
+        ]
       }
     }
   ]

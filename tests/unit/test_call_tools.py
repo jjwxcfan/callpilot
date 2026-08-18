@@ -60,11 +60,15 @@ def make_tools(
 
 # ---- 注册表：4 个工具全部就位 ----
 
-def test_register_exposes_all_four_tools():
+def test_register_exposes_base_tools():
     tools, _, _ = make_tools()
     registry = tools.register()
     names = {spec["function"]["name"] for spec in registry.specs()}
-    assert names == {"send_sms", "hangup_call", "query_verification_code", "send_dtmf"}
+    # wait_for_sms 与 query_verification_code 同门（WIL-120 三期，同一开关）。
+    assert names == {
+        "send_sms", "hangup_call", "query_verification_code",
+        "wait_for_sms", "send_dtmf",
+    }
 
 
 def test_send_dtmf_tool_description_requires_silent_execution():
@@ -672,4 +676,42 @@ def test_ask_owner_timeout_is_declined_fail_closed(monkeypatch):
 def test_ask_owner_rejects_empty_question():
     tools, _, _ = make_tools(hub=make_hub(), direction="outbound")
     result = tools.register().dispatch("ask_owner", {"question": "  "})
+    assert result["success"] is False
+
+
+# ---- WIL-120 三期：wait_for_sms ----
+
+
+def test_wait_for_sms_returns_new_message_and_ignores_old(monkeypatch):
+    monkeypatch.setenv("WAIT_SMS_TIMEOUT_SECONDS", "2")
+    hub = make_hub()
+    # 通话前的旧短信：绝不能被当成「刚到的」返回。
+    hub.publish({"type": "sms_in", "ts": time.time() - 300,
+                 "sender": "10086", "text": "旧验证码 111111"})
+    tools, _, _ = make_tools(hub=hub, direction="outbound")
+    registry = tools.register()
+
+    import threading
+
+    def deliver():
+        time.sleep(0.3)
+        hub.publish({"type": "sms_in", "ts": time.time(),
+                     "sender": "10086", "text": "您的验证码是 654321"})
+
+    t = threading.Thread(target=deliver, daemon=True)
+    t.start()
+    result = registry.dispatch("wait_for_sms", {})
+    t.join()
+    assert result["success"] is True
+    assert result["code"] == "654321"
+    assert result["sender"] == "10086"
+
+
+def test_wait_for_sms_times_out_without_new_message(monkeypatch):
+    monkeypatch.setenv("WAIT_SMS_TIMEOUT_SECONDS", "1")
+    hub = make_hub()
+    hub.publish({"type": "sms_in", "ts": time.time() - 300,
+                 "sender": "10086", "text": "历史短信 999999"})
+    tools, _, _ = make_tools(hub=hub, direction="outbound")
+    result = tools.register().dispatch("wait_for_sms", {})
     assert result["success"] is False

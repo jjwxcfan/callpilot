@@ -266,6 +266,8 @@ class CallSession:
         # WIL-120 一期：profile 级长通话覆盖。None=跟随全局 OUTBOUND_MAX_SECONDS。
         self._profile_max_call_seconds: int | None = None
         self._profile_wrap_up_judge = True
+        # WIL-120 三期：结构化任务包（值只进模型上下文，不进 events/metrics）。
+        self._profile_task_package: dict | None = None
         self._dtmf_lock = threading.RLock()
         # 上行媒体互斥：drain 的「取空队列再写桥」与 DTMF 的「清队列再入双音」
         # 必须原子，否则清队列会清了个空、语音仍抢在双音前面写进桥。
@@ -386,6 +388,7 @@ class CallSession:
         self._result_verification_mode = "none"
         self._profile_max_call_seconds = None
         self._profile_wrap_up_judge = True
+        self._profile_task_package = None
         self._cancel_spoken_dtmf_followups(clear_recent=True)
         self._stop_dtmf_judge(join_timeout=0.0)
         self._stop_triage_judge(join_timeout=0.0)
@@ -1864,6 +1867,9 @@ class CallSession:
             # 曾写成 triage_mode == "enforce"，于是 _triage_pending 成了只写
             # 标志（4 处写、0 处读），放行裁决完全落空（#76）。
             triage_pending=self._triage_pending if direction == "inbound" else False,
+            task_package=(
+                self._profile_task_package if direction == "outbound" else None
+            ),
         )
 
     def _opening_instructions(self, direction: str) -> str:
@@ -2041,6 +2047,8 @@ class CallSession:
             else None
         )
         self._profile_wrap_up_judge = result.get("wrap_up_judge") is not False
+        package = result.get("task_package")
+        self._profile_task_package = package if isinstance(package, dict) else None
         if result.get("ok") and str(result.get("scenario", "")).strip():
             return str(result["scenario"])
         return None
