@@ -1625,3 +1625,31 @@ def test_owner_confirm_publishes_response_event():
     assert service.hub.events == [
         {"type": "owner_confirm_response", "id": "a" * 32, "choice": "approve"}
     ]
+
+
+# ---- WIL-120 三期 b：/api/intake/chat ----
+
+
+def test_intake_chat_endpoint_validates_and_delegates(monkeypatch):
+    from agentcall import task_intake
+
+    monkeypatch.setattr(
+        task_intake, "intake_step",
+        lambda messages, *, owner, lang: {
+            "ok": True, "reply": f"收到 {len(messages)} 条 / {lang}",
+            "ready": False, "draft": None, "error": None,
+        },
+    )
+    app = make_app(FakeService())
+
+    async def fn(client):
+        good = await client.post("/api/intake/chat", json={
+            "messages": [{"role": "user", "content": "帮我打 Xfinity"}],
+            "lang": "zh",
+        })
+        bad = await client.post("/api/intake/chat", json={"messages": []})
+        return good.status, await good.json(), bad.status
+
+    status, body, bad_status = api(app, fn)
+    assert status == 200 and body["reply"] == "收到 1 条 / zh"
+    assert bad_status == 400

@@ -113,6 +113,26 @@
   .confirm-card .cc-acts { display: flex; gap: 10px; margin-top: 16px; }
   .confirm-card .cc-acts .btn { flex: 1; }
   .confirm-card .cc-note { font-size: 11px; color: var(--dim); margin-top: 10px; }
+  /* 对话式建单（WIL-120 三期 b）：GPT 式聊天框 + 任务确认卡 */
+  .intake-card { width: min(94vw, 560px); display: flex; flex-direction: column; max-height: 86vh; }
+  .intake-log { flex: 1; overflow-y: auto; display: flex; flex-direction: column;
+    gap: 8px; padding: 10px 2px; min-height: 180px; }
+  .intake-msg { max-width: 86%; padding: 8px 12px; border-radius: 14px;
+    font-size: 13.5px; line-height: 1.6; white-space: pre-wrap; }
+  .intake-msg.user { align-self: flex-end; background: var(--blue-dim);
+    border: 1px solid rgba(10, 132, 255, .35); }
+  .intake-msg.assistant { align-self: flex-start; background: var(--well);
+    border: 1px solid var(--border); }
+  .intake-msg.pending { color: var(--dim); font-style: italic; }
+  .intake-input-row { display: flex; gap: 8px; margin-top: 10px; }
+  .intake-input-row input { flex: 1; }
+  .intake-draft { margin-top: 10px; padding: 12px 14px; border-radius: 12px;
+    background: var(--well); border: 1px solid var(--border-strong);
+    font-size: 13px; line-height: 1.6; }
+  .intake-draft .dr-line { display: flex; gap: 8px; }
+  .intake-draft .dr-key { color: var(--dim); flex: 0 0 auto; }
+  .intake-draft .dr-sect { margin-top: 6px; font-weight: 700; font-size: 12px;
+    color: var(--muted); }
   .state-chip.ended .sdot { background: var(--err); }
   .state-chip .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
   .recording-badge {
@@ -876,6 +896,7 @@
               </div>
               <div class="dial-actions">
                 <button class="btn primary" id="dialBtn" data-i18n="dial"></button>
+                <button class="btn ghost" id="intakeBtn" data-i18n="intake_open"></button>
                 <button class="btn ghost" id="remotePairBtn" data-i18n="remote_pair" hidden></button>
                 <button class="btn ghost" id="remoteInviteBtn" data-i18n="remote_invite" hidden></button>
               </div>
@@ -1434,6 +1455,20 @@ const I18N = {
     met_pill_known: "known caller", met_tip_known: "Calls where the caller was recognized as a known contact (affects greeting and strategy).",
     met_tip_combo: "The provider / turn-detection / barge-in configuration these calls ran with. Different configs are counted separately so their numbers never blend.",
     met_pill_fallback: "self-echo fallback", met_tip_fallback: "Calls where suspected self-echo (downlink audio re-captured as uplink) triggered the half-duplex fallback.",
+    intake_open: "Chat to set up a call",
+    intake_title: "Set up a call by chatting",
+    intake_greeting: "Tell me what call you want made — who to call, what to get done, and any limits (e.g. \"call Xfinity, my bill jumped from $50 to $93, get it back near $55, no contracts\").",
+    intake_thinking: "Thinking…",
+    intake_error: "Something went wrong — please say that again.",
+    intake_ph: "Describe the task, or answer the question…",
+    intake_send: "Send", intake_close: "Close",
+    intake_note: "When enough is gathered you'll get a task card to review — nothing is dialed until you press the button. Saved as a preset in the task library either way.",
+    intake_saved: "Saved to the task library.",
+    intake_save_fail: "Save failed: ",
+    intake_dial_now: "Save & dial", intake_save_only: "Save as preset",
+    intake_dr_number: "Number", intake_dr_task: "Task",
+    intake_dr_verification: "Verification facts", intake_dr_negotiation: "Negotiation brief",
+    intake_dr_preauth: "Authorized range", intake_dr_blacklist: "Never agree to",
     hold_badge: "On hold",
     confirm_title: "The assistant needs your decision",
     confirm_countdown: "Auto-decline in {s}s",
@@ -1680,6 +1715,20 @@ const I18N = {
     met_pill_known: "熟人", met_tip_known: "来电被识别为通讯录熟人的通数（影响开场白与策略）。",
     met_tip_combo: "该批通话运行时的 provider / 判停 / barge-in 配置组合。不同配置分开统计，数字绝不混平均。",
     met_pill_fallback: "自激兜底", met_tip_fallback: "疑似自激（下行音频被回采成上行）触发半双工兜底的通数。",
+    intake_open: "对话建单",
+    intake_title: "聊着把外呼任务建出来",
+    intake_greeting: "告诉我要打给谁、办什么事、有什么底线（比如「帮我打 Xfinity，账单从 50 涨到 93 了，谈回 55 左右，别签合约」）。",
+    intake_thinking: "思考中…",
+    intake_error: "出了点问题，麻烦再说一遍。",
+    intake_ph: "描述任务，或回答上面的问题…",
+    intake_send: "发送", intake_close: "关闭",
+    intake_note: "信息攒够后会出一张任务确认卡——你按下按钮前不会拨任何电话。两种保存方式都会存进任务库成为预设。",
+    intake_saved: "已存入任务库。",
+    intake_save_fail: "保存失败：",
+    intake_dial_now: "保存并拨打", intake_save_only: "仅存为预设",
+    intake_dr_number: "号码", intake_dr_task: "任务",
+    intake_dr_verification: "核身信息", intake_dr_negotiation: "谈判要点",
+    intake_dr_preauth: "授权范围", intake_dr_blacklist: "绝不同意",
     hold_badge: "排队等待",
     confirm_title: "AI 需要你拿主意",
     confirm_countdown: "{s} 秒后自动按「不同意」处理",
@@ -2069,6 +2118,147 @@ function showConfirmCard(ev) {
   tick();
   confirmCardState = { id: ev.id, deadline, timerId: setInterval(tick, 500), overlay };
 }
+
+/* ========= 对话式建单（WIL-120 三期 b）========= */
+let intakeMessages = [];   // {role, content} 全量历史，服务端无状态
+let intakeDraft = null;
+let intakeOverlay = null;
+let intakeBusy = false;
+
+function intakeClose() {
+  if (intakeOverlay) { intakeOverlay.remove(); intakeOverlay = null; }
+  intakeMessages = []; intakeDraft = null; intakeBusy = false;
+}
+
+function intakeRenderLog(log) {
+  log.textContent = "";
+  for (const m of intakeMessages)
+    log.appendChild(el("div", "intake-msg " + m.role, m.content));
+  if (intakeBusy)
+    log.appendChild(el("div", "intake-msg assistant pending", t("intake_thinking")));
+  log.scrollTop = log.scrollHeight;
+}
+
+function intakeRenderDraft(box) {
+  box.textContent = "";
+  if (!intakeDraft) { box.hidden = true; return; }
+  box.hidden = false;
+  const d = intakeDraft;
+  const line = (key, value) => {
+    const row = el("div", "dr-line");
+    row.appendChild(el("span", "dr-key", key));
+    row.appendChild(el("span", null, value));
+    box.appendChild(row);
+  };
+  line(t("intake_dr_number"), d.number);
+  line(t("intake_dr_task"), d.task);
+  const pkg = d.task_package || {};
+  const sections = [["verification", "intake_dr_verification"],
+                    ["negotiation", "intake_dr_negotiation"],
+                    ["preauth", "intake_dr_preauth"]];
+  for (const [sect, key] of sections) {
+    const entries = Object.entries(pkg[sect] || {});
+    if (!entries.length) continue;
+    box.appendChild(el("div", "dr-sect", t(key)));
+    for (const [k, v] of entries) line(k, v);
+  }
+  if ((pkg.blacklist || []).length) {
+    box.appendChild(el("div", "dr-sect", t("intake_dr_blacklist")));
+    for (const item of pkg.blacklist) line("·", item);
+  }
+}
+
+async function intakeSend(input, log, draftBox, actions) {
+  const text = input.value.trim();
+  if (!text || intakeBusy) return;
+  input.value = "";
+  intakeMessages.push({ role: "user", content: text });
+  intakeBusy = true; intakeDraft = null;
+  intakeRenderLog(log); intakeRenderDraft(draftBox); actions.hidden = true;
+  try {
+    const { httpOk, res } = await postJson("/api/intake/chat",
+      { messages: intakeMessages, lang: LANG });
+    intakeBusy = false;
+    if (!httpOk) throw new Error(res.error || "intake failed");
+    intakeMessages.push({ role: "assistant", content: res.reply });
+    if (res.ready && res.draft) {
+      intakeDraft = res.draft;
+      actions.hidden = false;
+    }
+  } catch (err) {
+    intakeBusy = false;
+    intakeMessages.push({ role: "assistant", content: t("intake_error") });
+  }
+  intakeRenderLog(log); intakeRenderDraft(draftBox);
+}
+
+async function intakeSaveAndDial(dialAfter) {
+  if (!intakeDraft) return;
+  const d = intakeDraft;
+  const payload = {
+    number: d.number, match_mode: "exact",
+    label: { [LANG]: d.label || d.task.slice(0, 20) },
+    task: { [LANG]: d.task },
+    scenario: { [LANG]: d.scenario || d.task },
+  };
+  if (d.task_package) payload.task_package = d.task_package;
+  try {
+    const { httpOk, res } = await postJson("/api/number_profiles", payload);
+    if (!httpOk) throw new Error(res.error || "save failed");
+    intakeClose();
+    await loadDialPresets();
+    if (dialAfter) {
+      $("dialNumber").value = d.number;
+      $("dialTask").value = d.task;
+      dialPresetId = res.profile.id; dialPresetHint = d.task;
+      doDial();
+    } else {
+      setToast("dialToast", "ok", t("intake_saved"));
+    }
+  } catch (err) {
+    setToast("dialToast", "err", t("intake_save_fail") + (err.message || ""));
+  }
+}
+
+function intakeOpen() {
+  intakeClose();
+  intakeOverlay = el("div", "confirm-overlay show");
+  const card = el("div", "confirm-card intake-card");
+  card.appendChild(el("h3", null, t("intake_title")));
+  const log = el("div", "intake-log");
+  card.appendChild(log);
+  const draftBox = el("div", "intake-draft");
+  draftBox.hidden = true;
+  card.appendChild(draftBox);
+  const actions = el("div", "cc-acts");
+  actions.hidden = true;
+  const dialNow = el("button", "btn primary", t("intake_dial_now"));
+  dialNow.addEventListener("click", () => intakeSaveAndDial(true));
+  const saveOnly = el("button", "btn ghost", t("intake_save_only"));
+  saveOnly.addEventListener("click", () => intakeSaveAndDial(false));
+  actions.appendChild(dialNow); actions.appendChild(saveOnly);
+  card.appendChild(actions);
+  const inputRow = el("div", "intake-input-row");
+  const input = el("input");
+  input.type = "text";
+  input.placeholder = t("intake_ph");
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") intakeSend(input, log, draftBox, actions);
+  });
+  const sendBtn = el("button", "btn primary", t("intake_send"));
+  sendBtn.addEventListener("click", () => intakeSend(input, log, draftBox, actions));
+  const closeBtn = el("button", "btn ghost", t("intake_close"));
+  closeBtn.addEventListener("click", intakeClose);
+  inputRow.appendChild(input); inputRow.appendChild(sendBtn); inputRow.appendChild(closeBtn);
+  card.appendChild(inputRow);
+  card.appendChild(el("div", "cc-note", t("intake_note")));
+  intakeOverlay.appendChild(card);
+  document.body.appendChild(intakeOverlay);
+  intakeMessages.push({ role: "assistant", content: t("intake_greeting") });
+  intakeRenderLog(log);
+  input.focus();
+}
+$("intakeBtn").addEventListener("click", intakeOpen);
 let ws;
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";

@@ -310,6 +310,7 @@ def build_app(
     )
     app.router.add_post("/api/call/batch_dial", _batch_dial)
     app.router.add_post("/api/call/owner_confirm", _owner_confirm)
+    app.router.add_post("/api/intake/chat", _intake_chat)
     app.router.add_get("/api/call/queue", _queue_status)
     app.router.add_get("/api/number_profiles", _number_profiles)
     app.router.add_get("/api/number_profiles/manage", _number_profiles_manage)
@@ -810,6 +811,29 @@ async def _remote_cloud_enroll(request: web.Request) -> web.Response:
         {"ok": True, "edge_id": stored.edge_id},
         headers={"Cache-Control": "no-store"},
     )
+
+
+async def _intake_chat(request: web.Request) -> web.Response:
+    """对话式建单（WIL-120 三期 b）：推进一轮采集对话。
+
+    无服务端会话状态：前端每轮送全量历史。模型调用是阻塞 IO，放线程池。
+    """
+    from ..prompts import agent_language, owner_name
+    from ..task_intake import _sanitize_messages, intake_step
+
+    data = await read_json(request)
+    messages = _sanitize_messages(data.get("messages"))
+    if messages is None:
+        return web.json_response(
+            {"ok": False, "error": "messages 必须是 1-40 条 user/assistant 往来，"
+             "以 user 结尾，单条 ≤2000 字符"},
+            status=400,
+        )
+    lang = data.get("lang") if data.get("lang") in ("zh", "en") else agent_language()
+    result = await asyncio.to_thread(
+        intake_step, messages, owner=owner_name(lang), lang=lang
+    )
+    return web.json_response(result)
 
 
 async def _owner_confirm(request: web.Request) -> web.Response:
