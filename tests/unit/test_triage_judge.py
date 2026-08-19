@@ -181,3 +181,151 @@ def test_consumer_transfers_at_threshold_without_realtime_discretion():
     result = consumer.consume(verdict, current_generation=7)
     assert result.outcome == "transfer"
     assert result.reason == "threshold_met"
+
+
+# ---- 转接闸门（真机 2026-08-19 spam 演练回归）----
+
+
+def test_replay_20260819_pressure_talk_cannot_flip_pending_reject():
+    """真机回放：健保推销判 marketing/reject(0.9) 待确认后，「我要马上跟本人说」
+    的加压话术让判官出 unknown/transfer(0.8)——修复前直接转接，修复后不执行、
+    且拒绝候选保留，下一轮同类别 reject 即完成二次确认。"""
+    consumer = TriageVerdictConsumer()
+    spam = parse_triage_verdict(
+        _response(
+            category="marketing",
+            action="reject",
+            confidence=0.9,
+            reason_code="spam_call",
+            turn_id=1,
+        )
+    )
+    pressure = parse_triage_verdict(
+        _response(
+            category="unknown",
+            action="transfer",
+            confidence=0.8,
+            reason_code="valid_request",
+            turn_id=2,
+        )
+    )
+    confirm = parse_triage_verdict(
+        _response(
+            category="marketing",
+            action="reject",
+            confidence=0.88,
+            reason_code="spam_call",
+            turn_id=3,
+        )
+    )
+
+    assert consumer.consume(spam, current_generation=7).outcome == "clarify"
+    gated = consumer.consume(pressure, current_generation=7)
+    assert gated.outcome == "observe"
+    assert gated.reason == "transfer_category_not_eligible"
+    assert consumer.consume(confirm, current_generation=7).outcome == "reject"
+
+
+def test_transfer_requires_identified_category():
+    """unknown/marketing 的 transfer 判决即使高置信也不执行——判官自己都定不出
+    来电性质时，不能做不可逆转接。"""
+    for category in ("unknown", "marketing"):
+        consumer = TriageVerdictConsumer()
+        verdict = parse_triage_verdict(
+            _response(category=category, confidence=0.95)
+        )
+        result = consumer.consume(verdict, current_generation=7)
+        assert result.outcome == "observe"
+        assert result.reason == "transfer_category_not_eligible"
+
+
+def test_transfer_over_pending_reject_needs_reject_grade_confidence():
+    """有待确认拒绝时，翻案为转接要拿出不低于拒绝门槛(0.85)的置信度。"""
+    consumer = TriageVerdictConsumer()
+    spam = parse_triage_verdict(
+        _response(category="marketing", action="reject", confidence=0.9, turn_id=1)
+    )
+    weak_flip = parse_triage_verdict(
+        _response(category="personal", confidence=0.8, turn_id=2)
+    )
+    strong_flip = parse_triage_verdict(
+        _response(category="personal", confidence=0.9, turn_id=3)
+    )
+
+    assert consumer.consume(spam, current_generation=7).outcome == "clarify"
+    gated = consumer.consume(weak_flip, current_generation=7)
+    assert gated.outcome == "observe"
+    assert gated.reason == "transfer_needs_stronger_evidence"
+    assert consumer.consume(strong_flip, current_generation=7).outcome == "transfer"
+
+
+def test_below_threshold_transfer_keeps_reject_candidate():
+    """低置信 transfer 摇摆不得重置拒绝确认——否则施压话术可无限拖延 reject。"""
+    consumer = TriageVerdictConsumer()
+    spam = parse_triage_verdict(
+        _response(category="marketing", action="reject", confidence=0.9, turn_id=1)
+    )
+    wobble = parse_triage_verdict(
+        _response(category="personal", confidence=0.5, turn_id=2)
+    )
+    confirm = parse_triage_verdict(
+        _response(category="marketing", action="reject", confidence=0.9, turn_id=3)
+    )
+
+    assert consumer.consume(spam, current_generation=7).outcome == "clarify"
+    wobbled = consumer.consume(wobble, current_generation=7)
+    assert wobbled.outcome == "observe"
+    assert wobbled.reason == "below_threshold"
+    assert consumer.consume(confirm, current_generation=7).outcome == "reject"
+
+
+def test_judge_prompt_gates_transfer_semantics():
+    """系统提示的承重语句不得回退：unknown 不转、施压话术不构成来意、
+    旧的「找本人优先 transfer」通道已移除。"""
+    from agentcall.triage_judge import _SYSTEM_PROMPT
+
+    assert "不构成正当来意" in _SYSTEM_PROMPT
+    assert "性质仍是 unknown 时先 clarify" in _SYSTEM_PROMPT
+    assert "维持原判" in _SYSTEM_PROMPT
+    assert "清晰意图应优先 transfer" not in _SYSTEM_PROMPT
+
+
+def test_clarify_keeps_reject_candidate():
+    """clarify 是待定不是改判：判官按新提示词对加压话术输出 unknown/clarify 时，
+    不得重置拒绝确认（否则 transfer 关掉的摇摆重置通道原样搬进 clarify）。"""
+    consumer = TriageVerdictConsumer()
+    spam = parse_triage_verdict(
+        _response(category="marketing", action="reject", confidence=0.9, turn_id=1)
+    )
+    wobble = parse_triage_verdict(
+        _response(category="unknown", action="clarify", confidence=0.6, turn_id=2)
+    )
+    confirm = parse_triage_verdict(
+        _response(category="marketing", action="reject", confidence=0.9, turn_id=3)
+    )
+
+    assert consumer.consume(spam, current_generation=7).outcome == "clarify"
+    assert consumer.consume(wobble, current_generation=7).outcome == "clarify"
+    assert consumer.consume(confirm, current_generation=7).outcome == "reject"
+
+
+def test_continue_ai_still_clears_reject_candidate():
+    """continue_ai 是与拒绝相反的积极改判，应照旧清空候选、重新起算确认。"""
+    consumer = TriageVerdictConsumer()
+    spam = parse_triage_verdict(
+        _response(category="marketing", action="reject", confidence=0.9, turn_id=1)
+    )
+    release = parse_triage_verdict(
+        _response(category="service", action="continue_ai", confidence=0.8, turn_id=2)
+    )
+    again = parse_triage_verdict(
+        _response(category="marketing", action="reject", confidence=0.9, turn_id=3)
+    )
+
+    assert consumer.consume(spam, current_generation=7).outcome == "clarify"
+    assert consumer.consume(release, current_generation=7).outcome == "continue_ai"
+    # 候选已被 continue_ai 清空，再次 reject 需重新走确认
+    assert (
+        consumer.consume(again, current_generation=7).reason
+        == "reject_confirmation_required"
+    )
