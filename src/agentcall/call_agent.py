@@ -16,7 +16,7 @@ from datetime import UTC, datetime
 from queue import Empty, Full, Queue
 from typing import Callable
 
-from . import config, platforms
+from . import call_playbooks, config, platforms
 from .agents.base import VoiceAgent
 from .agents.factory import create_agent
 from .agents.tools import REQUEST_OWNER_TAKEOVER_SPEC, ToolRegistry
@@ -1541,6 +1541,7 @@ class CallSession:
                 self._publish({"type": "call_summary", "call_id": record.id, **result})
             else:
                 logger.warning("通话摘要生成失败: %s", result.get("error"))
+            self._maybe_learn_playbook(record, transcripts, direction, number)
         except Exception as exc:  # noqa: BLE001
             logger.exception("通话摘要线程异常: %s", exc)
             try:
@@ -1549,6 +1550,51 @@ class CallSession:
                 )
             except Exception:  # noqa: BLE001
                 logger.exception("记录摘要线程失败状态时发生异常")
+
+    def _maybe_learn_playbook(
+        self,
+        record: CallRecord,
+        transcripts: list[tuple[str, str]],
+        direction: str,
+        number: str | None,
+    ) -> None:
+        """呼叫情报库自动回流（WIL-129）：摘要线程尾部顺跑一次 learner。
+
+        从转写提炼"对方索要了什么我们没有的核身信息 / 新的 IVR 流程事实"并
+        合并入库（只增不删、隐私硬校验在 call_playbooks 内）。挂在摘要流程上
+        意味着 SUMMARY_ENABLED=false 时不回流——P1 接受该耦合。绝不抛出。
+        """
+        try:
+            if direction != "outbound" or not number:
+                return
+            learned = call_playbooks.learn_from_call(
+                number,
+                transcripts,
+                self._profile_task_package,
+                call_id=record.id,
+                updated=time.strftime("%Y-%m-%d"),
+            )
+            if not learned:
+                return
+            # 只发键名与 label 级信息——情报库本身无值，事件同样保持无值。
+            keys = [
+                entry.get("key")
+                for entry in learned.get("required_info", [])
+                if isinstance(entry, dict)
+            ]
+            record.log_event(
+                "playbook_updated", playbook_id=learned.get("id"), keys=keys
+            )
+            self._publish(
+                {
+                    "type": "playbook_updated",
+                    "call_id": record.id,
+                    "playbook_id": learned.get("id"),
+                    "keys": keys,
+                }
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("呼叫情报库回流异常（不影响摘要）")
 
     def _build_tools(self, direction: str | None = None) -> ToolRegistry:
         """构造本通会话的工具集（工具语义在 call_tools 模块）。"""
@@ -1847,6 +1893,14 @@ class CallSession:
         """会话系统提示词：文本构造在 prompts 模块（纯函数，可独测）。"""
         lang = agent_language()
         scenario = self._take_prompt_scenario() if direction == "outbound" else None
+        if direction == "outbound" and call_playbooks.playbooks_enabled():
+            # 呼叫情报库（WIL-129）：命中热线的 IVR 流程知识拼进场景——导航
+            # 纪律从"每个预设手写"升级为"按热线沉淀共享"。lookup 宽松 never-raises。
+            notes = call_playbooks.ivr_notes_text(
+                call_playbooks.lookup_playbook(self.current_caller), lang
+            )
+            if notes:
+                scenario = f"{scenario}\n{notes}" if scenario else notes
         triage_mode = self._triage_mode if direction == "inbound" else "off"
         takeover_preference = (
             config.get_str("INBOUND_TAKEOVER_PREFERENCE")
@@ -3395,6 +3449,11 @@ class CallAgentService:
         missing_credentials, message = self._reject_if_credentials_missing()
         if missing_credentials:
             return False, message
+        blocked, message = self._reject_if_playbook_info_missing(
+            number, task=task, preset_hint=preset_hint, preset_id=preset_id
+        )
+        if blocked:
+            return False, message
         self._remember_outbound_task(task)
         with self._ring_lock:
             if self.session.is_active or self._remote_call_owner is not None:
@@ -3415,6 +3474,45 @@ class CallAgentService:
                     preset_id=preset_id,
                 )
         return True, None
+
+    def _reject_if_playbook_info_missing(
+        self,
+        number: str,
+        *,
+        task: str | None,
+        preset_hint: str | None,
+        preset_id: str | None,
+    ) -> tuple[bool, str | None]:
+        """拨前硬拦截（WIL-129）：热线情报库要求的必备信息，预设里必须齐。
+
+        情报库存"要什么"（键定义），预设 task_package.verification 存"是什么"
+        （值）。命中情报且缺任一必备键即拒绝拨号——信息缺口应在拨号前暴露，
+        而不是在通话里白打一通（611 演练实锤）。库未命中/开关关闭时放行；
+        检查器自身异常也放行（挡住拨号主链路比漏检更糟）。
+        """
+        try:
+            if not call_playbooks.playbooks_enabled():
+                return False, None
+            playbook = call_playbooks.lookup_playbook(number)
+            if playbook is None:
+                return False, None
+            lang = agent_language()
+            profile = None
+            if preset_id:
+                profile = lookup_profile_by_id(preset_id, number, task or "", lang=lang)
+            if profile is None:
+                match_key = preset_hint if preset_hint is not None else (task or "")
+                profile = lookup_profile(number, match_key, lang=lang)
+            package = (profile or {}).get("task_package")
+            missing = call_playbooks.missing_required_info(
+                playbook, package if isinstance(package, dict) else None
+            )
+            if not missing:
+                return False, None
+            return True, call_playbooks.missing_info_message(missing, lang)
+        except Exception:  # noqa: BLE001
+            logger.exception("呼叫情报库拨前检查异常，放行")
+            return False, None
 
     def hangup(self) -> tuple[bool, str | None]:
         """挂断进行中的通话（AI 与 IVR 互相不挂断时的人工兜底）。"""

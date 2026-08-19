@@ -17,7 +17,7 @@ import webbrowser
 from aiohttp import web
 from dotenv import load_dotenv
 
-from agentcall import config, number_profiles
+from agentcall import call_playbooks, config, number_profiles
 from agentcall.call_agent import CallAgentService
 from agentcall.cloud_control import CloudControlApi, CloudEdgeClient
 from agentcall.cloud_credentials import CloudCredentialStore
@@ -214,6 +214,7 @@ def main() -> None:
     data_dir = config.data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
     number_profiles.ensure_seeded()
+    call_playbooks.ensure_seeded()
     store_path = data_dir / "messages.json"
     hub = EventHub(loop, store_path=store_path)
 

@@ -1846,3 +1846,142 @@ def test_wrap_up_judge_on_hold_transitions(monkeypatch):
     # 非 hold 状态下复读卡死收尾照常生效。
     session._request_repeat_stuck_wrap_up("复读卡死")
     assert session._wrap_up_requested is True
+
+
+# ---------------------------------------------------------------------------
+# 呼叫情报库（WIL-129 P1）：拨前硬拦截 + ivr_notes 注入
+# ---------------------------------------------------------------------------
+
+
+def _write_playbook_env_file(playbooks: list) -> None:
+    """写到 conftest 已隔离的 CALL_PLAYBOOKS_FILE 路径。"""
+    path = Path(os.environ["CALL_PLAYBOOKS_FILE"])
+    path.write_text(
+        json.dumps({"playbooks": playbooks}, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def _drill_playbook() -> dict:
+    return {
+        "id": "att_prepaid_611",
+        "numbers": ["611"],
+        "label": {"zh": "AT&T Prepaid 客服", "en": "AT&T Prepaid CS"},
+        "required_info": [
+            {
+                "key": "account_pin",
+                "label": {"zh": "四位账户 PIN", "en": "Four-digit account PIN"},
+                "purpose": {"zh": "转人工核身", "en": "identity gate"},
+            }
+        ],
+        "ivr_notes": {"zh": "对语音菜单只说短词。", "en": "Speak short tokens only."},
+    }
+
+
+def test_dial_blocked_when_playbook_required_info_missing(monkeypatch):
+    monkeypatch.setenv("CALL_PLAYBOOKS_ENABLED", "true")
+    _write_playbook_env_file([_drill_playbook()])
+    service = make_service(FakeModem())
+    ok, err = service.dial("611")
+    assert ok is False
+    assert "四位账户 PIN" in err and "account_pin" in err
+    # 没进拨号：会话未激活
+    assert not service.session.is_active
+
+
+def test_dial_allowed_when_verification_covers_required_info(monkeypatch):
+    monkeypatch.setenv("CALL_PLAYBOOKS_ENABLED", "true")
+    _write_playbook_env_file([_drill_playbook()])
+    profiles = Path(os.environ["NUMBER_PROFILES_FILE"])
+    profiles.write_text(
+        json.dumps(
+            {
+                "profiles": [
+                    {
+                        "id": "drill611",
+                        "number": "611",
+                        "task": "查套餐",
+                        "scenario": "演练",
+                        "task_package": {"verification": {"account_pin": "1234"}},
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    service = make_service(FakeModem())
+    blocked, message = service._reject_if_playbook_info_missing(
+        "611", task="查套餐", preset_hint=None, preset_id=None
+    )
+    assert blocked is False and message is None
+
+
+def test_dial_gate_bypassed_when_playbooks_disabled():
+    # conftest 默认 CALL_PLAYBOOKS_ENABLED=false
+    _write_playbook_env_file([_drill_playbook()])
+    service = make_service(FakeModem())
+    blocked, message = service._reject_if_playbook_info_missing(
+        "611", task=None, preset_hint=None, preset_id=None
+    )
+    assert blocked is False and message is None
+
+
+def test_dial_gate_ignores_numbers_without_playbook(monkeypatch):
+    monkeypatch.setenv("CALL_PLAYBOOKS_ENABLED", "true")
+    _write_playbook_env_file([_drill_playbook()])
+    service = make_service(FakeModem())
+    blocked, message = service._reject_if_playbook_info_missing(
+        "10086", task=None, preset_hint=None, preset_id=None
+    )
+    assert blocked is False and message is None
+
+
+def test_playbook_ivr_notes_injected_into_outbound_instructions(monkeypatch):
+    monkeypatch.setenv("CALL_PLAYBOOKS_ENABLED", "true")
+    monkeypatch.setenv("AGENT_LANGUAGE", "zh")
+    _write_playbook_env_file([_drill_playbook()])
+    service = make_service(FakeModem())
+    service.session.current_caller = "611"
+    text = service.session._build_agent_instructions("outbound")
+    assert "对语音菜单只说短词。" in text
+    # inbound 不注入
+    inbound = service.session._build_agent_instructions("inbound")
+    assert "对语音菜单只说短词" not in inbound
+
+
+def test_playbook_notes_not_injected_when_disabled():
+    _write_playbook_env_file([_drill_playbook()])
+    service = make_service(FakeModem())
+    service.session.current_caller = "611"
+    text = service.session._build_agent_instructions("outbound")
+    assert "对语音菜单只说短词" not in text
+
+
+def test_summary_worker_triggers_playbook_learner(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "agentcall.call_agent.summarize_call",
+        lambda *args, **kwargs: {"ok": True, "summary": "s", "error": None},
+    )
+    seen = {}
+
+    def fake_learn(number, transcripts, package, *, call_id, updated, **kwargs):
+        seen["number"] = number
+        seen["call_id"] = call_id
+        return {
+            "id": "att_prepaid_611",
+            "required_info": [{"key": "activation_zip"}],
+        }
+
+    monkeypatch.setattr("agentcall.call_playbooks.learn_from_call", fake_learn)
+    base = tmp_path / "rec"
+    service = make_service(FakeModem(), call_logger=CallLogger(base))
+    record = service.session._begin_record("outbound", "611")
+    assert record is not None
+    record.finish("completed")
+    service.session._summarize_worker(
+        record, [("user", "please say your zip")], "outbound", "611", "none", ""
+    )
+    assert seen["number"] == "611" and seen["call_id"] == record.id
+    events = call_events(base)
+    updated = [e for e in events if e.get("type") == "playbook_updated"]
+    assert updated and updated[0]["keys"] == ["activation_zip"]
