@@ -1653,3 +1653,27 @@ def test_intake_chat_endpoint_validates_and_delegates(monkeypatch):
     status, body, bad_status = api(app, fn)
     assert status == 200 and body["reply"] == "收到 1 条 / zh"
     assert bad_status == 400
+
+
+def test_playbooks_endpoint_lists_entries(tmp_path, monkeypatch):
+    """GET /api/playbooks（WIL-129 P1）：只读返回情报库内容与开关状态。"""
+    pb = tmp_path / "pb.json"
+    pb.write_text(
+        json.dumps(
+            {"playbooks": [{"id": "att_prepaid_611", "numbers": ["611"]}]},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CALL_PLAYBOOKS_FILE", str(pb))
+    monkeypatch.setenv("CALL_PLAYBOOKS_ENABLED", "true")
+    app = make_app(FakeService())
+
+    async def fn(client):
+        res = await client.get("/api/playbooks")
+        return res.status, await res.json()
+
+    status, body = api(app, fn)
+    assert status == 200
+    assert body["ok"] is True and body["enabled"] is True
+    assert body["playbooks"][0]["id"] == "att_prepaid_611"

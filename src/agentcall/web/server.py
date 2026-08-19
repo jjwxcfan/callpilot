@@ -20,6 +20,7 @@ from serial.tools import list_ports
 
 from .. import config, metrics_report, platforms
 from ..audio_bridge import apply_pcm_gain
+from ..call_playbooks import list_playbooks, playbooks_enabled
 from ..contacts import is_reply_target_allowed
 from ..events import EventHub
 from ..modem import SerialModem
@@ -312,6 +313,7 @@ def build_app(
     app.router.add_post("/api/call/owner_confirm", _owner_confirm)
     app.router.add_post("/api/intake/chat", _intake_chat)
     app.router.add_get("/api/call/queue", _queue_status)
+    app.router.add_get("/api/playbooks", _playbooks)
     app.router.add_get("/api/number_profiles", _number_profiles)
     app.router.add_get("/api/number_profiles/manage", _number_profiles_manage)
     app.router.add_post("/api/number_profiles", _number_profiles_create)
@@ -890,6 +892,15 @@ async def _number_profiles(request: web.Request) -> web.Response:
     # UI 语言决定下拉里 label/task 的展示语言；缺省回退通话语言。
     lang = request.query.get("lang", "").strip() or config.get_str("AGENT_LANGUAGE")
     return web.json_response({"profiles": list_profiles(lang=lang, include_id=True)})
+
+
+async def _playbooks(request: web.Request) -> web.Response:
+    """呼叫情报库只读视图（WIL-129 P1）：热线要什么信息、IVR 怎么走。"""
+    loop = asyncio.get_running_loop()
+    playbooks = await loop.run_in_executor(None, list_playbooks)
+    return web.json_response(
+        {"ok": True, "enabled": playbooks_enabled(), "playbooks": playbooks}
+    )
 
 
 async def _number_profiles_manage(request: web.Request) -> web.Response:
