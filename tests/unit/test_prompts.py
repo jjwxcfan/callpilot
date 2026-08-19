@@ -563,3 +563,14 @@ def test_task_package_ignored_for_inbound():
         task_package={"negotiation": {"目标价": "$55"}},
     )
     assert "$55" not in text
+
+
+def test_outbound_voice_menu_role_discipline_present():
+    """真机 1d 教训：AI 对语音菜单说出接线员口吻（"let me connect you"）——
+    外呼 prompt 必须含角色反转自纠条款（zh/en 各自查关键句）。"""
+    zh = build_instructions("outbound", "李明", "AI 助理", "查套餐", "zh")
+    assert "角色说反了" in zh
+    assert "只说它听得懂的内容" in zh
+    en = build_instructions("outbound", "Alex", "AI assistant", "check plan", "en")
+    assert "the roles are flipped" in en
+    assert "say only what it can understand" in en
