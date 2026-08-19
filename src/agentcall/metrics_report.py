@@ -314,6 +314,21 @@ def write_label(label_path: Path, label: str) -> dict[str, Any]:
     return payload
 
 
+# 判官裁决里唯一的自由散文字段：模型用自己的话复述这通发生了什么，按提示词
+# 设计会引用通话原文。其余字段（conclusion/attribution/confidence/需否复核/
+# 模型名…）都是机器产出的枚举或数值，不含通话内容。
+_CALL_CONTENT_FIELDS = ("reasons", "evidence_refs")
+
+
+def _without_call_content(row: dict[str, Any]) -> dict[str, Any]:
+    """去掉会带出通话原文的字段——只用于**下发到 HTTP** 的那份（WIL-131）。
+
+    盘上的 verdicts.json 与 collect_verdicts()/review_queue() 保持全量，CLI 与
+    离线分析不受影响；收窄的只是网络边界。
+    """
+    return {k: v for k, v in row.items() if k not in _CALL_CONTENT_FIELDS}
+
+
 def build_dashboard_report(root: Path) -> dict[str, Any]:
     """看板一次拉全：指标汇总 + 裁决 rollup + 复核队列。
 
@@ -323,7 +338,11 @@ def build_dashboard_report(root: Path) -> dict[str, Any]:
     """
     metrics, skipped = collect(root)
     verdicts = collect_verdicts(root)
-    review = [r for r in verdicts if r["needs_review"] and not r["label"]]
+    review = [
+        _without_call_content(r)
+        for r in verdicts
+        if r["needs_review"] and not r["label"]
+    ]
     conclusions: dict[str, int] = {}
     labels: dict[str, int] = {}
     for row in verdicts:
