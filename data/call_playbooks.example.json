@@ -1,0 +1,304 @@
+{
+  "_comment": "Call playbooks seed (WIL-129): per-hotline required-info definitions and IVR flow knowledge. Copied to data/call_playbooks.json on first run. KEY/VALUE SEPARATION: this library stores only WHAT is needed (field definitions, public IVR knowledge) - never actual values. Real values (PIN, ZIP, ...) live in number_profiles.json task_package.verification. Keep entries free of any digit sequence that could be a real value; hotline numbers belong only in the numbers field.",
+  "playbooks": [
+    {
+      "id": "att_prepaid_611",
+      "numbers": [
+        "611",
+        "8009019878"
+      ],
+      "label": {
+        "zh": "AT&T Prepaid 客服（本机 SIM 拨 611，或外线拨免费客服号）",
+        "en": "AT&T Prepaid customer service (611 from this SIM, or the toll-free prepaid line)"
+      },
+      "required_info": [
+        {
+          "key": "account_pin",
+          "label": {
+            "zh": "四位账户 PIN",
+            "en": "Four-digit account PIN"
+          },
+          "purpose": {
+            "zh": "转人工前 IVR 核身第一道；可键盘输入或口述",
+            "en": "First IVR identity gate before agent transfer; enter by keypad or speak it"
+          }
+        },
+        {
+          "key": "activation_zip",
+          "label": {
+            "zh": "激活账户时使用的 ZIP code",
+            "en": "ZIP code used when activating the account"
+          },
+          "purpose": {
+            "zh": "IVR 核身第二道（PIN 之后追加询问）",
+            "en": "Second IVR identity gate (asked after the PIN)"
+          }
+        }
+      ],
+      "ivr_notes": {
+        "zh": "语音 IVR（Ada）是关键词分类器：对是非/分类式反问只用最短词回答（\"No.\"/\"Yes.\"/\"Representative\"），绝不解释、绝不说过渡句——长句会被误判。要求转人工反复用单词 \"Representative\" 或 \"Agent\"。听到按键菜单立即用键盘按键，按键优先于说话；绝不按未被菜单点名的数字。核身顺序：先四位 PIN、再激活 ZIP，全部通过后才进转人工排队。IVR 菜单播报时静默听完；排队/等待音乐期间保持完全静默、绝不挂断。客服人工时段约为周一至周五 9am-9pm、周六 12pm-9pm（东部时间），时段外只有自助菜单。",
+        "en": "The speech IVR (Ada) is a keyword classifier: answer yes/no or category questions with the shortest token only (\"No.\"/\"Yes.\"/\"Representative\") - never explain, never use transition phrases; long sentences get misclassified. To reach a human, repeat the single word \"Representative\" or \"Agent\". When a keypad menu is offered, press keys immediately - pressing takes priority over speaking; never press a digit the menu did not announce. Verification order: four-digit PIN first, then the activation ZIP; only after both does the agent-transfer queue begin. Listen silently through menu announcements; stay completely silent during hold music and never hang up. Live agents are available roughly Mon-Fri 9am-9pm and Sat 12pm-9pm ET; outside those hours only self-service menus respond."
+      },
+      "updated": "2026-08-18",
+      "source": {
+        "zh": "真机演练实测（2026-08-18，WIL-120 611 演练 1a/1b/1c）",
+        "en": "Verified on a real device (2026-08-18, WIL-120 611 drills 1a/1b/1c)"
+      },
+      "use_cases": [
+        {
+          "label": {
+            "zh": "查余额/到期日/近期用量",
+            "en": "Check balance, renewal date, recent usage"
+          },
+          "notes": {
+            "zh": "IVR 自助即可完成，无需转人工；开场常直接播报套餐与余额",
+            "en": "Self-service in the IVR, no agent needed; the greeting often reads out plan and balance"
+          }
+        },
+        {
+          "label": {
+            "zh": "充值/缴费",
+            "en": "Refill / make a payment"
+          },
+          "notes": {
+            "zh": "主菜单说 \"Payment\"；电话系统或人工缴费收手续费（约 $5），App/官网免手续费——适合只查不办",
+            "en": "Say \"Payment\" at the main menu; phone/agent payments carry a convenience fee (about $5) while the app/website are free - prefer inquiry-only on calls"
+          }
+        },
+        {
+          "label": {
+            "zh": "套餐咨询/变更",
+            "en": "Plan inquiry / change"
+          },
+          "notes": {
+            "zh": "变更类须先过 PIN(+ZIP) 核身；纯咨询也常被 IVR 要求核身后才转人工",
+            "en": "Changes require the PIN (+ZIP) identity gates first; even inquiries usually need verification before an agent"
+          }
+        },
+        {
+          "label": {
+            "zh": "携号转出（port-out）",
+            "en": "Port-out (transfer number away)"
+          },
+          "notes": {
+            "zh": "需要账号(account number)与 Number Transfer PIN（App 或客服生成），与登录 PIN 不同",
+            "en": "Needs the account number and a Number Transfer PIN (generated in the app or by an agent) - distinct from the login PIN"
+          }
+        },
+        {
+          "label": {
+            "zh": "语音信箱/故障排查",
+            "en": "Voicemail / troubleshooting"
+          },
+          "notes": {
+            "zh": "IVR 自助菜单覆盖；复杂故障才需转人工",
+            "en": "Covered by IVR self-service; only complex issues need an agent"
+          }
+        }
+      ]
+    },
+    {
+      "id": "att_postpaid_cs",
+      "numbers": [
+        "8003310500"
+      ],
+      "label": {
+        "zh": "AT&T Postpaid 无线客服（postpaid 用户拨 611 亦达同线）",
+        "en": "AT&T postpaid wireless customer service (611 from a postpaid SIM reaches the same line)"
+      },
+      "required_info": [
+        {
+          "key": "account_passcode",
+          "label": {
+            "zh": "账户持有人 passcode（数字口令）",
+            "en": "Account holder's passcode"
+          },
+          "purpose": {
+            "zh": "IVR 提示\"say or enter your account holder's passcode\"进行核身",
+            "en": "IVR asks to say or enter the account holder's passcode to verify"
+          }
+        },
+        {
+          "key": "account_holder_name",
+          "label": {
+            "zh": "账户持有人姓名",
+            "en": "Account holder's full name"
+          },
+          "purpose": {
+            "zh": "人工客服核对账户归属",
+            "en": "Agents confirm who the account belongs to"
+          }
+        },
+        {
+          "key": "billing_zip",
+          "label": {
+            "zh": "账单地址 ZIP code",
+            "en": "Billing ZIP code"
+          },
+          "purpose": {
+            "zh": "常见备用核身项（passcode 之外）",
+            "en": "Common fallback verification item besides the passcode"
+          }
+        }
+      ],
+      "ivr_notes": {
+        "zh": "待真机校准。公开资料：客服时段约为周一至周五 8am-10pm、周末 7am-7pm（东部时间）；IVR 开场即要求 say or enter passcode。常见事项：账单争议、套餐谈判、取消挽留（retention 部门）。",
+        "en": "Pending real-device calibration. Public sources: hours roughly Mon-Fri 8am-10pm, weekends 7am-7pm ET; the IVR asks to say or enter the passcode up front. Common tasks: billing disputes, plan negotiation, cancellation/retention."
+      },
+      "updated": "2026-08-18",
+      "source": {
+        "zh": "公开资料调研初版（待真机校准）",
+        "en": "Initial version from public research (pending real-device calibration)"
+      },
+      "use_cases": [
+        {
+          "label": {
+            "zh": "账单争议/费用解释",
+            "en": "Billing dispute / charge explanation"
+          },
+          "notes": {
+            "zh": "转账务部门前先过 passcode 核身",
+            "en": "Passcode verification comes before the billing department"
+          }
+        },
+        {
+          "label": {
+            "zh": "套餐谈判/降费挽留",
+            "en": "Plan negotiation / retention discount"
+          },
+          "notes": {
+            "zh": "说取消意向常被转 retention 部门，该部门权限最大",
+            "en": "Mentioning cancellation routes to retention, which has the most pricing authority"
+          }
+        },
+        {
+          "label": {
+            "zh": "取消线路",
+            "en": "Cancel a line"
+          },
+          "notes": {
+            "zh": "必过 retention 挽留流程，通话时间显著拉长",
+            "en": "Always goes through retention save-offers; expect a much longer call"
+          }
+        },
+        {
+          "label": {
+            "zh": "设备解锁/国际漫游",
+            "en": "Device unlock / international roaming"
+          },
+          "notes": {
+            "zh": "解锁走线上门户更快；漫游开通可 IVR 自助",
+            "en": "Unlocks are faster via the online portal; roaming can be enabled in the IVR"
+          }
+        }
+      ]
+    },
+    {
+      "id": "xfinity_cs",
+      "numbers": [
+        "8009346489"
+      ],
+      "label": {
+        "zh": "Xfinity/Comcast 客服（1-800-XFINITY）",
+        "en": "Xfinity/Comcast customer service (1-800-XFINITY)"
+      },
+      "required_info": [
+        {
+          "key": "account_number",
+          "label": {
+            "zh": "Xfinity 账号（账单首页可查）",
+            "en": "Xfinity account number (top of the bill)"
+          },
+          "purpose": {
+            "zh": "首选核身项；没有时可用注册手机号/服务地址替代",
+            "en": "Primary verification item; registered phone or service address works as fallback"
+          }
+        },
+        {
+          "key": "account_holder_name",
+          "label": {
+            "zh": "账户持有人姓名",
+            "en": "Account holder's full name"
+          },
+          "purpose": {
+            "zh": "核对账户归属",
+            "en": "Confirms who the account belongs to"
+          }
+        },
+        {
+          "key": "service_address",
+          "label": {
+            "zh": "服务地址",
+            "en": "Service address"
+          },
+          "purpose": {
+            "zh": "备用核身项与故障定位",
+            "en": "Fallback verification and service lookup"
+          }
+        },
+        {
+          "key": "registered_phone",
+          "label": {
+            "zh": "账户注册手机号",
+            "en": "Phone number registered on the account"
+          },
+          "purpose": {
+            "zh": "客服会向注册手机号/邮箱发验证码（配合 wait_for_sms 回读）",
+            "en": "Agents text a verification code to the registered phone/email (pair with wait_for_sms)"
+          }
+        }
+      ],
+      "ivr_notes": {
+        "zh": "待真机校准。公开资料：核身可用账号、或注册手机号/服务地址等账单信息替代；客服可向注册手机号或邮箱发送验证码完成确认。常见事项：账单谈判（WIL-120 主场景）、套餐变更、取消挽留。",
+        "en": "Pending real-device calibration. Public sources: verification accepts the account number, or billing details such as the registered phone / service address; agents can text or email a verification code to confirm. Common tasks: bill negotiation (the WIL-120 flagship scenario), plan changes, cancellation/retention."
+      },
+      "updated": "2026-08-18",
+      "source": {
+        "zh": "公开资料调研初版（待真机校准）",
+        "en": "Initial version from public research (pending real-device calibration)"
+      },
+      "use_cases": [
+        {
+          "label": {
+            "zh": "账单谈判/涨价回调",
+            "en": "Bill negotiation / price-increase rollback"
+          },
+          "notes": {
+            "zh": "WIL-120 主场景；说取消意向转 retention，报竞品价格是常用筹码",
+            "en": "The WIL-120 flagship scenario; mentioning cancellation reaches retention, and quoting competitor offers is standard leverage"
+          }
+        },
+        {
+          "label": {
+            "zh": "套餐变更/网速升降级",
+            "en": "Plan change / speed tier change"
+          },
+          "notes": {
+            "zh": "需完整核身；注意合约期与设备租赁费变化",
+            "en": "Full verification required; watch contract terms and equipment rental fee changes"
+          }
+        },
+        {
+          "label": {
+            "zh": "断网报障/预约技师",
+            "en": "Outage report / technician visit"
+          },
+          "notes": {
+            "zh": "IVR 先跑自动检测；报障只需服务地址级核身",
+            "en": "The IVR runs automated diagnostics first; outage reports need only address-level verification"
+          }
+        },
+        {
+          "label": {
+            "zh": "取消服务/搬家迁移",
+            "en": "Cancel service / move service"
+          },
+          "notes": {
+            "zh": "必过 retention；搬家迁移常被当二次销售机会",
+            "en": "Always via retention; moves are treated as a resale opportunity"
+          }
+        }
+      ]
+    }
+  ]
+}
