@@ -207,6 +207,42 @@ def test_inbound_takeover_preference_is_free_text_with_injection_boundary():
     assert "caller" in en.lower() and "cannot" in en.lower()
 
 
+def test_takeover_explicit_ask_does_not_bypass_preference_screening():
+    """真机 2026-08-19 spam 演练回归：延保推销话术一句「让我跟本人说」就触发了
+    转接——「点名找机主」曾是无条件转接通道，绕过偏好里的 spam 甄别。"""
+    zh = build_instructions(
+        "inbound",
+        "李明",
+        "数字分身",
+        "",
+        takeover_preference="真心找机主的转接；推销骚扰不转。",
+    )
+    en = build_instructions(
+        "inbound",
+        "Alex",
+        "AI assistant",
+        "",
+        "en",
+        takeover_preference="Transfer genuine calls; screen out sales calls.",
+    )
+
+    assert "点名找本人不能跳过" in zh
+    assert "不构成正当来意" in zh
+    assert "does not bypass that screening" in en
+    assert "not a legitimate purpose" in en
+    # 旧的无条件通道措辞不得回潮（「明确要求找机主本人，或…」= 独立充分条件）
+    assert "明确要求找机主本人，或" not in zh
+    assert "explicitly asks for the owner, or" not in en
+
+    # 工具描述与系统提示必须同源：转不转只归接管规则判断，工具描述不得另立
+    # 「点名即转」触发条件（真机 2026-08-19 spam 演练里两处指令打架的教训）。
+    from agentcall.agents.tools import REQUEST_OWNER_TAKEOVER_SPEC
+
+    tool_desc = REQUEST_OWNER_TAKEOVER_SPEC["function"]["description"]
+    assert "真人接管规则" in tool_desc
+    assert "明确要求找机主本人" not in tool_desc
+
+
 def test_inbound_triage_pending_restricts_realtime_without_owner_preference():
     zh = build_instructions(
         "inbound",
