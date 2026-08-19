@@ -288,3 +288,44 @@ def test_judge_prompt_gates_transfer_semantics():
     assert "性质仍是 unknown 时先 clarify" in _SYSTEM_PROMPT
     assert "维持原判" in _SYSTEM_PROMPT
     assert "清晰意图应优先 transfer" not in _SYSTEM_PROMPT
+
+
+def test_clarify_keeps_reject_candidate():
+    """clarify 是待定不是改判：判官按新提示词对加压话术输出 unknown/clarify 时，
+    不得重置拒绝确认（否则 transfer 关掉的摇摆重置通道原样搬进 clarify）。"""
+    consumer = TriageVerdictConsumer()
+    spam = parse_triage_verdict(
+        _response(category="marketing", action="reject", confidence=0.9, turn_id=1)
+    )
+    wobble = parse_triage_verdict(
+        _response(category="unknown", action="clarify", confidence=0.6, turn_id=2)
+    )
+    confirm = parse_triage_verdict(
+        _response(category="marketing", action="reject", confidence=0.9, turn_id=3)
+    )
+
+    assert consumer.consume(spam, current_generation=7).outcome == "clarify"
+    assert consumer.consume(wobble, current_generation=7).outcome == "clarify"
+    assert consumer.consume(confirm, current_generation=7).outcome == "reject"
+
+
+def test_continue_ai_still_clears_reject_candidate():
+    """continue_ai 是与拒绝相反的积极改判，应照旧清空候选、重新起算确认。"""
+    consumer = TriageVerdictConsumer()
+    spam = parse_triage_verdict(
+        _response(category="marketing", action="reject", confidence=0.9, turn_id=1)
+    )
+    release = parse_triage_verdict(
+        _response(category="service", action="continue_ai", confidence=0.8, turn_id=2)
+    )
+    again = parse_triage_verdict(
+        _response(category="marketing", action="reject", confidence=0.9, turn_id=3)
+    )
+
+    assert consumer.consume(spam, current_generation=7).outcome == "clarify"
+    assert consumer.consume(release, current_generation=7).outcome == "continue_ai"
+    # 候选已被 continue_ai 清空，再次 reject 需重新走确认
+    assert (
+        consumer.consume(again, current_generation=7).reason
+        == "reject_confirmation_required"
+    )

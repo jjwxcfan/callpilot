@@ -156,9 +156,12 @@ class TriageVerdictConsumer:
             self._reject_candidate = (verdict.category, verdict.turn_id)
             return TriageConsumption("clarify", verdict, "reject_confirmation_required")
 
-        self._reject_candidate = None
         if verdict.action == "clarify":
+            # clarify 是「待定再问一句」而非改判，不重置拒绝确认——新提示词
+            # 引导判官对加压话术输出 unknown/clarify，若这里清候选，transfer
+            # 关掉的「摇摆重置」通道就原样搬进 clarify（独立评审发现）。
             return TriageConsumption("clarify", verdict, "judge_requested")
+        self._reject_candidate = None
         if verdict.action == "continue_ai":
             return TriageConsumption("continue_ai", verdict, "judge_decided")
         return TriageConsumption("observe", verdict, "below_threshold")
