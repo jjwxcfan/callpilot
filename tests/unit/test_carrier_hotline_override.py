@@ -80,7 +80,8 @@ def test_only_known_hotlines_are_accepted(bad):
 
 
 def test_valid_set_is_exactly_the_known_hotlines():
-    assert VALID_SERVICE_NUMBERS == {"10086", "10010", "10000", "10099"}
+    # WIL-133 起还包含按国家兜底的 611（美国 NANP 通用运营商客服短码）。
+    assert VALID_SERVICE_NUMBERS == {"10086", "10010", "10000", "10099", "611"}
 
 
 def test_disagreeing_with_a_successful_detection_is_warned(caplog):
@@ -110,15 +111,23 @@ def test_other_identity_fields_are_untouched():
 # ---- 真正的收益：误拨保护重新生效 ----
 
 
-def test_misdial_guard_is_dead_without_a_service_number():
-    """前置证明：识别不到时，那道保护确实拦不住。"""
+def test_misdial_guard_blocks_when_the_service_number_is_unknown():
+    """原为「反面基线」：识别不到时保护拦不住——WIL-133 已把这个洞补上。
+
+    补之前放行，代价是话费（跨运营商客服号按普通通话计费，从美国卡拨 10086
+    更是国际长途）；现在改成拦下并提示去填 CARRIER_HOTLINE。下面
+    test_override_restores_the_misdial_guard 仍然成立：填了覆盖值之后，
+    提示会从「认不出」升级为更精确的「应为 XXXXX」。
+    """
     unknown = SimIdentity(
         present=True, plmn="", carrier="未知", service_number="",
         registered=True, reg_status="已注册",
     )
-    assert check_dial_guard(modem_online=True, sim_identity=unknown, number="10010") is None, (
-        "本用例是反面基线：service_number 为空时保护本就不拦"
+    failure = check_dial_guard(
+        modem_online=True, sim_identity=unknown, number="10010"
     )
+    assert failure is not None, "本卡客服号未知时，已知客服号必须拦下"
+    assert failure.code == "SERVICE_NUMBER_UNKNOWN"
 
 
 def test_override_restores_the_misdial_guard():
