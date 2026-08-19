@@ -151,7 +151,7 @@ struct SettingsView: View {
         case .idle: L10n.text("settings.push.unavailable")
         case .registering: L10n.text("settings.push.registering")
         case .registered: L10n.text("settings.push.registered")
-        case .failed(let code): L10n.format("settings.push.failed", code)
+        case .failed(let code): VoipPushErrorCopy.message(code: code)
         }
     }
 

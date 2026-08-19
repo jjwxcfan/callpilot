@@ -13,6 +13,20 @@ enum PairingErrorCopy {
     }
 }
 
+enum VoipPushErrorCopy {
+    static func message(code: String, locale: Locale? = nil) -> String {
+        switch code {
+        case "FEATURE_DISABLED", "FEATURE_UNAVAILABLE":
+            L10n.text("settings.push.error.disabled", locale: locale)
+        case "TRANSPORT_ERROR":
+            L10n.text("settings.push.error.network", locale: locale)
+        default:
+            // 未映射的码保留原样进文案,便于对照 Worker 侧排障。
+            L10n.format("settings.push.failed", code)
+        }
+    }
+}
+
 enum CallFailureCopy {
     static func message(code: String?, locale: Locale? = nil) -> String {
         let key = switch code {

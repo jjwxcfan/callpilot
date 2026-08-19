@@ -45,11 +45,9 @@ final class AppModel: ObservableObject {
     init(callKit: CallKitCoordinator) {
         self.callKit = callKit
         pairing = store.load()
-        // 顺序有讲究:先 rebuildClient 再 attach——冷启动重放的 answerRequested
-        // 要立即接管,client 必须已就位。
+        // 先建 client 再挂 delegate:PushKit 回调(接听/token)一到就要能干活。
         rebuildClient()
-        callKit.attach(delegate: self)
-        registerCurrentVoipToken()
+        callKit.delegate = self
     }
 
     private func rebuildClient() {
@@ -79,6 +77,7 @@ final class AppModel: ObservableObject {
         } else {
             messageInbox = nil
             callHistory = nil
+            resetVoipTokenRegistration()
         }
     }
 
@@ -157,7 +156,10 @@ final class AppModel: ObservableObject {
                 if callState != .idle {
                     incomingOffer = nil
                 }
-                if tick % 5 == 0 { await refreshDeviceStatus() }
+                if tick % 5 == 0 {
+                    await refreshDeviceStatus()
+                    retryVoipTokenRegistrationIfNeeded()
+                }
             }
             tick += 1
             try? await Task.sleep(for: offerPollInterval)
@@ -342,7 +344,7 @@ final class AppModel: ObservableObject {
     private func registerVoipToken(_ token: String, environment: ApnsEnvironment) {
         guard let currentClient = client else { return }
         let attempt = voipTokenMachine.begin()
-        voipTokenRegistration = voipTokenMachine.state
+        publishVoipTokenState()
         Task {
             do {
                 try await currentClient.registerVoipToken(token, environment: environment)
@@ -351,21 +353,30 @@ final class AppModel: ObservableObject {
             } catch {
                 guard currentClient === client else { return }
                 let code = (error as? HostedCloudError)?.code ?? "TRANSPORT_ERROR"
-                Self.voipLog.error("VoIP token 注册失败: \(code, privacy: .public)")
+                Self.voipLog.error("voip token registration failed: \(code, privacy: .public)")
                 guard voipTokenMachine.fail(code: code, for: attempt) else { return }
             }
-            voipTokenRegistration = voipTokenMachine.state
+            publishVoipTokenState()
         }
     }
 
-    /// 回前台时对失败态重试一次;成功/进行中/未配对不动。
+    /// 对失败态重试;token 已失效则归位未注册(失败态没有可重试对象)。
     func retryVoipTokenRegistrationIfNeeded() {
         guard case .failed = voipTokenRegistration else { return }
-        registerCurrentVoipToken()
+        if callKit.currentToken == nil {
+            resetVoipTokenRegistration()
+        } else {
+            registerCurrentVoipToken()
+        }
     }
 
     private func resetVoipTokenRegistration() {
         voipTokenMachine.reset()
+        publishVoipTokenState()
+    }
+
+    // 状态机变更与发布不许分离:漏一处镜像就是 Settings 静默显示陈旧状态。
+    private func publishVoipTokenState() {
         voipTokenRegistration = voipTokenMachine.state
     }
 }

@@ -36,14 +36,19 @@ final class CallKitConfigurationTests: XCTestCase {
 
     func testApnsEnvironmentComesFromRuntimeDetectionNotBuildConfiguration() throws {
         let source = try source("ios/CallPilot/Call/CallKitCoordinator.swift")
-        XCTAssertFalse(
-            source.contains("#if DEBUG"),
-            "环境判定不得回到编译配置猜测——签名 profile 才是 token 归属的真相源"
-        )
         XCTAssertTrue(source.contains("ApnsEnvironmentDetector.detect()"))
+
+        // 只约束 token 上报路径:签名 profile 才是 token 归属的真相源,这里不许
+        // 回到 #if DEBUG 猜测。文件其他位置的编译条件不在本契约范围内。
+        let tokenHandler = try XCTUnwrap(
+            source.components(separatedBy: "didUpdate pushCredentials").last?
+                .components(separatedBy: "didInvalidatePushTokenFor").first
+        )
+        XCTAssertFalse(tokenHandler.contains("#if DEBUG"))
+        XCTAssertTrue(tokenHandler.contains("self.apnsEnvironment"))
     }
 
-    func testPushRegistryIsCreatedInAppDelegateLaunch() throws {
+    func testPushKitStartsAtLaunchWithDelegateAlreadyAttached() throws {
         let app = try source("ios/CallPilot/CallPilotApp.swift")
         XCTAssertTrue(app.contains("@UIApplicationDelegateAdaptor(AppDelegate.self)"))
 
@@ -51,15 +56,17 @@ final class CallKitConfigurationTests: XCTestCase {
         let launch = try XCTUnwrap(
             delegate.components(separatedBy: "didFinishLaunchingWithOptions").last
         )
+        let modelRange = try XCTUnwrap(launch.range(of: "AppModel(callKit:"))
+        let startRange = try XCTUnwrap(launch.range(of: "callKit.start()"))
         XCTAssertTrue(
-            launch.contains("callKit.start()"),
-            "PushKit 注册必须发生在 didFinishLaunching 内(冷启动 VoIP push 契约)"
+            modelRange.lowerBound < startRange.lowerBound,
+            "AppModel(即 delegate)必须先于 PushKit start():后台冷启动不连接场景,延迟挂 delegate 会丢接听回调"
         )
 
         let model = try source("ios/CallPilot/AppModel.swift")
         XCTAssertFalse(model.contains("callKit.start()"))
         XCTAssertFalse(model.contains("CallKitCoordinator()"))
-        XCTAssertTrue(model.contains("callKit.attach(delegate:"))
+        XCTAssertTrue(model.contains("callKit.delegate = self"))
     }
 
     private func source(_ path: String) throws -> String {

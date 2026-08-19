@@ -28,7 +28,6 @@ final class CallKitCoordinator: NSObject {
     private var calls = CallKitCallRegistry()
     private var pendingAnswers: [UUID: CXAnswerCallAction] = [:]
     private var expirationTasks: [UUID: Task<Void, Never>] = [:]
-    private var eventBuffer = CallKitDelegateEventBuffer()
 
     init(apnsEnvironment: ApnsEnvironment = ApnsEnvironmentDetector.detect()) {
         self.apnsEnvironment = apnsEnvironment
@@ -50,37 +49,6 @@ final class CallKitCoordinator: NSObject {
         registry.delegate = self
         registry.desiredPushTypes = [.voIP]
         pushRegistry = registry
-    }
-
-    /// 挂接 delegate 并重放空窗期缓存的回调。冷启动(被杀后由 VoIP push 拉起)时
-    /// report() 先于 SwiftUI 场景执行,delegate 还不存在——answer/decline 不缓存
-    /// 就会丢,接听请求挂死直至 CallKit 超时。
-    func attach(delegate: any CallKitCoordinatorDelegate) {
-        self.delegate = delegate
-        // 补课:report() 时 delegate 缺位跳过了音频会话准备,仍在响铃的通话要在
-        // 接听前补上,否则 CallKit 激活音频会话时 LiveKit 仍处自动配置模式。
-        if delegate.callKitCanAcceptIncomingCall,
-           calls.firstCallUUID(in: .ringing) != nil {
-            CallKitAudioSessionBridge.prepareForIncoming()
-        }
-        for event in eventBuffer.drain() { dispatch(event) }
-    }
-
-    private func emit(_ event: CallKitDelegateEvent) {
-        guard delegate != nil else {
-            eventBuffer.append(event)
-            return
-        }
-        dispatch(event)
-    }
-
-    private func dispatch(_ event: CallKitDelegateEvent) {
-        switch event {
-        case .offerReceived(let offer): delegate?.callKitDidReceiveOffer(offer)
-        case .answerRequested(let offer): delegate?.callKitDidRequestAnswer(offer)
-        case .declineRequested(let offer): delegate?.callKitDidRequestDecline(offer)
-        case .hangupRequested: delegate?.callKitDidRequestHangup()
-        }
     }
 
     func requestAnswerIfManaged(_ offer: InboundOffer) async -> Bool {
@@ -171,7 +139,7 @@ final class CallKitCoordinator: NSObject {
                         callUUID: payload.callUUID,
                         expiresAt: payload.expiresAtUnixMs
                     )
-                    self.emit(.offerReceived(offer))
+                    self.delegate?.callKitDidReceiveOffer(offer)
                     self.scheduleExpiration(payload)
                 } else {
                     _ = self.calls.remove(callUUID: payload.callUUID)
@@ -208,11 +176,11 @@ final class CallKitCoordinator: NSObject {
         provider.reportCall(with: callUUID, endedAt: Date(), reason: reason)
         if phase == .ringing {
             CallKitAudioSessionBridge.prepareForStandaloneCall()
-            emit(.declineRequested(InboundOffer(
+            delegate?.callKitDidRequestDecline(InboundOffer(
                 offerId: payload.offerId,
                 callUUID: payload.callUUID,
                 expiresAt: payload.expiresAtUnixMs
-            )))
+            ))
         }
     }
 
@@ -298,7 +266,7 @@ extension CallKitCoordinator: CXProviderDelegate {
             self.expirationTasks.removeAll()
             _ = self.calls.removeAll()
             CallKitAudioSessionBridge.prepareForStandaloneCall()
-            self.emit(.hangupRequested)
+            self.delegate?.callKitDidRequestHangup()
         }
     }
 
@@ -311,11 +279,11 @@ extension CallKitCoordinator: CXProviderDelegate {
             }
             self.expirationTasks.removeValue(forKey: action.callUUID)?.cancel()
             self.pendingAnswers[action.callUUID] = action
-            self.emit(.answerRequested(InboundOffer(
+            self.delegate?.callKitDidRequestAnswer(InboundOffer(
                 offerId: payload.offerId,
                 callUUID: payload.callUUID,
                 expiresAt: payload.expiresAtUnixMs
-            )))
+            ))
         }
     }
 
@@ -333,14 +301,14 @@ extension CallKitCoordinator: CXProviderDelegate {
             self.expirationTasks.removeValue(forKey: action.callUUID)?.cancel()
             self.pendingAnswers.removeValue(forKey: action.callUUID)?.fail()
             if phase == .active || phase == .answering {
-                self.emit(.hangupRequested)
+                self.delegate?.callKitDidRequestHangup()
             } else {
                 CallKitAudioSessionBridge.prepareForStandaloneCall()
-                self.emit(.declineRequested(InboundOffer(
+                self.delegate?.callKitDidRequestDecline(InboundOffer(
                     offerId: payload.offerId,
                     callUUID: payload.callUUID,
                     expiresAt: payload.expiresAtUnixMs
-                )))
+                ))
             }
             action.fulfill()
         }

@@ -165,6 +165,8 @@
 "settings.push.registering" = "注册中…";
 "settings.push.registered" = "已注册";
 "settings.push.failed" = "失败(%@)";
+"settings.push.error.disabled" = "服务端未开启推送";
+"settings.push.error.network" = "网络错误";
 "settings.status.checking" = "正在检查";
 "settings.status.unavailable" = "暂不可用";
 "settings.status.online" = "在线";

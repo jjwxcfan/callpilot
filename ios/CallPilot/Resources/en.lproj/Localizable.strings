@@ -165,6 +165,8 @@
 "settings.push.registering" = "Registering…";
 "settings.push.registered" = "Registered";
 "settings.push.failed" = "Failed (%@)";
+"settings.push.error.disabled" = "Server Push Disabled";
+"settings.push.error.network" = "Network Error";
 "settings.status.checking" = "Checking";
 "settings.status.unavailable" = "Unavailable";
 "settings.status.online" = "Online";
