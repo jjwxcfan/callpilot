@@ -84,7 +84,9 @@ def test_identify_all_known_plmns():
 
 
 def test_identify_unknown_plmn_no_service_number():
-    sim = identify("310150123456789\r\nOK", "+CREG: 0,1")  # 美国运营商
+    # 原用例拿美国卡(310150)当「识别不到」的样本；WIL-133 起美国按 MCC 兜底出
+    # 611，故改用仍未覆盖的英国(234)。断言的规则没变：表里没有的国家不编号码。
+    sim = identify("234159876543210\r\nOK", "+CREG: 0,1")  # 英国，未覆盖
     assert sim.present and sim.carrier == "未知" and sim.service_number == ""
 
 
@@ -302,3 +304,43 @@ def test_open_serial_enables_sim_and_registration_urcs_before_identity_refresh(m
 
     assert commands.index("AT+QSIMSTAT=1") < commands.index("AT+CIMI")
     assert commands.index("AT+CREG=1") < commands.index("AT+CIMI")
+
+
+# ---- 国家级兜底：非大陆卡也要识别出免费客服号（WIL-133）----
+
+
+def test_us_mcc_resolves_to_the_universal_carrier_hotline():
+    """611 是 NANP 全国通用的运营商客服短码，按 MCC 粒度给即可。
+
+    美国 MNC 是 3 位（AT&T 310-410），而 plmn 取 imsi[:5]，切出来是 MCC + MNC
+    前两位，本来就对不齐——所以必须按 MCC 兜底，不能指望精确表命中。
+    """
+    for imsi in (
+        "310410123456789",  # AT&T
+        "311480123456789",  # Verizon
+        "310260123456789",  # T-Mobile
+    ):
+        sim = identify(f"+CIMI: {imsi}", "+CREG: 0,1")
+        assert sim.service_number == "611", imsi
+        assert sim.carrier == "美国运营商"
+
+
+def test_mainland_lookup_still_wins_over_the_country_fallback():
+    """精确表优先：大陆卡的识别结果不能被兜底改掉。"""
+    sim = identify("+CIMI: 460071234567890", "+CREG: 0,1")
+    assert sim.carrier == "中国移动" and sim.service_number == "10086"
+
+
+def test_unmapped_country_stays_unknown():
+    """没覆盖的国家仍是「未知」——兜底不能假装认识所有卡。"""
+    sim = identify("+CIMI: 234159876543210", "+CREG: 0,1")  # UK
+    assert sim.carrier == "未知" and sim.service_number == ""
+
+
+def test_carrier_hotline_override_now_accepts_611():
+    """兜底通道对美国用户开放：此前 611 会被当非法值忽略。"""
+    from agentcall.sim_identity import VALID_SERVICE_NUMBERS, with_service_number_override
+
+    assert "611" in VALID_SERVICE_NUMBERS
+    unknown = identify("+CIMI: 234159876543210", "+CREG: 0,1")
+    assert with_service_number_override(unknown, "611").service_number == "611"
