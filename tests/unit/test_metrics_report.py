@@ -13,6 +13,7 @@ from agentcall.call_log import CallLogger
 from agentcall.metrics_report import (
     build_dashboard_report,
     collect,
+    collect_verdicts,
     review_queue,
     summarize,
     write_label,
@@ -232,3 +233,54 @@ def test_metrics_label_endpoint_writes_and_validates(tmp_path):
     assert label["label"] == "correct"
     # 标注后不再占复核队列。
     assert review_queue(tmp_path) == []
+
+
+# ---- 网络边界不带通话原文（WIL-131）----
+
+
+def _seed_verdict_call(root, call_id, *, needs_review=True):
+    d = root / call_id
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "verdicts.json").write_text(json.dumps({
+        "conclusion": "achieved",
+        "attribution": "agent",
+        "confidence": 0.8,
+        "reasons": "对方说本月账单是 128 元，机主身份证后四位 1234 已核对",
+        "evidence_refs": ["客服：请提供身份证后四位", "AI：1234"],
+        "needs_review": needs_review,
+        "review_reason": "no_hard_evidence",
+        "judge_model": "gpt-4o",
+        "prompt_version": "v1",
+    }, ensure_ascii=False), encoding="utf-8")
+    return d
+
+
+def test_dashboard_report_strips_call_content_from_review_rows(tmp_path):
+    """判官散文会引用通话原文，不能随无鉴权接口下发。
+
+    该字段是模型用自己的话复述这通发生了什么，提示词明确要求引用证据片段；
+    而看板当前根本没有渲染复核队列，等于挂在网上却没人看——最不该有的形态。
+    """
+    _seed_verdict_call(tmp_path, "20260812-041410-outbound-10086")
+
+    report = build_dashboard_report(tmp_path)
+
+    assert report["review"], "复核队列本身要保留"
+    row = report["review"][0]
+    assert "reasons" not in row, "判官散文不得下发"
+    assert "evidence_refs" not in row, "证据片段不得下发"
+    # 机器产出的判定元数据照常保留，复核队列才有用
+    assert row["conclusion"] == "achieved"
+    assert row["needs_review"] is True
+    assert row["review_reason"] == "no_hard_evidence"
+    # 兜底：整份响应里不得出现通话原文
+    assert "128 元" not in json.dumps(report, ensure_ascii=False)
+
+
+def test_on_disk_and_cli_paths_keep_full_verdict(tmp_path):
+    """收窄只发生在 HTTP 边界：盘上与 CLI 仍是全量，离线分析不受影响。"""
+    _seed_verdict_call(tmp_path, "20260812-041410-outbound-10086")
+
+    rows = collect_verdicts(tmp_path)
+    assert rows[0]["reasons"].startswith("对方说本月账单")
+    assert review_queue(tmp_path)[0]["reasons"]
