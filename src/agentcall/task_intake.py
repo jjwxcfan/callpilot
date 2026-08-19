@@ -19,10 +19,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from . import config
-from .number_profiles import _DIAL_NUMBER_RE, _normalize_task_package
+from .number_profiles import _normalize_task_package
 from .prompt_gen import (
     call_text_model,
     parse_json_payload,
@@ -165,13 +166,22 @@ def _sanitize_messages(raw: Any) -> list[dict[str, str]] | None:
     return out
 
 
+# 模型产出的号码单独收严，**不复用** number_profiles._DIAL_NUMBER_RE（WIL-130）。
+# 那条允许 * 与 #，是给人工手输预设留的；而 GSM 补充业务码形如 *21*<号码>#，
+# 拨出去不是打电话，是在机主 SIM 上设置无条件呼叫转移——机主此后所有来电被转走
+# 且几乎不会察觉。建单聊天恰恰是机主会粘贴外部文本的地方（「打发票上这个号码」），
+# 所以这个字段是**间接可被攻击者影响**的，不能沿用人工输入那档宽松度。
+# 下限 3 位：611 / 911 这类短号必须能过。
+_LLM_DIAL_NUMBER_RE = re.compile(r"\+?[0-9]{3,20}")
+
+
 def _sanitize_draft(raw: Any) -> dict[str, Any] | None:
     """草稿收口：号码/文本字段校验 + task_package 宽松归一化。"""
     if not isinstance(raw, dict):
         return None
     number = str(raw.get("number") or "").strip()
     task = " ".join(str(raw.get("task") or "").split())
-    if not _DIAL_NUMBER_RE.fullmatch(number) or not task:
+    if not _LLM_DIAL_NUMBER_RE.fullmatch(number) or not task:
         return None
     return {
         "number": number,
