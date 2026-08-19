@@ -15,7 +15,9 @@ Edge/cloud 侧无需改动;Android(`../android`)是同协议的活参照实现�
 - `CallPilot/Info.plist` — 前台版权限(麦克风)
 
 待续建:配对/拨号/来电接听卡/通话页(SwiftUI)、LiveKit 媒体会话、前台轮询接管。
-CallKit/PushKit(锁屏系统来电)属 Phase 2。
+CallKit/PushKit(锁屏系统来电)已实现:`CallPilot/Call/CallKitCoordinator.swift`
+(VoIP push → CallKit 上报 → 接听接管;需 Worker 侧开 `VOIP_PUSH_ENABLED` 并配 APNs
+secrets,见 `../cloud/README.md`)。
 
 ## 环境前置(硬阻塞)
 

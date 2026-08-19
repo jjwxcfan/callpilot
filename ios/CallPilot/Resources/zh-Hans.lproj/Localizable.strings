@@ -160,6 +160,11 @@
 "settings.connection.edge" = "电脑端";
 "settings.connection.sim" = "SIM / 模组";
 "settings.connection.refresh" = "刷新状态";
+"settings.connection.push" = "来电推送";
+"settings.push.unavailable" = "未注册";
+"settings.push.registering" = "注册中…";
+"settings.push.registered" = "已注册";
+"settings.push.failed" = "失败(%@)";
 "settings.status.checking" = "正在检查";
 "settings.status.unavailable" = "暂不可用";
 "settings.status.online" = "在线";

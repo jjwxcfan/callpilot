@@ -18,6 +18,11 @@ struct SettingsView: View {
                     value: simStatusText,
                     color: simStatusColor
                 )
+                DeviceStatusRow(
+                    title: L10n.text("settings.connection.push"),
+                    value: pushStatusText,
+                    color: pushStatusColor
+                )
                 HStack {
                     Label(deviceSyncText, systemImage: deviceSyncIcon)
                         .foregroundStyle(.secondary)
@@ -139,6 +144,23 @@ struct SettingsView: View {
     private var simStatusColor: Color {
         guard let status = model.deviceStatus, status.connected else { return .gray }
         return status.modemOnline ? .green : .red
+    }
+
+    private var pushStatusText: String {
+        switch model.voipTokenRegistration {
+        case .idle: L10n.text("settings.push.unavailable")
+        case .registering: L10n.text("settings.push.registering")
+        case .registered: L10n.text("settings.push.registered")
+        case .failed(let code): L10n.format("settings.push.failed", code)
+        }
+    }
+
+    private var pushStatusColor: Color {
+        switch model.voipTokenRegistration {
+        case .idle, .registering: .gray
+        case .registered: .green
+        case .failed: .red
+        }
     }
 
     private var deviceSyncText: String {

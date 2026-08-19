@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import os
 
 /// App 状态中枢:配对、线路状态轮询、来电 offer 轮询、通话状态机。
 /// 对齐 Android CallManager + MainActivity 的组合职责。
@@ -18,6 +19,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var deviceStatus: HostedDeviceStatus?
     @Published private(set) var deviceStatusSync: DeviceStatusSyncState = .idle
     @Published private(set) var deviceStatusRefreshing = false
+    @Published private(set) var voipTokenRegistration: VoipTokenRegistrationState = .idle
 
     private let store = CredentialStore()
     private var client: HostedCloudClient?
@@ -27,18 +29,26 @@ final class AppModel: ObservableObject {
     private let messageStore = FileMessageCacheStore()
     private let callHistoryStore = FileCallHistoryCacheStore()
     private var deviceStatusMachine = DeviceStatusStateMachine()
-    private let callKit = CallKitCoordinator()
+    private var voipTokenMachine = VoipTokenRegistrationMachine()
+    private let callKit: CallKitCoordinator
+    // 只记错误码,绝不记 token 值。
+    private static let voipLog = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "CallPilot",
+        category: "voip-push"
+    )
 
     // 接管媒体超时(对齐 Android takeoverMediaTimeoutMs;真机实证:失败会话不复位会挡后续 offer)。
     private let takeoverMediaTimeout: Duration = .seconds(20)
     private let offerPollInterval: Duration = .seconds(3)
     private let lineStatusInterval: Duration = .seconds(15)
 
-    init() {
+    init(callKit: CallKitCoordinator) {
+        self.callKit = callKit
         pairing = store.load()
+        // 顺序有讲究:先 rebuildClient 再 attach——冷启动重放的 answerRequested
+        // 要立即接管,client 必须已就位。
         rebuildClient()
-        callKit.delegate = self
-        callKit.start()
+        callKit.attach(delegate: self)
         registerCurrentVoipToken()
     }
 
@@ -48,6 +58,7 @@ final class AppModel: ObservableObject {
             client = nil
             messageInbox = nil
             callHistory = nil
+            resetVoipTokenRegistration()
             return
         }
         client = try? HostedCloudClient(baseURL: p.gatewayURL).also { $0.credential = p.credential }
@@ -95,6 +106,7 @@ final class AppModel: ObservableObject {
     func unpair() {
         let pairedClient = client
         Task { try? await pairedClient?.unregisterVoipToken() }
+        resetVoipTokenRegistration()
         messageInbox?.clearLocalData()
         callHistory?.clearLocalData()
         store.clear()
@@ -323,8 +335,38 @@ final class AppModel: ObservableObject {
     }
 
     private func registerCurrentVoipToken() {
-        guard let client, let token = callKit.currentToken else { return }
-        Task { try? await client.registerVoipToken(token.value, environment: token.environment) }
+        guard let token = callKit.currentToken else { return }
+        registerVoipToken(token.value, environment: token.environment)
+    }
+
+    private func registerVoipToken(_ token: String, environment: ApnsEnvironment) {
+        guard let currentClient = client else { return }
+        let attempt = voipTokenMachine.begin()
+        voipTokenRegistration = voipTokenMachine.state
+        Task {
+            do {
+                try await currentClient.registerVoipToken(token, environment: environment)
+                guard currentClient === client,
+                      voipTokenMachine.succeed(environment, for: attempt) else { return }
+            } catch {
+                guard currentClient === client else { return }
+                let code = (error as? HostedCloudError)?.code ?? "TRANSPORT_ERROR"
+                Self.voipLog.error("VoIP token 注册失败: \(code, privacy: .public)")
+                guard voipTokenMachine.fail(code: code, for: attempt) else { return }
+            }
+            voipTokenRegistration = voipTokenMachine.state
+        }
+    }
+
+    /// 回前台时对失败态重试一次;成功/进行中/未配对不动。
+    func retryVoipTokenRegistrationIfNeeded() {
+        guard case .failed = voipTokenRegistration else { return }
+        registerCurrentVoipToken()
+    }
+
+    private func resetVoipTokenRegistration() {
+        voipTokenMachine.reset()
+        voipTokenRegistration = voipTokenMachine.state
     }
 }
 
@@ -334,11 +376,11 @@ extension AppModel: CallKitCoordinatorDelegate {
     }
 
     func callKitDidUpdateToken(_ token: String, environment: ApnsEnvironment) {
-        guard let client else { return }
-        Task { try? await client.registerVoipToken(token, environment: environment) }
+        registerVoipToken(token, environment: environment)
     }
 
     func callKitDidInvalidateToken() {
+        resetVoipTokenRegistration()
         guard let client else { return }
         Task { try? await client.unregisterVoipToken() }
     }

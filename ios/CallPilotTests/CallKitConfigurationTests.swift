@@ -34,6 +34,41 @@ final class CallKitConfigurationTests: XCTestCase {
         XCTAssertTrue(callback.contains("self.report(decoded, completion: completionBox)"))
     }
 
+    func testApnsEnvironmentComesFromRuntimeDetectionNotBuildConfiguration() throws {
+        let source = try source("ios/CallPilot/Call/CallKitCoordinator.swift")
+        XCTAssertFalse(
+            source.contains("#if DEBUG"),
+            "环境判定不得回到编译配置猜测——签名 profile 才是 token 归属的真相源"
+        )
+        XCTAssertTrue(source.contains("ApnsEnvironmentDetector.detect()"))
+    }
+
+    func testPushRegistryIsCreatedInAppDelegateLaunch() throws {
+        let app = try source("ios/CallPilot/CallPilotApp.swift")
+        XCTAssertTrue(app.contains("@UIApplicationDelegateAdaptor(AppDelegate.self)"))
+
+        let delegate = try source("ios/CallPilot/AppDelegate.swift")
+        let launch = try XCTUnwrap(
+            delegate.components(separatedBy: "didFinishLaunchingWithOptions").last
+        )
+        XCTAssertTrue(
+            launch.contains("callKit.start()"),
+            "PushKit 注册必须发生在 didFinishLaunching 内(冷启动 VoIP push 契约)"
+        )
+
+        let model = try source("ios/CallPilot/AppModel.swift")
+        XCTAssertFalse(model.contains("callKit.start()"))
+        XCTAssertFalse(model.contains("CallKitCoordinator()"))
+        XCTAssertTrue(model.contains("callKit.attach(delegate:"))
+    }
+
+    private func source(_ path: String) throws -> String {
+        try String(
+            contentsOf: repositoryRoot.appendingPathComponent(path),
+            encoding: .utf8
+        )
+    }
+
     private func plist(_ path: String) throws -> [String: Any] {
         try XCTUnwrap(
             PropertyListSerialization.propertyList(
