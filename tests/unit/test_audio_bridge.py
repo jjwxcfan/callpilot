@@ -322,3 +322,177 @@ def test_ffmpeg_bridge_constructs_on_macos(monkeypatch):
 def test_create_audio_bridge_invalid_mode_mentions_macos_constraint():
     with pytest.raises(ValueError, match="仅 macOS"):
         create_audio_bridge("bogus", "Interface", None, 921600)
+
+
+# ---- SerialPcmAudioBridge: macOS PTY 波特率回退 ----
+
+def test_serial_pcm_open_falls_back_to_115200_on_enotty(monkeypatch):
+    """PTY(USB→PTY 桥)不支持自定义波特率 ioctl(ENOTTY)时退回 115200 重开。"""
+    import errno
+
+    from agentcall.audio_bridge import SerialPcmAudioBridge
+
+    tried = []
+
+    class FakeSerial:
+        def __init__(self, port, baudrate, **kw):
+            tried.append(baudrate)
+            if baudrate != 115200:
+                raise OSError(errno.ENOTTY, "Inappropriate ioctl for device")
+            self.is_open = True
+
+    monkeypatch.setattr(audio_bridge.serial, "Serial", FakeSerial)
+    bridge = SerialPcmAudioBridge("/tmp/sim7600-pcm", baudrate=921600)
+    ser = bridge._open_serial()
+    assert tried == [921600, 115200]
+    assert ser.is_open is True
+
+
+def test_serial_pcm_open_reraises_non_enotty(monkeypatch):
+    """非 ENOTTY 的 OSError(如权限/设备不存在)不吞，照常上抛。"""
+    import errno
+
+    from agentcall.audio_bridge import SerialPcmAudioBridge
+
+    def boom(port, baudrate, **kw):
+        raise OSError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(audio_bridge.serial, "Serial", boom)
+    bridge = SerialPcmAudioBridge("/tmp/sim7600-pcm", baudrate=921600)
+    with pytest.raises(OSError) as exc:
+        bridge._open_serial()
+    assert exc.value.errno == errno.EACCES
+
+
+def test_serial_pcm_read_chunk_even_aligned_with_carry(monkeypatch):
+    """串口读可能返回奇数字节；read_modem_chunk 须始终返回偶数（16-bit 对齐），
+    奇出的 1 字节 carry 到下次——否则 np.frombuffer(int16) 崩掉整通。"""
+    from agentcall.audio_bridge import SerialPcmAudioBridge
+
+    bridge = SerialPcmAudioBridge("/tmp/sim7600-pcm")
+
+    class FakeSer:
+        def __init__(self):
+            self._chunks = iter([b"\x01\x02\x03", b"\x04\x05", b""])
+
+        def read(self, n):
+            return next(self._chunks, b"")
+
+    bridge._ser = FakeSer()
+    r1 = bridge.read_modem_chunk()  # 3B -> 返回 2B，carry 1B
+    r2 = bridge.read_modem_chunk()  # carry(1)+2 = 3B -> 返回 2B，carry 1B
+    assert len(r1) % 2 == 0 and len(r2) % 2 == 0
+    assert r1 == b"\x01\x02"
+    assert r2 == b"\x03\x04"  # carry 保证不丢字节、不错位
+
+
+def test_serial_pcm_discard_pending_output_clears_backlog():
+    """barge-in 打断：一次性丢弃未播积压并返回字节数，缓冲清零。"""
+    from agentcall.audio_bridge import SerialPcmAudioBridge
+
+    bridge = SerialPcmAudioBridge("/tmp/sim7600-pcm")
+    bridge._ser = object()  # write_modem_chunks 只要求非 None
+    bridge.write_modem_chunks([b"\x00" * 3200, b"\x00" * 1600])
+    assert bridge.pending_output_bytes() == 4800
+    assert bridge.discard_pending_output() == 4800
+    assert bridge.pending_output_bytes() == 0
+    assert bridge.discard_pending_output() == 0  # 幂等
+
+
+# ---- 上行字节对齐自愈（真机 2026-08-12：整条上行恒偏移 1 字节）----
+
+def _speech_like(n=20000, seed=7):
+    """造一段相邻样本高度相关的「语音状」信号（真实语音 r>0.8）。"""
+    rng = np.random.default_rng(seed)
+    x = np.cumsum(rng.normal(0, 300, n))
+    x = np.clip(x - np.convolve(x, np.ones(50) / 50, mode="same"), -8000, 8000)
+    return (x * 3).astype(np.int16).tobytes()
+
+
+def _feed(bridge, payload, chunk=640):
+    out = bytearray()
+
+    class _S:
+        def __init__(self, data):
+            self.data = data
+            self.i = 0
+
+        def read(self, n):
+            piece = self.data[self.i:self.i + n]
+            self.i += len(piece)
+            return piece
+
+    bridge._ser = _S(payload)
+    for _ in range(len(payload) // chunk + 2):
+        out += bridge.read_modem_chunk()
+    return bytes(out)
+
+
+def test_uplink_alignment_corrects_one_byte_offset():
+    """流首多出 1 字节导致高低字节颠倒时，桥应自动丢 1 字节回到采样边界。"""
+    from agentcall.audio_bridge import SerialPcmAudioBridge
+
+    good = _speech_like()
+    bridge = SerialPcmAudioBridge("/tmp/x")
+    bridge._rx_carry = b""
+    got = _feed(bridge, b"\x00" + good)      # 人为错位 1 字节
+    assert bridge._align_locked
+    tail = np.frombuffer(got[-16000:], dtype=np.int16).astype(float)
+    r = float(np.corrcoef(tail[:-1], tail[1:])[0, 1])
+    assert r > 0.8, f"纠正后应恢复语音相关性，实际 {r}"
+
+
+def test_uplink_alignment_leaves_correct_stream_untouched():
+    """本来就对齐的流不得被误改（否则反而把好数据弄坏）。"""
+    from agentcall.audio_bridge import SerialPcmAudioBridge
+
+    good = _speech_like()
+    bridge = SerialPcmAudioBridge("/tmp/x")
+    bridge._rx_carry = b""
+    got = _feed(bridge, good)
+    assert bridge._align_locked
+    assert bridge._align_drop is False
+    assert got[:200] == good[:200], "对齐正常时不应丢字节"
+
+
+def test_uplink_alignment_waits_while_silent():
+    """静音期不下判定（避免拿静音瞎判导致误纠正）。"""
+    from agentcall.audio_bridge import SerialPcmAudioBridge
+
+    bridge = SerialPcmAudioBridge("/tmp/x")
+    bridge._rx_carry = b""
+    _feed(bridge, b"\x00" * 40000)
+    assert bridge._align_locked is False
+
+
+def test_uplink_alignment_reprobes_after_midstream_slip():
+    """锁定后中途丢 1 字节（劣化模组丢字节）：监控应发现相关性塌陷并重探纠正。"""
+    from agentcall.audio_bridge import SerialPcmAudioBridge
+
+    good = _speech_like(n=60000)
+    half = len(good) // 2
+    # 前半正常 → 锁定「对齐」；中途丢 1 字节 → 后半整体错位。
+    payload = good[:half] + good[half + 1:]
+    bridge = SerialPcmAudioBridge("/tmp/x")
+    bridge._rx_carry = b""
+    got = _feed(bridge, payload)
+    # 监控应已解锁重探，且重探判定错位（丢 1 字节归位后重新锁定）。
+    tail = np.frombuffer(got[-8000:], dtype=np.int16).astype(float)
+    r = float(np.corrcoef(tail[:-1], tail[1:])[0, 1])
+    assert r > 0.8, f"中途错位应被复核纠正，尾段相关性实际 {r}"
+
+
+def test_uplink_alignment_ambiguous_evidence_does_not_lock():
+    """两个偏移的相关性都含糊（分不出胜负）时不得锁定——继续攒证据。
+
+    真机教训（2026-08-12）：对齐0=0.815 / 偏移1=0.844 的含糊样本被锁成
+    「对齐正常」，整通乱码没人管。
+    """
+    from agentcall.audio_bridge import SerialPcmAudioBridge
+
+    bridge = SerialPcmAudioBridge("/tmp/x")
+    bridge._rx_carry = b""
+    # 恒定直流方波：两个偏移读出来相关性都高且接近 → 证据含糊。
+    ambiguous = (b"\x10\x10" * 20000)
+    _feed(bridge, ambiguous)
+    assert bridge._align_locked is False

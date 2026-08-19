@@ -18,11 +18,12 @@ from pathlib import Path
 from aiohttp import WSMsgType, web
 from serial.tools import list_ports
 
-from .. import config, platforms
+from .. import config, metrics_report, platforms
 from ..audio_bridge import apply_pcm_gain
+from ..call_playbooks import list_playbooks, playbooks_enabled
 from ..contacts import is_reply_target_allowed
 from ..events import EventHub
-from ..modem import Eg25Modem
+from ..modem import SerialModem
 from ..number_profiles import (
     ProfileConflictError,
     ProfileNotFoundError,
@@ -254,7 +255,7 @@ def _auth_middleware_factory(token: str):
 
 def build_app(
     hub: EventHub,
-    modem: Eg25Modem,
+    modem: SerialModem,
     service=None,
     meta: dict | None = None,
     restart_event=None,
@@ -309,7 +310,10 @@ def build_app(
         "/api/remote_dialer/devices/{device_id}", _remote_dialer_device_revoke
     )
     app.router.add_post("/api/call/batch_dial", _batch_dial)
+    app.router.add_post("/api/call/owner_confirm", _owner_confirm)
+    app.router.add_post("/api/intake/chat", _intake_chat)
     app.router.add_get("/api/call/queue", _queue_status)
+    app.router.add_get("/api/playbooks", _playbooks)
     app.router.add_get("/api/number_profiles", _number_profiles)
     app.router.add_get("/api/number_profiles/manage", _number_profiles_manage)
     app.router.add_post("/api/number_profiles", _number_profiles_create)
@@ -320,6 +324,10 @@ def build_app(
     app.router.add_post("/api/history/{call_id}", _history_delete)
     app.router.add_delete("/api/history/{call_id}", _history_delete)
     app.router.add_get("/api/history/{call_id}/events", _history_events)
+    app.router.add_get("/api/metrics/summary", _metrics_summary)
+    app.router.add_post("/api/metrics/label", _metrics_label)
+    # 看板已并入主界面 #metrics 面板；老链接 302 保活（先于 add_static 注册）。
+    app.router.add_get("/static/metrics.html", _metrics_page)
     app.router.add_get("/api/history/{call_id}/audio/{track}", _history_audio)
     app.router.add_get("/api/config", _get_config)
     app.router.add_post("/api/config", _post_config)
@@ -338,6 +346,10 @@ async def _index(request: web.Request) -> web.StreamResponse:
         index_file,
         headers={"Cache-Control": "no-cache, must-revalidate"},
     )
+
+
+async def _metrics_page(request: web.Request) -> web.StreamResponse:
+    raise web.HTTPFound("/#metrics")
 
 
 async def _remote_dialer_redirect(request: web.Request) -> web.StreamResponse:
@@ -445,7 +457,7 @@ async def _audio_websocket(request: web.Request) -> web.WebSocketResponse:
 
 async def _send_sms(request: web.Request) -> web.Response:
     hub: EventHub = request.app["hub"]
-    modem: Eg25Modem = request.app["modem"]
+    modem: SerialModem = request.app["modem"]
     data = await read_json(request)
 
     number = (data.get("number") or "").strip()
@@ -473,6 +485,9 @@ async def _send_sms(request: web.Request) -> web.Response:
         hub,
         call_logger,
         extra_allowed=current_caller,
+        # 这里刻意**不**放行 OWNER_PHONE：本端点 loopback 下无鉴权，白名单就是
+        # 它仅有的 CSRF 护栏；放行机主号码等于让任意页面能用本机 SIM 给机主发
+        # 钓鱼短信（review finding #6）。owner 放行只给通话内的 Agent 工具链路。
         allow_any=config.get_bool("SMS_ALLOW_ANY_TARGET"),
     ):
         return web.json_response(
@@ -800,6 +815,47 @@ async def _remote_cloud_enroll(request: web.Request) -> web.Response:
     )
 
 
+async def _intake_chat(request: web.Request) -> web.Response:
+    """对话式建单（WIL-120 三期 b）：推进一轮采集对话。
+
+    无服务端会话状态：前端每轮送全量历史。模型调用是阻塞 IO，放线程池。
+    """
+    from ..prompts import agent_language, owner_name
+    from ..task_intake import _sanitize_messages, intake_step
+
+    data = await read_json(request)
+    messages = _sanitize_messages(data.get("messages"))
+    if messages is None:
+        return web.json_response(
+            {"ok": False, "error": "messages 必须是 1-40 条 user/assistant 往来，"
+             "以 user 结尾，单条 ≤2000 字符"},
+            status=400,
+        )
+    lang = data.get("lang") if data.get("lang") in ("zh", "en") else agent_language()
+    result = await asyncio.to_thread(
+        intake_step, messages, owner=owner_name(lang), lang=lang
+    )
+    return web.json_response(result)
+
+
+async def _owner_confirm(request: web.Request) -> web.Response:
+    """机主确认卡答复（WIL-120 二期）：把选择发回事件流，ask_owner 工具在等它。"""
+    service = require_service(request)
+    data = await read_json(request)
+    confirm_id = data.get("id")
+    choice = data.get("choice")
+    if not isinstance(confirm_id, str) or not re.fullmatch(r"[0-9a-f]{32}", confirm_id):
+        return web.json_response({"ok": False, "error": "id 格式不合法"}, status=400)
+    if choice not in ("approve", "decline"):
+        return web.json_response(
+            {"ok": False, "error": "choice 只能是 approve 或 decline"}, status=400
+        )
+    service.hub.publish(
+        {"type": "owner_confirm_response", "id": confirm_id, "choice": choice}
+    )
+    return web.json_response({"ok": True})
+
+
 async def _batch_dial(request: web.Request) -> web.Response:
     """批量外呼：``{"numbers": [...], "task"?: str}`` → ``service.batch_dial``。"""
     service = require_service(request)
@@ -836,6 +892,15 @@ async def _number_profiles(request: web.Request) -> web.Response:
     # UI 语言决定下拉里 label/task 的展示语言；缺省回退通话语言。
     lang = request.query.get("lang", "").strip() or config.get_str("AGENT_LANGUAGE")
     return web.json_response({"profiles": list_profiles(lang=lang, include_id=True)})
+
+
+async def _playbooks(request: web.Request) -> web.Response:
+    """呼叫情报库只读视图（WIL-129 P1）：热线要什么信息、IVR 怎么走。"""
+    loop = asyncio.get_running_loop()
+    playbooks = await loop.run_in_executor(None, list_playbooks)
+    return web.json_response(
+        {"ok": True, "enabled": playbooks_enabled(), "playbooks": playbooks}
+    )
 
 
 async def _number_profiles_manage(request: web.Request) -> web.Response:
@@ -955,6 +1020,50 @@ async def _history_delete(request: web.Request) -> web.Response:
     deleted = [call_id] if status == "deleted" else []
     skipped = [call_id] if status == "skipped" else []
     return web.json_response({"ok": True, "deleted": deleted, "skipped": skipped})
+
+
+async def _metrics_summary(request: web.Request) -> web.Response:
+    """看板数据源（WIL-95 第四期）：指标汇总 + 裁决 rollup + 复核队列。
+
+    只读汇总物（metrics.json/verdicts.json，几百字节级），不碰事件流与音频
+    ——WIL-76 的全量重扫教训针对的是每请求重解析 events。
+    """
+    service = require_call_logger(request)
+    report = await asyncio.to_thread(
+        metrics_report.build_dashboard_report, Path(service.call_logger.base_dir)
+    )
+    return web.json_response(report)
+
+
+async def _metrics_label(request: web.Request) -> web.Response:
+    """人工标注判官裁决（对/错/看不出）——地面真值，判官回归测试集的来源。"""
+    service = require_call_logger(request)
+    data = await read_json(request)
+    if not isinstance(data, dict):
+        return web.json_response(
+            {"ok": False, "error": "请求体需为 JSON 对象"}, status=400
+        )
+    call_id = str(data.get("call_id") or "")
+    label = str(data.get("label") or "")
+    if not _CALL_ID_RE.fullmatch(call_id):
+        return web.json_response({"ok": False, "error": "非法的通话 ID"}, status=400)
+    if label not in metrics_report.REVIEW_LABELS:
+        return web.json_response(
+            {"ok": False, "error": f"label 需为 {metrics_report.REVIEW_LABELS} 之一"},
+            status=400,
+        )
+    label_path = _call_artifact_path(
+        service.call_logger.base_dir, call_id, "verdict_label.json"
+    )
+    if label_path is None or not label_path.parent.is_dir():
+        return web.json_response({"ok": False, "error": "通话记录不存在"}, status=404)
+    try:
+        payload = await asyncio.to_thread(
+            metrics_report.write_label, label_path, label
+        )
+    except (OSError, ValueError) as exc:
+        return web.json_response({"ok": False, "error": str(exc)}, status=400)
+    return web.json_response({"ok": True, **payload})
 
 
 async def _history_events(request: web.Request) -> web.Response:
@@ -1094,7 +1203,7 @@ async def _setup_complete(request: web.Request) -> web.Response:
 async def _setup_test_sms(request: web.Request) -> web.Response:
     """One explicit setup-wizard SMS test, separate from the normal reply-only SMS API."""
     hub: EventHub = request.app["hub"]
-    modem: Eg25Modem = request.app["modem"]
+    modem: SerialModem = request.app["modem"]
     data = await read_json(request)
     if not isinstance(data, dict):
         return web.json_response(

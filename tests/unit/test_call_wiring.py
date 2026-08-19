@@ -707,6 +707,33 @@ def test_prompt_profile_applies_carrier_sms_verification_mode():
     assert session._result_verification_mode == "carrier_sms"
 
 
+def test_prompt_profile_applies_long_call_overrides():
+    """WIL-120 一期：profile 的 max_call_seconds / wrap_up_judge 进 session。"""
+    session = make_service(FakeModem()).session
+    session._prompt_gen_result = {
+        "ok": True,
+        "scenario": "长排队演练",
+        "max_call_seconds": 3600,
+        "wrap_up_judge": False,
+    }
+    assert session._apply_prompt_gen_result() == "长排队演练"
+    assert session._profile_max_call_seconds == 3600
+    assert session._profile_wrap_up_judge is False
+
+    # 动态生成结果无这两个键：回落默认（跟随全局 + 裁判开）。
+    session._prompt_gen_result = {"ok": True, "scenario": "普通外呼"}
+    session._apply_prompt_gen_result()
+    assert session._profile_max_call_seconds is None
+    assert session._profile_wrap_up_judge is True
+
+    # 布尔 True 伪装的 int（JSON 手改）不当作秒数。
+    session._prompt_gen_result = {
+        "ok": True, "scenario": "x", "max_call_seconds": True,
+    }
+    session._apply_prompt_gen_result()
+    assert session._profile_max_call_seconds is None
+
+
 # ---- P2-1 批量外呼：入队顺序拨打 + 白名单 + 状态查询 ----
 
 def test_batch_dial_dials_in_order(tmp_path, monkeypatch):
@@ -1710,3 +1737,251 @@ def test_inbound_hard_deadline_finalizes_when_all_hangup_signals_are_lost(
     assert service.session._thread is not None
     service.session._thread.join(timeout=5)
     assert not service.session._thread.is_alive()
+
+
+# ---- WIL-111：看门狗重建必须有界，且避开桥恢复期 ----
+
+def _watchdog_service(tmp_path, port_exists=True):
+    """构造只用于看门狗测试的 service：复用 FakeModem，补上端口与连接状态。"""
+    port = tmp_path / "sim7600-at"
+    if port_exists:
+        port.write_text("")
+
+    class _WatchdogModem(FakeModem):
+        def __init__(self) -> None:
+            super().__init__()
+            self.port = str(port)
+            self.connect_calls = 0
+
+        def is_connected(self) -> bool:
+            return False
+
+        def connect(self) -> None:
+            self.connect_calls += 1
+
+        def initialize_for_voice(self, mode="nmea") -> None:
+            pass
+
+        def start_listener(self) -> None:
+            pass
+
+    modem = _WatchdogModem()
+    return make_service(modem), modem
+
+
+def test_watchdog_skips_reconnect_while_port_missing(tmp_path):
+    """桥做 PCM 自愈时串口被删——此时不该去 connect（注定失败且可能卡住）。"""
+    service, modem = _watchdog_service(tmp_path, port_exists=False)
+    assert service._modem_port_ready() is False
+
+
+def test_watchdog_port_ready_when_symlink_back(tmp_path):
+    service, _ = _watchdog_service(tmp_path, port_exists=True)
+    assert service._modem_port_ready() is True
+
+
+def test_bounded_reconnect_returns_true_on_success(tmp_path):
+    service, modem = _watchdog_service(tmp_path)
+    assert service._reconnect_modem_bounded() is True
+    assert modem.connect_calls == 1
+
+
+def test_bounded_reconnect_gives_up_on_hang(tmp_path, monkeypatch, caplog):
+    """connect() 挂住不返回时必须超时放弃，否则看门狗自己被挂死（真机 WIL-111）。"""
+    import logging as _logging
+    import threading as _th
+
+    service, modem = _watchdog_service(tmp_path)
+    blocked = _th.Event()
+    monkeypatch.setattr(service, "_LINK_RECONNECT_TIMEOUT", 0.2)
+    monkeypatch.setattr(modem, "connect", lambda: blocked.wait(30))
+
+    with caplog.at_level(_logging.WARNING):
+        assert service._reconnect_modem_bounded() is False
+    assert "未完成" in caplog.text
+    blocked.set()
+
+
+def test_bounded_reconnect_reports_error(tmp_path, monkeypatch, caplog):
+    import logging as _logging
+
+    service, modem = _watchdog_service(tmp_path)
+
+    def boom():
+        raise RuntimeError("串口不存在")
+
+    monkeypatch.setattr(modem, "connect", boom)
+    with caplog.at_level(_logging.WARNING):
+        assert service._reconnect_modem_bounded() is False
+    assert "重建连接失败" in caplog.text
+
+
+# ---- WIL-120 二期：hold 状态机（收尾裁判 on_hold 驱动） ----
+
+
+def test_wrap_up_judge_on_hold_transitions(monkeypatch):
+    """on_hold 进入、continue/wrap_up 退出；失败结果不动状态；hold 期间复读卡死豁免。"""
+    session = make_service(FakeModem()).session
+
+    def run_judge(result):
+        monkeypatch.setattr(
+            "agentcall.call_agent.judge_wrap_up", lambda *a, **k: result
+        )
+        asyncio.run(session._run_wrap_up_judge([], "查流量"))
+
+    run_judge({"ok": True, "decision": "on_hold", "reason": "循环等待音"})
+    assert session._on_hold is True
+
+    # hold 期间复读抑制的「卡死收尾」被豁免（等待音循环不是会话卡死）。
+    session._request_repeat_stuck_wrap_up("重复播报")
+    assert session._wrap_up_requested is False
+
+    # 裁判失败（ok=False）不把排队踢回普通计时。
+    run_judge({"ok": False, "decision": "continue", "reason": "timeout"})
+    assert session._on_hold is True
+
+    run_judge({"ok": True, "decision": "continue", "reason": "真人接入"})
+    assert session._on_hold is False
+
+    # 非 hold 状态下复读卡死收尾照常生效。
+    session._request_repeat_stuck_wrap_up("复读卡死")
+    assert session._wrap_up_requested is True
+
+
+# ---------------------------------------------------------------------------
+# 呼叫情报库（WIL-129 P1）：拨前硬拦截 + ivr_notes 注入
+# ---------------------------------------------------------------------------
+
+
+def _write_playbook_env_file(playbooks: list) -> None:
+    """写到 conftest 已隔离的 CALL_PLAYBOOKS_FILE 路径。"""
+    path = Path(os.environ["CALL_PLAYBOOKS_FILE"])
+    path.write_text(
+        json.dumps({"playbooks": playbooks}, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def _drill_playbook() -> dict:
+    return {
+        "id": "att_prepaid_611",
+        "numbers": ["611"],
+        "label": {"zh": "AT&T Prepaid 客服", "en": "AT&T Prepaid CS"},
+        "required_info": [
+            {
+                "key": "account_pin",
+                "label": {"zh": "四位账户 PIN", "en": "Four-digit account PIN"},
+                "purpose": {"zh": "转人工核身", "en": "identity gate"},
+            }
+        ],
+        "ivr_notes": {"zh": "对语音菜单只说短词。", "en": "Speak short tokens only."},
+    }
+
+
+def test_dial_blocked_when_playbook_required_info_missing(monkeypatch):
+    monkeypatch.setenv("CALL_PLAYBOOKS_ENABLED", "true")
+    _write_playbook_env_file([_drill_playbook()])
+    service = make_service(FakeModem())
+    ok, err = service.dial("611")
+    assert ok is False
+    assert "四位账户 PIN" in err and "account_pin" in err
+    # 没进拨号：会话未激活
+    assert not service.session.is_active
+
+
+def test_dial_allowed_when_verification_covers_required_info(monkeypatch):
+    monkeypatch.setenv("CALL_PLAYBOOKS_ENABLED", "true")
+    _write_playbook_env_file([_drill_playbook()])
+    profiles = Path(os.environ["NUMBER_PROFILES_FILE"])
+    profiles.write_text(
+        json.dumps(
+            {
+                "profiles": [
+                    {
+                        "id": "drill611",
+                        "number": "611",
+                        "task": "查套餐",
+                        "scenario": "演练",
+                        "task_package": {"verification": {"account_pin": "1234"}},
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    service = make_service(FakeModem())
+    blocked, message = service._reject_if_playbook_info_missing(
+        "611", task="查套餐", preset_hint=None, preset_id=None
+    )
+    assert blocked is False and message is None
+
+
+def test_dial_gate_bypassed_when_playbooks_disabled():
+    # conftest 默认 CALL_PLAYBOOKS_ENABLED=false
+    _write_playbook_env_file([_drill_playbook()])
+    service = make_service(FakeModem())
+    blocked, message = service._reject_if_playbook_info_missing(
+        "611", task=None, preset_hint=None, preset_id=None
+    )
+    assert blocked is False and message is None
+
+
+def test_dial_gate_ignores_numbers_without_playbook(monkeypatch):
+    monkeypatch.setenv("CALL_PLAYBOOKS_ENABLED", "true")
+    _write_playbook_env_file([_drill_playbook()])
+    service = make_service(FakeModem())
+    blocked, message = service._reject_if_playbook_info_missing(
+        "10086", task=None, preset_hint=None, preset_id=None
+    )
+    assert blocked is False and message is None
+
+
+def test_playbook_ivr_notes_injected_into_outbound_instructions(monkeypatch):
+    monkeypatch.setenv("CALL_PLAYBOOKS_ENABLED", "true")
+    monkeypatch.setenv("AGENT_LANGUAGE", "zh")
+    _write_playbook_env_file([_drill_playbook()])
+    service = make_service(FakeModem())
+    service.session.current_caller = "611"
+    text = service.session._build_agent_instructions("outbound")
+    assert "对语音菜单只说短词。" in text
+    # inbound 不注入
+    inbound = service.session._build_agent_instructions("inbound")
+    assert "对语音菜单只说短词" not in inbound
+
+
+def test_playbook_notes_not_injected_when_disabled():
+    _write_playbook_env_file([_drill_playbook()])
+    service = make_service(FakeModem())
+    service.session.current_caller = "611"
+    text = service.session._build_agent_instructions("outbound")
+    assert "对语音菜单只说短词" not in text
+
+
+def test_summary_worker_triggers_playbook_learner(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "agentcall.call_agent.summarize_call",
+        lambda *args, **kwargs: {"ok": True, "summary": "s", "error": None},
+    )
+    seen = {}
+
+    def fake_learn(number, transcripts, package, *, call_id, updated, **kwargs):
+        seen["number"] = number
+        seen["call_id"] = call_id
+        return {
+            "id": "att_prepaid_611",
+            "required_info": [{"key": "activation_zip"}],
+        }
+
+    monkeypatch.setattr("agentcall.call_playbooks.learn_from_call", fake_learn)
+    base = tmp_path / "rec"
+    service = make_service(FakeModem(), call_logger=CallLogger(base))
+    record = service.session._begin_record("outbound", "611")
+    assert record is not None
+    record.finish("completed")
+    service.session._summarize_worker(
+        record, [("user", "please say your zip")], "outbound", "611", "none", ""
+    )
+    assert seen["number"] == "611" and seen["call_id"] == record.id
+    events = call_events(base)
+    updated = [e for e in events if e.get("type") == "playbook_updated"]
+    assert updated and updated[0]["keys"] == ["activation_zip"]

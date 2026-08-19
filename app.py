@@ -17,7 +17,7 @@ import webbrowser
 from aiohttp import web
 from dotenv import load_dotenv
 
-from agentcall import config, number_profiles
+from agentcall import call_playbooks, config, number_profiles
 from agentcall.call_agent import CallAgentService
 from agentcall.cloud_control import CloudControlApi, CloudEdgeClient
 from agentcall.cloud_credentials import CloudCredentialStore
@@ -102,6 +102,21 @@ def _force_utf8() -> None:
                 reconfigure(encoding="utf-8")
             except Exception:  # noqa: BLE001
                 pass
+
+
+def _enable_thread_dump() -> None:
+    """kill -USR1 <pid> 时打印全部线程栈。
+
+    真机排障用：曾出现「进程活着、某个线程挂住不返回」（WIL-111），当时只能靠
+    推测。装上这个钩子后，现场直接抓栈即可定位，无需复现。
+    """
+    import faulthandler
+    import signal
+
+    try:
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def main() -> None:
@@ -191,12 +206,15 @@ def main() -> None:
         )
         sys.exit(2)
 
+    _enable_thread_dump()
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
     data_dir = config.data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
     number_profiles.ensure_seeded()
+    call_playbooks.ensure_seeded()
     store_path = data_dir / "messages.json"
     hub = EventHub(loop, store_path=store_path)
 
@@ -210,6 +228,7 @@ def main() -> None:
         pcm_baudrate=config.get_int("MODEM_PCM_BAUD"),
         tx_gain=config.get_float("MODEM_TX_GAIN"),
         hub=hub,
+        vendor=config.get_str("MODEM_VENDOR"),
     )
 
     # provider -> 模型显示名的注册表 key（未知 provider 回落 qwen 显示名）。

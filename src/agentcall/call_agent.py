@@ -11,11 +11,12 @@ import re
 import secrets
 import threading
 import time
+from array import array
 from datetime import UTC, datetime
 from queue import Empty, Full, Queue
 from typing import Callable
 
-from . import config
+from . import call_playbooks, config, platforms
 from .agents.base import VoiceAgent
 from .agents.factory import create_agent
 from .agents.tools import REQUEST_OWNER_TAKEOVER_SPEC, ToolRegistry
@@ -29,14 +30,14 @@ from .audio_bridge import (
 )
 from .call_log import CallLogger, CallRecord
 from .call_tools import CallTools
-from .contacts import is_reply_target_allowed
+from .contacts import is_reply_target_allowed, known_contact_numbers
 from .dial_guard import DialGuardFailure, check_dial_guard
 from .dial_queue import DialQueue, whitelist_from_env
 from .dtmf import dtmf_tone
 from .dtmf_followup import extract_spoken_dtmf
 from .dtmf_judge import DtmfActionLedger, DtmfJudge, WindowMode
 from .events import EventHub
-from .modem import Eg25Modem
+from .modem import SerialModem, create_modem
 from .monitor_playback import MonitorPlayback
 from .number_profiles import lookup_profile, lookup_profile_by_id
 from .pcm_stats import PcmFlowStats
@@ -91,6 +92,26 @@ from .triage_judge import (
 
 logger = logging.getLogger(__name__)
 
+# 上行「有声」判定峰值（int16）。真机实测（2026-08-12）上行静音是纯数字零
+# （峰值中位 2、p90 13）——modem 不给底噪，所以阈值可以放得很低；而对端小声
+# 说话峰值常在 500~900，设 1000 会把句尾标早、夸大「音尾→判停」的读数。
+# 只用于轮次延迟测量的打点，不参与任何对话逻辑。
+_VOICED_PEAK_THRESHOLD = 350
+
+# 下行轮首静音垫的判定峰值与掐除上限（WIL-112）。TTS 音频前缘实测垫中位
+# 470ms、最长 ~1s 纯静音；上限防止把真正的轻声开头吃掉。16B = 1ms @8kHz/16bit。
+_DOWNLINK_SILENCE_PEAK = 500
+_TURN_TRIM_CAP_BYTES = 24000  # 1.5s
+
+# barge-in 自激兜底（WIL-94 坑 4）：回复出声后极短时间内就被「对端开口」打断、
+# 且连续多次，即视为疑似自激（下行被模组回采成上行触发 provider VAD）。前提
+# 「模组无回采」是一次性实测（SIM7600 r=0.009），换硬件/改增益后可能失效，
+# 失效的代价是通话自循环——必须有运行时兜底：触发后本通退回半双工。
+# 窗口取 2s：无积压时回声必然落在首块音频到达后的这段内；真人抢话通常更晚。
+# 连续 3 次才触发——单次快速插话是正常抢话，不该因此没收打断能力。
+_BARGE_IN_ECHO_WINDOW_SECONDS = 2.0
+_BARGE_IN_ECHO_STRIKES = 3
+
 # dtmf_outcome 事件里对端话语的截断长度：够判读，又不至于把整段通话搬进事件流。
 _OUTCOME_TEXT_CHARS = 80
 # 按键后等待对端反应的窗口，与 scripts/regression_call.py 的 8s 观察窗一致。
@@ -117,10 +138,21 @@ DTMF_SPOKEN_FOLLOWUP_DELAY_SECONDS = 3.0
 DTMF_RECENT_SEND_WINDOW_SECONDS = 5.0
 _EXTERNAL_TOOL_RESULT_TIMEOUT_SECONDS = 2.0
 _INBOUND_TAKEOVER_OFFER_TTL_SECONDS = 30.0
-_INBOUND_TAKEOVER_HOLD_TEXT = "请稍等，我确认一下，马上帮您转接。"
+# 固定垫话按 AGENT_LANGUAGE 取（WIL-120 二期顺手修：原为写死中文，en 通话下
+# AI 会突然冒中文）。不进模型自由生成——这几句是系统兜底话术，必须可预期。
+_INBOUND_TAKEOVER_HOLD_TEXT = {
+    "zh": "请稍等，我确认一下，马上帮您转接。",
+    "en": "One moment please, let me check — I'll transfer you right away.",
+}
 _INBOUND_TAKEOVER_MEDIA_TIMEOUT_SECONDS = 15.0
-_INBOUND_TRIAGE_CLARIFY_TEXT = "请简单确认一下，您是有具体事情找本人，还是一般业务介绍？"
-_INBOUND_TRIAGE_REJECT_TEXT = "谢谢您的来电，目前不需要这项服务。再见。"
+_INBOUND_TRIAGE_CLARIFY_TEXT = {
+    "zh": "请简单确认一下，您是有具体事情找本人，还是一般业务介绍？",
+    "en": "Just to confirm — do you have a specific matter for them personally, or is this a general offer?",
+}
+_INBOUND_TRIAGE_REJECT_TEXT = {
+    "zh": "谢谢您的来电，目前不需要这项服务。再见。",
+    "en": "Thanks for calling — this service isn't needed right now. Goodbye.",
+}
 
 
 class _CallSessionMediaRouter:
@@ -143,7 +175,7 @@ class _CallSessionMediaRouter:
 class CallSession:
     def __init__(
         self,
-        modem: Eg25Modem,
+        modem: SerialModem,
         audio_keyword: str,
         provider: str | None,
         audio_mode: str,
@@ -184,6 +216,23 @@ class CallSession:
         self._active = False
         self._active_lock = threading.Lock()
         self._outgoing_audio: Queue[bytes] = Queue()
+        # 本轮是否已记过「排队时长」（每轮只记一次，见 _make_agent_audio_handler）。
+        self._turn_first_audio_logged = False
+        # 上行最近一次「有声」块的到达时刻（monotonic）。首块回复音频到达时用
+        # now - 这个值 得到本地可观测的端到端轮次延迟（上行传输 + VAD 判停 +
+        # 生成），比「判停→首音频」多覆盖前半段链路；蜂窝两腿仍在其外。
+        self._last_voiced_at = 0.0
+        # 轮首静音掐除：本轮还允许掐多少字节（轮次边界重置为上限）与已掐字节。
+        self._turn_trim_budget = 0
+        self._turn_trimmed_bytes = 0
+        # barge-in（BARGE_IN_ENABLED）：每通开始时从 config 读取；True 时上行
+        # 不做半双工丢弃、对端开口即打断 AI（见 _run_agent_loop 与
+        # _handle_peer_barge_in）。自激兜底触发时本通内置回 False。
+        self._barge_in = False
+        # 自激兜底状态（WIL-94 坑 4）：连续「刚出声即被打断」计数 + 本轮首块
+        # 回复音频的到达时刻（0.0 = 本通尚无回复音频）。
+        self._barge_in_echo_strikes = 0
+        self._turn_audio_started_at = 0.0
         self._record: CallRecord | None = None
         self._summary_thread: threading.Thread | None = None
         # 延迟挂断（hangup 工具）状态：CallSession 跨通复用，上一通排下的
@@ -196,6 +245,10 @@ class CallSession:
         # 请求收尾标志 + 理由 + 在途裁判 task（每通重置）。
         self._wrap_up_requested = False
         self._wrap_up_reason = ""
+        # hold 状态（WIL-120 二期）：收尾裁判判 on_hold 进入、判其他退出。
+        # 时间戳用 time.time()（与事件 ts 同钟），秒数聚合在 metrics 层做。
+        self._on_hold = False
+        self._hold_started_ts = 0.0
         self._judge_task: asyncio.Task | None = None
         # 会话级可调参数：每通会话开始时从 config 重新读取，支持不重启改参。
         self._hangover_seconds = HALF_DUPLEX_HANGOVER_SECONDS
@@ -210,6 +263,11 @@ class CallSession:
         self._prompt_gen_opening_mode = "say"
         self._prompt_gen_dtmf_spoken_followup = False
         self._result_verification_mode = "none"
+        # WIL-120 一期：profile 级长通话覆盖。None=跟随全局 OUTBOUND_MAX_SECONDS。
+        self._profile_max_call_seconds: int | None = None
+        self._profile_wrap_up_judge = True
+        # WIL-120 三期：结构化任务包（值只进模型上下文，不进 events/metrics）。
+        self._profile_task_package: dict | None = None
         self._dtmf_lock = threading.RLock()
         # 上行媒体互斥：drain 的「取空队列再写桥」与 DTMF 的「清队列再入双音」
         # 必须原子，否则清队列会清了个空、语音仍抢在双音前面写进桥。
@@ -315,6 +373,8 @@ class CallSession:
         self._preset_hint = preset_hint
         self._preset_id = preset_id
         self._wrap_up_requested = False  # 每通重置收尾裁判状态
+        self._on_hold = False
+        self._hold_started_ts = 0.0
         self._wrap_up_reason = ""
         self._judge_task = None
         self._prompt_gen_thread = None
@@ -326,6 +386,9 @@ class CallSession:
         self._prompt_gen_opening_mode = "say"
         self._prompt_gen_dtmf_spoken_followup = False
         self._result_verification_mode = "none"
+        self._profile_max_call_seconds = None
+        self._profile_wrap_up_judge = True
+        self._profile_task_package = None
         self._cancel_spoken_dtmf_followups(clear_recent=True)
         self._stop_dtmf_judge(join_timeout=0.0)
         self._stop_triage_judge(join_timeout=0.0)
@@ -452,11 +515,20 @@ class CallSession:
             )
             mark("answered")
 
-            await asyncio.sleep(1.0)
+            # 接听后静置时长由厂商实现决定：自带重试的（SIM7600）不必盲等整秒，
+            # 首次失败立刻重试即可，健康态省约 0.8s（WIL-104）。Quectel 维持 1.0s。
+            await asyncio.sleep(
+                getattr(self.modem, "POST_ANSWER_SETTLE_SECONDS", 1.0)
+            )
 
             # 挂断流程会发 AT+QPCMV=0 关闭语音通道，每通电话都要重新启用，
             # 否则第二通开始模组无 PCM 流（双向无声）。
             self.modem.initialize_for_voice(self.audio_mode)
+            # 通话内的启用结果进事件流：ok=False 即整通无声、attempts≥2 即已劣化
+            # ——WIL-95 D 组「异常掉话指纹」的蜂窝形态（CPCMREG 替代 RTP keepalive）。
+            enable_info = getattr(self.modem, "last_voice_enable", None)
+            if record is not None and isinstance(enable_info, dict):
+                record.log_event("pcm_enable", **enable_info)
 
             bridge = create_audio_bridge(
                 mode=self.audio_mode,
@@ -482,6 +554,60 @@ class CallSession:
             agent.set_tools(tools)
             if isinstance(bridge, SerialPcmAudioBridge):
                 bridge.set_ready_check(self.modem.pcm_ready)
+            self._barge_in = config.get_bool("BARGE_IN_ENABLED")
+            self._barge_in_echo_strikes = 0
+            self._turn_audio_started_at = 0.0
+            if self._barge_in:
+                # 对端开口（provider VAD speech_started）→ 丢弃本地未播积压，
+                # AI 闭嘴听对方说完；护窗期让位与自激兜底见 _handle_peer_barge_in。
+                # 掐生成（response.cancel）由 agent 侧按回调返回值决定。
+                agent.set_user_interrupt_handler(
+                    lambda: self._handle_peer_barge_in(bridge)
+                )
+            # 复读晚截（ResponseAudioGate on_late_cut）：同一个清积压动作、
+            # 不同语义——不计自激笔数，且半双工模式也要清（复读开头已播出的
+            # 尾巴不清会多拖 1~2s）。护窗让位逻辑在 _discard_agent_playback 内。
+            agent.set_late_cut_handler(
+                lambda: self._discard_agent_playback(bridge, "复读晚截")
+            )
+            # provider 侧逐轮时延（如判停→首音频）经回调落 events.jsonl
+            # （WIL-95 第一期：测量早已校准，缺的只是持久化）。
+            if record is not None:
+                agent.set_latency_handler(record.log_latency)
+            # 配置快照（WIL-95 第一期硬要求）：没有它，跨时间对比无法归因——
+            # 指标变了可能只是切了 provider / 判停方式 / barge-in。字段增删
+            # 属指标契约变更，要同步升 call_metrics.SCHEMA_VERSION。
+            if record is not None:
+                # 快照失败绝不影响通话（metrics.json 会记 config 缺失 + 原因）。
+                try:
+                    record.log_event(
+                        "config_snapshot",
+                        provider=self.provider,
+                        model=getattr(agent, "model", "") or "",
+                        turn_detection=config.get_str("OPENAI_TURN_DETECTION"),
+                        vad_eagerness=config.get_str("OPENAI_VAD_EAGERNESS"),
+                        vad_silence_ms=config.get_int("OPENAI_VAD_SILENCE_MS"),
+                        barge_in_enabled=self._barge_in,
+                        hangover_seconds=self._hangover_seconds,
+                        dtmf_mode=config.get_str("DTMF_MODE"),
+                        recording_enabled=getattr(
+                            record, "recording_enabled", False
+                        ),
+                        audio_mode=self.audio_mode,
+                        modem_vendor=config.get_str("MODEM_VENDOR"),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning("配置快照落盘失败（不影响通话）", exc_info=True)
+            if record is not None:
+                # 通话上下文（WIL-95 第二期）：熟人布尔——只记 bool 不记身份
+                # （§7 同款约束）。是 Stage 2「熟人来电处理占比」的数据前置。
+                try:
+                    known = bool(number) and number in known_contact_numbers(
+                        self.hub, self.call_logger
+                    )
+                    record.log_event("call_context", contact_known=known)
+                except Exception:  # noqa: BLE001
+                    pass
             bridge.start()
             mark("bridge_started")
 
@@ -655,12 +781,103 @@ class CallSession:
             pcm_8k = bridge.agent_to_modem(pcm_agent, agent.output_rate)
             if hasattr(bridge, "amplify_for_modem"):
                 pcm_8k = bridge.amplify_for_modem(pcm_8k)
+            # 掐掉本轮开头的静音垫（WIL-112 最后一块）：TTS 音频前缘实测垫
+            # 中位 470ms、最长 ~1s 纯静音——仪器在「首字节到达」停表，对端耳朵
+            # 却要等垫子播完。只掐轮首、设上限防误伤；句中停顿原样保留。
+            if pcm_8k and self._turn_trim_budget > 0:
+                pcm_8k = self._trim_leading_silence(pcm_8k)
             if pcm_8k:
                 if record is not None:
                     record.write_downlink(pcm_8k)
+                # 本轮首块音频入队时，记录「它前面还排着多少秒没播完」——这才是
+                # 对端真正要等的时间。判停→首音频只是 OpenAI 生成耗时，不含排队
+                # （WIL-112：录音按生成时点记录，会把排队完全抹掉，别再用它判断）。
+                if not self._turn_first_audio_logged:
+                    self._turn_first_audio_logged = True
+                    # 自激兜底的时间锚点：本轮首块回复音频到达时刻。
+                    self._turn_audio_started_at = time.monotonic()
+                    pending = (
+                        bridge.pending_output_bytes()
+                        if hasattr(bridge, "pending_output_bytes") else 0
+                    )
+                    queued = self._outgoing_audio.qsize() * len(pcm_8k)
+                    ahead = (pending + queued) / (MODEM_RATE * 2)
+                    # playout_backlog_ms（2026-08-14 定义，WIL-95 第一期）：本轮
+                    # 首块回复入队时，前面已排未播的音频时长。每轮都落盘——
+                    # 0 也是有效读数（无积压），只有日志沿用 0.5s 的降噪阈值。
+                    if record is not None:
+                        # 埋点失败绝不影响通话（WIL-95 §6；BrokenRecord 测试锁）。
+                        try:
+                            record.log_latency(
+                                "playout_backlog", round(ahead * 1000, 1)
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                    if ahead >= 0.5:
+                        logger.info(
+                            "[timing] 本轮回复前面还排着 %.1fs 未播完（对端要多等这么久）",
+                            ahead,
+                        )
+                    # 端到端（本地可观测）：上行最后一块有声 → 首块回复到达。
+                    # 覆盖上行传输 + VAD 判停 + 生成；对端体感还要再加蜂窝两腿
+                    # （各 ~0.2-0.3s）与本地播出排队（上面的 ahead）。
+                    voiced_at = self._last_voiced_at
+                    if voiced_at > 0:
+                        e2e = time.monotonic() - voiced_at
+                        if 0 < e2e < 30:
+                            # local_response_latency_ms（2026-08-14 定义，WIL-95
+                            # 2.1：诚实命名，不叫 e2e——蜂窝两腿在观测范围外）。
+                            if record is not None:
+                                try:
+                                    record.log_latency(
+                                        "local_response", round(e2e * 1000, 1)
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    pass
+                            logger.info(
+                                "[timing] 端到端轮次延迟(本地音尾→首音频): %.0fms",
+                                e2e * 1000,
+                            )
                 self._outgoing_audio.put(pcm_8k)
 
         return on_agent_audio
+
+    def _trim_leading_silence(self, pcm_8k: bytes) -> bytes:
+        """掐掉本轮开头的静音垫，返回剩余部分（可能为空）。
+
+        预算（_turn_trim_budget）由轮次边界重置为上限：静音块整块掐掉直到
+        预算耗尽或遇到第一个过阈样本；一旦见声或预算耗尽即停，本轮不再触碰
+        （句中停顿因此不受影响）。
+        """
+        usable = len(pcm_8k) - (len(pcm_8k) % 2)
+        if not usable:
+            return pcm_8k
+        samples = array("h", pcm_8k[:usable])
+        if max(max(samples), -min(samples)) < _DOWNLINK_SILENCE_PEAK:
+            drop = min(len(pcm_8k), self._turn_trim_budget)
+            self._turn_trimmed_bytes += drop
+            self._turn_trim_budget -= drop
+            if self._turn_trim_budget <= 0:
+                self._log_turn_trim()
+            return pcm_8k[drop:]
+        cut_idx = 0
+        for k, sample in enumerate(samples):
+            if abs(sample) >= _DOWNLINK_SILENCE_PEAK:
+                cut_idx = k
+                break
+        cut = min(cut_idx * 2, self._turn_trim_budget)
+        self._turn_trimmed_bytes += cut
+        self._turn_trim_budget = 0
+        self._log_turn_trim()
+        return pcm_8k[cut:]
+
+    def _log_turn_trim(self) -> None:
+        if self._turn_trimmed_bytes:
+            logger.info(
+                "[timing] 已掐掉本轮开头静音 %dms",
+                self._turn_trimmed_bytes // 16,
+            )
+        self._turn_trimmed_bytes = 0
 
     async def _speak_takeover_hold_if_needed(
         self, agent: VoiceAgent, bridge: AudioBridge, generation: int
@@ -678,7 +895,7 @@ class CallSession:
         if not should_speak:
             return
         try:
-            await agent.say(_INBOUND_TAKEOVER_HOLD_TEXT)
+            await agent.say(_INBOUND_TAKEOVER_HOLD_TEXT[agent_language()])
             # Flush the one permitted hold line before closing the AI gate; the
             # regular loop deliberately drops queued AI audio after this point.
             self._drain_agent_audio(bridge)
@@ -699,9 +916,16 @@ class CallSession:
         last_play_at = 0.0
         loop_started = time.monotonic()
         # 外呼硬时限：LLM 收尾裁判失灵/漏判时的最后防线（到点道别挂断）。
-        outbound_max_seconds = (
-            float(config.get_int("OUTBOUND_MAX_SECONDS")) if self._outbound_number else 0.0
-        )
+        # profile 可覆盖（WIL-120 一期）：长通话（客服排队 30 分钟+）是场景属性，
+        # 只给点名的预设放开；0=不限时，其余外呼保持全局安全默认。
+        outbound_max_seconds = 0.0
+        if self._outbound_number:
+            if self._profile_max_call_seconds is not None:
+                outbound_max_seconds = float(self._profile_max_call_seconds)
+            else:
+                outbound_max_seconds = float(
+                    config.get_int("OUTBOUND_MAX_SECONDS")
+                )
         inbound_max_seconds = (
             float(config.get_int("INBOUND_MAX_SECONDS"))
             if self._outbound_number is None
@@ -717,11 +941,39 @@ class CallSession:
             )
         # 收尾裁判（仅外呼）：接通后先给 grace 让通话进正题，之后每 interval 让文本模型
         # 看对话判「继续/收尾」——理解任意措辞（治打转/太早撤），不靠关键词枚举。
-        judge_enabled = self._outbound_number is not None
+        # profile 可显式关闭裁判（WIL-120 一期）：排队循环音会被误判「打转」。
+        # 二期换 hold 冻结后收回这个一刀切开关。
+        judge_enabled = (
+            self._outbound_number is not None and self._profile_wrap_up_judge
+        )
         judge_grace = config.get_float("WRAP_UP_JUDGE_GRACE_SECONDS")
         judge_interval = config.get_float("WRAP_UP_JUDGE_INTERVAL_SECONDS")
         last_judge_at = loop_started
-        goal = self._outbound_task(agent_language()) if judge_enabled else ""
+        if record is not None and self._outbound_number is not None:
+            # 生效时限随通落盘（WIL-95 归因惯例）：没有这条，长通话演练的
+            # 指标就无法区分「配置放开了」和「默认 150s 恰好没触发」。
+            try:
+                record.log_event(
+                    "call_limits",
+                    outbound_max_seconds=outbound_max_seconds,
+                    wrap_up_judge=judge_enabled,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        # goal 只看方向、不看裁判开关：profile 关掉收尾裁判时 task_goal 证据
+        # 仍须落盘（WIL-95 §4——离线判官对长排队通话照样要裁「目的是否达成」）。
+        goal = (
+            self._outbound_task(agent_language())
+            if self._outbound_number is not None
+            else ""
+        )
+        if record is not None and goal:
+            # 任务目标随通落盘（WIL-95 §4 证据层）：判官离线裁决「目的是否达成」
+            # 必须知道目的是什么；不落盘则历史通话永远无法重算。
+            try:
+                record.log_event("task_goal", goal=goal)
+            except Exception:  # noqa: BLE001
+                pass
         # 浏览器实时旁听：对方上行电平低，推给浏览器前按此增益放大到可闻。
         uplink_listen_gain = config.get_float("MONITOR_UPLINK_GAIN")
         agent_uplink_gain = config.get_float("AGENT_UPLINK_GAIN")
@@ -795,6 +1047,7 @@ class CallSession:
                     "外呼超过 %.0fs 仍在进行，自动道别收尾",
                     outbound_max_seconds,
                 )
+                self._log_winddown(record, "outbound_deadline")
                 try:
                     await agent.say(self._winddown_instructions())
                 except Exception as exc:  # noqa: BLE001
@@ -816,6 +1069,7 @@ class CallSession:
             # ③ 裁判判定该收尾 → 说句告别再挂（同硬时限收尾路径）
             if self._wrap_up_requested and winddown_deadline is None:
                 logger.info("收尾裁判判定结束（%s），自动收尾", self._wrap_up_reason)
+                self._log_winddown(record, "wrap_up_judge")
                 try:
                     await agent.say(self._winddown_instructions())
                 except Exception as exc:  # noqa: BLE001
@@ -833,9 +1087,12 @@ class CallSession:
                 last_play_at = now
             # 半双工防回环：Agent 说话期间（含挂尾窗口）丢弃上行，
             # 避免模组把下行音频回采给千问导致自循环。
-            suppress_uplink = agent_speaking or (
-                now - last_play_at
-            ) < self._hangover_seconds
+            # barge-in 模式下不丢：上行全程送 provider，由其 VAD 触发打断
+            # （前提是模组无回采——SIM7600 CPCMREG 实测干净，见 BARGE_IN_ENABLED）。
+            suppress_uplink = not self._barge_in and (
+                agent_speaking
+                or (now - last_play_at) < self._hangover_seconds
+            )
 
             pcm_8k = bridge.read_modem_chunk()
             if self._dead_media_expired(pcm_8k, now) and not self._dead_media_reported:
@@ -856,6 +1113,18 @@ class CallSession:
                 if self._dead_media_hangup:
                     break
             if pcm_8k:
+                # 端到端轮次延迟的起点：这块上行是否「有声」。峰值扫描与
+                # PcmFlowStats.add 同量级（每块几百样本），开销可忽略。
+                usable = len(pcm_8k) - (len(pcm_8k) % 2)
+                if usable:
+                    samples = array("h", pcm_8k[:usable])
+                    if max(max(samples), -min(samples)) >= _VOICED_PEAK_THRESHOLD:
+                        # 静音 >1s 后再次有声 = 一次新发声的起点。与 provider 的
+                        # speech_started 到达时刻对表，可分离「上行传输延迟」与
+                        # 「VAD 判停拖尾」（WIL-112 暗区定位）。
+                        if now - self._last_voiced_at > 1.0:
+                            logger.info("[timing] 本地检测到语音起点")
+                        self._last_voiced_at = now
                 # 录音不受半双工屏蔽影响（内存追加，非磁盘 IO）。
                 if record is not None:
                     record.write_uplink(pcm_8k)
@@ -1272,6 +1541,7 @@ class CallSession:
                 self._publish({"type": "call_summary", "call_id": record.id, **result})
             else:
                 logger.warning("通话摘要生成失败: %s", result.get("error"))
+            self._maybe_learn_playbook(record, transcripts, direction, number)
         except Exception as exc:  # noqa: BLE001
             logger.exception("通话摘要线程异常: %s", exc)
             try:
@@ -1280,6 +1550,51 @@ class CallSession:
                 )
             except Exception:  # noqa: BLE001
                 logger.exception("记录摘要线程失败状态时发生异常")
+
+    def _maybe_learn_playbook(
+        self,
+        record: CallRecord,
+        transcripts: list[tuple[str, str]],
+        direction: str,
+        number: str | None,
+    ) -> None:
+        """呼叫情报库自动回流（WIL-129）：摘要线程尾部顺跑一次 learner。
+
+        从转写提炼"对方索要了什么我们没有的核身信息 / 新的 IVR 流程事实"并
+        合并入库（只增不删、隐私硬校验在 call_playbooks 内）。挂在摘要流程上
+        意味着 SUMMARY_ENABLED=false 时不回流——P1 接受该耦合。绝不抛出。
+        """
+        try:
+            if direction != "outbound" or not number:
+                return
+            learned = call_playbooks.learn_from_call(
+                number,
+                transcripts,
+                self._profile_task_package,
+                call_id=record.id,
+                updated=time.strftime("%Y-%m-%d"),
+            )
+            if not learned:
+                return
+            # 只发键名与 label 级信息——情报库本身无值，事件同样保持无值。
+            keys = [
+                entry.get("key")
+                for entry in learned.get("required_info", [])
+                if isinstance(entry, dict)
+            ]
+            record.log_event(
+                "playbook_updated", playbook_id=learned.get("id"), keys=keys
+            )
+            self._publish(
+                {
+                    "type": "playbook_updated",
+                    "call_id": record.id,
+                    "playbook_id": learned.get("id"),
+                    "keys": keys,
+                }
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("呼叫情报库回流异常（不影响摘要）")
 
     def _build_tools(self, direction: str | None = None) -> ToolRegistry:
         """构造本通会话的工具集（工具语义在 call_tools 模块）。"""
@@ -1296,6 +1611,7 @@ class CallSession:
             is_sms_target_allowed=self._sms_target_allowed,
             send_dtmf=self._send_dtmf_from_tool,
             effect_guard=lambda: self._agent_effect_allowed(generation),
+            direction=direction,
         )
         registry = tools.register()
         if (
@@ -1486,7 +1802,7 @@ class CallSession:
                     continue
                 self._triage_clarification_spoken = True
                 try:
-                    await agent.say(_INBOUND_TRIAGE_CLARIFY_TEXT)
+                    await agent.say(_INBOUND_TRIAGE_CLARIFY_TEXT[agent_language()])
                     self._drain_agent_audio(bridge)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
@@ -1512,7 +1828,7 @@ class CallSession:
                 # free-form policy. Fence immediately after its audio is flushed.
                 self._clear_outgoing_audio()
                 try:
-                    await agent.say(_INBOUND_TRIAGE_REJECT_TEXT)
+                    await agent.say(_INBOUND_TRIAGE_REJECT_TEXT[agent_language()])
                     self._drain_agent_audio(bridge)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
@@ -1569,6 +1885,7 @@ class CallSession:
             self.hub,
             self.call_logger,
             extra_allowed=self.current_caller,
+            owner_number=config.get_str("OWNER_PHONE"),
             allow_any=config.get_bool("SMS_ALLOW_ANY_TARGET"),
         )
 
@@ -1576,6 +1893,14 @@ class CallSession:
         """会话系统提示词：文本构造在 prompts 模块（纯函数，可独测）。"""
         lang = agent_language()
         scenario = self._take_prompt_scenario() if direction == "outbound" else None
+        if direction == "outbound" and call_playbooks.playbooks_enabled():
+            # 呼叫情报库（WIL-129）：命中热线的 IVR 流程知识拼进场景——导航
+            # 纪律从"每个预设手写"升级为"按热线沉淀共享"。lookup 宽松 never-raises。
+            notes = call_playbooks.ivr_notes_text(
+                call_playbooks.lookup_playbook(self.current_caller), lang
+            )
+            if notes:
+                scenario = f"{scenario}\n{notes}" if scenario else notes
         triage_mode = self._triage_mode if direction == "inbound" else "off"
         takeover_preference = (
             config.get_str("INBOUND_TAKEOVER_PREFERENCE")
@@ -1596,6 +1921,9 @@ class CallSession:
             # 曾写成 triage_mode == "enforce"，于是 _triage_pending 成了只写
             # 标志（4 处写、0 处读），放行裁决完全落空（#76）。
             triage_pending=self._triage_pending if direction == "inbound" else False,
+            task_package=(
+                self._profile_task_package if direction == "outbound" else None
+            ),
         )
 
     def _opening_instructions(self, direction: str) -> str:
@@ -1631,11 +1959,36 @@ class CallSession:
                 reason=str(result.get("reason", ""))[:200],
                 ok=bool(result.get("ok")),
             )
-        if result.get("decision") == "wrap_up":
+        decision = result.get("decision")
+        # hold 转换（WIL-120 二期）：on_hold 进入；裁判成功返回其他判定即退出
+        # （失败结果不动状态——网络抖动不该把排队踢回普通计时）。
+        if decision == "on_hold" and not self._on_hold:
+            self._on_hold = True
+            self._hold_started_ts = time.time()
+            if record is not None:
+                record.log_event("hold_started")
+            self._publish({"type": "hold", "active": True})
+            logger.info("收尾裁判判定进入排队等待（%s）", result.get("reason", ""))
+        elif (
+            self._on_hold
+            and result.get("ok")
+            and decision in ("continue", "wrap_up")
+        ):
+            held = max(0.0, time.time() - self._hold_started_ts)
+            self._on_hold = False
+            if record is not None:
+                record.log_event("hold_ended", seconds=round(held, 1))
+            self._publish({"type": "hold", "active": False})
+            logger.info("排队等待结束（%.0fs），恢复正常判定", held)
+        if decision == "wrap_up":
             self._wrap_up_requested = True
             self._wrap_up_reason = result.get("reason", "")
 
     def _request_repeat_stuck_wrap_up(self, reason: str) -> None:
+        if self._on_hold:
+            # 排队等待中的「重复」是等待音循环，不是会话卡死（WIL-120 二期）。
+            logger.info("复读抑制在排队等待期触发，忽略: %s", reason)
+            return
         logger.warning("复读抑制判定会话卡死，准备收尾: %s", reason)
         self._wrap_up_requested = True
         self._wrap_up_reason = reason
@@ -1740,6 +2093,16 @@ class CallSession:
             if result.get("result_verification") == "carrier_sms"
             else "none"
         )
+        # 长通话覆盖（WIL-120 一期）：仅 profile 来源提供；动态生成结果无此键。
+        max_seconds = result.get("max_call_seconds")
+        self._profile_max_call_seconds = (
+            max_seconds
+            if isinstance(max_seconds, int) and not isinstance(max_seconds, bool)
+            else None
+        )
+        self._profile_wrap_up_judge = result.get("wrap_up_judge") is not False
+        package = result.get("task_package")
+        self._profile_task_package = package if isinstance(package, dict) else None
         if result.get("ok") and str(result.get("scenario", "")).strip():
             return str(result["scenario"])
         return None
@@ -2076,6 +2439,102 @@ class CallSession:
                 self._dtmf_guard_until = previous_guard
             return ok, mode
 
+    def _handle_peer_barge_in(self, bridge: AudioBridge) -> bool:
+        """对端开口（provider VAD speech_started）→ 让 AI 让路；返回是否接受打断。
+
+        返回 False（provider 侧据此**不发** ``response.cancel``）的两种情形：
+
+        - **DTMF 护窗期内（WIL-94 坑 1）**：inband 双音与 Agent 语音共用
+          ``_outgoing_audio``，IVR 提示音触发的「对端开口」若在此时清队列，
+          会把排队中的双音打断——WIL-49 修好的 IVR 导航就回归了。护窗在
+          ``_send_dtmf_raw`` 里**先装再入队**，所以这里先查护窗再动手是安全的。
+        - **自激兜底已触发（WIL-94 坑 4）**：本通已退回半双工，后续事件全拒。
+
+        自激指纹：回复首块音频到达后 ``_BARGE_IN_ECHO_WINDOW_SECONDS`` 内就被
+        「打断」，连续 ``_BARGE_IN_ECHO_STRIKES`` 次。真人抢话通常更晚，且出现
+        一次较晚的打断即清零计数。误判的代价是本通退回半双工（即今天的默认
+        行为），远小于放任自激的代价（通话自循环）。
+        """
+        now = time.monotonic()
+        if not self._barge_in:
+            return False
+        if now < self._dtmf_guard_until:
+            logger.info("护窗期内忽略对端开口：barge-in 让位，双音优先（WIL-49）")
+            return False
+        pending = (
+            bridge.pending_output_bytes()
+            if hasattr(bridge, "pending_output_bytes")
+            else 0
+        )
+        agent_in_flight = pending > 0 or not self._outgoing_audio.empty()
+        if agent_in_flight and self._turn_audio_started_at > 0:
+            if now - self._turn_audio_started_at <= _BARGE_IN_ECHO_WINDOW_SECONDS:
+                self._barge_in_echo_strikes += 1
+                if self._barge_in_echo_strikes >= _BARGE_IN_ECHO_STRIKES:
+                    self._barge_in = False
+                    logger.warning(
+                        "疑似自激：连续 %d 次回复出声 %.1fs 内即被「打断」，"
+                        "本通退回半双工（WIL-94 兜底）",
+                        self._barge_in_echo_strikes,
+                        _BARGE_IN_ECHO_WINDOW_SECONDS,
+                    )
+                    record = self._record
+                    if record is not None:
+                        record.log_event(
+                            "barge_in_fallback",
+                            strikes=self._barge_in_echo_strikes,
+                            window_s=_BARGE_IN_ECHO_WINDOW_SECONDS,
+                        )
+                    return False
+            else:
+                self._barge_in_echo_strikes = 0
+        return self._discard_agent_playback(bridge, "对端开口打断 AI")
+
+    def _log_winddown(self, record: CallRecord | None, reason: str) -> None:
+        """收尾起因落盘（WIL-95 第二期）：termination_kind 的证据之一。
+
+        只在「AI 主动收尾」的两个路径打（外呼硬时限 / 收尾裁判）；hangup 工具、
+        接管、对端先挂各有既有事件，metrics 层统一归类。埋点失败不影响通话。
+        """
+        if record is None:
+            return
+        try:
+            record.log_event("winddown", reason=reason)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _discard_agent_playback(self, bridge: AudioBridge, reason: str) -> bool:
+        """清掉 AI 未播出的下行积压（桥内 + 队列）；护窗期拒绝，双音优先。
+
+        barge-in 让路与复读晚截（ResponseAudioGate ``on_late_cut``）共用的
+        清积压动作。护窗语义对两者一致：DTMF 期间谁都不许清队列。
+        """
+        if time.monotonic() < self._dtmf_guard_until:
+            logger.info("护窗期内拒绝清积压（%s）：双音优先（WIL-49）", reason)
+            return False
+        with self._media_lock:
+            # 双检护窗：_send_dtmf_raw 是「先装护窗、再持本锁清队+入队双音」。
+            # 首查护窗时它可能还没装；等拿到锁，若双音已入队则护窗必已装上——
+            # 锁内重查一次，堵住「首查未装、动手时双音在队」的毫秒级竞态。
+            if time.monotonic() < self._dtmf_guard_until:
+                logger.info("护窗在清积压途中装上（%s）：让位，双音优先", reason)
+                return False
+            dropped = 0
+            if hasattr(bridge, "discard_pending_output"):
+                dropped = bridge.discard_pending_output()
+            cleared = 0
+            try:
+                while True:
+                    self._outgoing_audio.get_nowait()
+                    cleared += 1
+            except Empty:
+                pass
+        if dropped or cleared:
+            logger.info(
+                "%s：丢弃未播积压 %d 字节 / 队列 %d 块", reason, dropped, cleared
+            )
+        return True
+
     # 一轮之内 provider 是突发写音频的（分块几乎连着到），轮次之间才有真空档。
     # 用这个空档判定「新的一轮开始了」，就不必依赖各 provider 的 response 事件。
     _TURN_GAP_SECONDS = 1.5
@@ -2143,18 +2602,25 @@ class CallSession:
         代价要说清：这是**硬切**，被截的那一轮结尾会突兀。默认阈值取在实测
         p90 之上就是为了让它只在明显跑飞时才触发。
         """
-        if self._max_turn_seconds <= 0 or not pcm_agent:
+        if not pcm_agent:
             return False
-        rate = getattr(agent, "output_rate", 0) or self._agent_output_rate
-        if rate <= 0:
-            return False
+        # 轮次边界检测不属于闸门：排队/端到端埋点的「每轮一次」标志也靠它复位，
+        # 闸门关闭（max_turn_seconds<=0）时同样要走到（2026-08-12 教训：早退在
+        # 这之前会让埋点在首轮之后永久哑掉）。
         now = time.monotonic()
         with self._turn_lock:
             if now - self._turn_last_chunk_at > self._TURN_GAP_SECONDS:
                 # 空档 → 新的一轮，计数与「已超限」标志一起重置。
                 self._turn_audio_bytes = 0
                 self._turn_cancel_sent = False
+                self._turn_first_audio_logged = False
+                self._turn_trim_budget = _TURN_TRIM_CAP_BYTES
+                self._turn_trimmed_bytes = 0
             self._turn_last_chunk_at = now
+        rate = getattr(agent, "output_rate", 0) or self._agent_output_rate
+        if self._max_turn_seconds <= 0 or rate <= 0:
+            return False
+        with self._turn_lock:
             if self._turn_cancel_sent:
                 return True  # 本轮已超限，后续分块一律丢弃
             self._turn_audio_bytes += len(pcm_agent)
@@ -2777,12 +3243,13 @@ class CallAgentService:
         pcm_baudrate: int = 921600,
         tx_gain: float = 1.0,
         hub: EventHub | None = None,
-        modem: Eg25Modem | None = None,
+        modem: SerialModem | None = None,
         call_logger: CallLogger | None = None,
         sms_email_forwarder: SmsEmailForwarder | None = None,
+        vendor: str = "quectel",
     ) -> None:
         # modem/call_logger 参数供测试注入；默认按串口/环境配置自建。
-        self.modem = modem or Eg25Modem(modem_port, baudrate)
+        self.modem = modem or create_modem(modem_port, baudrate, vendor)
         self.audio_keyword = audio_keyword
         self.provider = provider
         self.audio_mode = audio_mode
@@ -2982,6 +3449,11 @@ class CallAgentService:
         missing_credentials, message = self._reject_if_credentials_missing()
         if missing_credentials:
             return False, message
+        blocked, message = self._reject_if_playbook_info_missing(
+            number, task=task, preset_hint=preset_hint, preset_id=preset_id
+        )
+        if blocked:
+            return False, message
         self._remember_outbound_task(task)
         with self._ring_lock:
             if self.session.is_active or self._remote_call_owner is not None:
@@ -3002,6 +3474,45 @@ class CallAgentService:
                     preset_id=preset_id,
                 )
         return True, None
+
+    def _reject_if_playbook_info_missing(
+        self,
+        number: str,
+        *,
+        task: str | None,
+        preset_hint: str | None,
+        preset_id: str | None,
+    ) -> tuple[bool, str | None]:
+        """拨前硬拦截（WIL-129）：热线情报库要求的必备信息，预设里必须齐。
+
+        情报库存"要什么"（键定义），预设 task_package.verification 存"是什么"
+        （值）。命中情报且缺任一必备键即拒绝拨号——信息缺口应在拨号前暴露，
+        而不是在通话里白打一通（611 演练实锤）。库未命中/开关关闭时放行；
+        检查器自身异常也放行（挡住拨号主链路比漏检更糟）。
+        """
+        try:
+            if not call_playbooks.playbooks_enabled():
+                return False, None
+            playbook = call_playbooks.lookup_playbook(number)
+            if playbook is None:
+                return False, None
+            lang = agent_language()
+            profile = None
+            if preset_id:
+                profile = lookup_profile_by_id(preset_id, number, task or "", lang=lang)
+            if profile is None:
+                match_key = preset_hint if preset_hint is not None else (task or "")
+                profile = lookup_profile(number, match_key, lang=lang)
+            package = (profile or {}).get("task_package")
+            missing = call_playbooks.missing_required_info(
+                playbook, package if isinstance(package, dict) else None
+            )
+            if not missing:
+                return False, None
+            return True, call_playbooks.missing_info_message(missing, lang)
+        except Exception:  # noqa: BLE001
+            logger.exception("呼叫情报库拨前检查异常，放行")
+            return False, None
 
     def hangup(self) -> tuple[bool, str | None]:
         """挂断进行中的通话（AI 与 IVR 互相不挂断时的人工兜底）。"""
@@ -3431,7 +3942,101 @@ class CallAgentService:
                 return
             self._set_modem_connected(True)
             logger.info("模组已连接，等待来电…")
+            self._watch_modem_link()
             return
+
+    # 断连超过该秒数仍未自愈，就由 supervisor 重新走一遍连接流程。
+    _LINK_WATCHDOG_SECONDS = 45.0
+    _LINK_WATCHDOG_POLL = 5.0
+    # 单轮重建的时限：connect() 会跑整套初始化（SMS/SIM 查询），正常几秒内完成。
+    # 真机 2026-08-12 出现过 connect() 5 分钟不返回（WIL-111），故必须有界——
+    # 超时就放弃本轮、下轮再试，绝不让看门狗线程被挂死而失去看护能力。
+    _LINK_RECONNECT_TIMEOUT = 30.0
+
+    def _modem_port_ready(self) -> bool:
+        """串口是否已存在。
+
+        macOS 上串口是 USB 桥建出来的 PTY symlink；桥执行 PCM 自愈期间会删掉它、
+        约一分半后重建。此时去 connect 注定失败，还可能卡在半开状态（WIL-111），
+        故先看文件在不在，不在就安静等下一轮。``auto`` 哨兵交给探测逻辑，不预判。
+        """
+        port = getattr(self.modem, "port", "")
+        if not port or port == platforms.AUTO_PORT:
+            return True
+        return os.path.exists(port)
+
+    def _reconnect_modem_bounded(self) -> bool:
+        """在时限内重建模组连接；超时返回 False（本轮放弃，下轮再试）。
+
+        connect() 可能因串口/锁竞争长时间阻塞，直接在看门狗线程里调用会把看门狗
+        本身挂死。放到独立线程并 join(timeout)：即便它卡住，看门狗仍能继续巡检。
+        """
+        result: dict[str, BaseException | None] = {"error": None}
+
+        def _do() -> None:
+            try:
+                self.modem.connect()
+                self.modem.initialize_for_voice(self.audio_mode)
+                self.modem.start_listener()
+            except BaseException as exc:  # noqa: BLE001
+                result["error"] = exc
+
+        worker = threading.Thread(
+            target=_do, name="modem-watchdog-reconnect", daemon=True
+        )
+        worker.start()
+        worker.join(timeout=self._LINK_RECONNECT_TIMEOUT)
+        if worker.is_alive():
+            logger.warning(
+                "看门狗重建连接超过 %.0fs 未完成，本轮放弃（下轮再试）",
+                self._LINK_RECONNECT_TIMEOUT,
+            )
+            return False
+        if result["error"] is not None:
+            logger.warning("看门狗重建连接失败，稍后再试: %s", result["error"])
+            return False
+        return True
+
+    def _watch_modem_link(self) -> None:
+        """连接看门狗：模组长时间断开就重新建连（不依赖 modem 内部重连线程活着）。
+
+        真机事故（2026-08-12，WIL-110）：USB 桥执行 PCM 卡死自愈期间串口消失约
+        100 秒，桥恢复后 app 的重连线程已因异常穿透而死亡，进程活着却永远连不
+        回来——来电全部无人接听，只能手工重启服务。modem 侧的异常穿透已修，但
+        这里再加一道与线程状态无关的兜底：只要「断开持续够久」就重建连接
+        （``start_listener`` 对已存活的线程是幂等的，不会重复起线程）。
+        """
+        # 鸭子类型的 modem（测试替身/旧实现）可能没有 is_connected，
+        # 那就没有可看护的信号，直接退出而不是让看门狗线程抛异常死掉。
+        is_connected = getattr(self.modem, "is_connected", None)
+        if not callable(is_connected):
+            return
+        disconnected_since: float | None = None
+        while self._service_running:
+            time.sleep(self._LINK_WATCHDOG_POLL)
+            if not self._service_running:
+                return
+            if is_connected():
+                disconnected_since = None
+                continue
+            now = time.monotonic()
+            if disconnected_since is None:
+                disconnected_since = now
+                continue
+            if now - disconnected_since < self._LINK_WATCHDOG_SECONDS:
+                continue
+            if not self._modem_port_ready():
+                # 桥多半正在做 PCM 自愈（串口被删、约 1 分半后重建）：安静等它建好，
+                # 不把计时清零，端口一回来立刻重连。
+                continue
+            logger.warning(
+                "模组已断开超过 %.0fs，看门狗重建连接", self._LINK_WATCHDOG_SECONDS
+            )
+            disconnected_since = None
+            if not self._reconnect_modem_bounded():
+                continue
+            self._set_modem_connected(True)
+            logger.info("看门狗已恢复模组连接，等待来电…")
 
     def _set_modem_connected(self, connected: bool, error: str | None = None) -> None:
         """更新模组连接状态并广播给 UI（仅状态翻转时发事件，避免重连期刷屏）。"""

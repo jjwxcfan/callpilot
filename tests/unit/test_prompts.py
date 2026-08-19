@@ -165,6 +165,21 @@ def test_inbound_instructions_inject_owner_and_rules():
     assert "这件事是李明的" not in text
 
 
+def test_inbound_relay_sms_must_carry_caller_identity():
+    """转告短信不能只写「有人找你」——机主不在通话里，谁、什么事只能由 AI 写进去。
+
+    真机 2026-08-14：来电者请 AI 给机主发消息，短信正文只有
+    「Caller needs to speak with you. Please reach out to them when available.」。
+    """
+    zh = build_instructions("inbound", "李明", "数字分身", "")
+    en = build_instructions("inbound", "Alex", "AI assistant", "", "en")
+
+    assert "send_sms" in zh and "对方是谁" in zh and "没留姓名" in zh
+    assert "send_sms" in en and "who is calling" in en and "no name" in en
+    # 「号码留空」的含义必须与实现一致：发给当前通话对端，不是机主
+    assert "empty to text the person you are on the call with" in en
+
+
 def test_inbound_takeover_preference_is_free_text_with_injection_boundary():
     preference = "快递和外卖也转给我；教育培训、贷款等营销电话由你处理。"
 
@@ -382,14 +397,19 @@ def test_inbound_rules_do_not_quote_the_greeting():
 def test_inbound_identity_moves_into_the_rules():
     """开场白不报身份了，身份就必须由规则兜住——否则对方可能整通都以为在跟机主讲话。
 
-    这是 WIL-91 砍开场白的**补偿机制**：改成「对方一说明来意就顺势表明」，
-    而不是原来的「被问才说」。没有这一条，缩短开场白就成了误导对方。
+    这是 WIL-91 砍开场白的**补偿机制**：身份要主动说，而不是「被问才说」。
+    没有这一条，缩短开场白就成了误导对方。
+
+    WIL-112 调整了措辞（从「对方一说明来意就顺势表明」改为「在第一个自然时机说
+    一次、之后不再重复」，因为 AI 每轮重复自我介绍把真正的回答埋在套话后面），
+    语义不变：仍是主动表明。故这里断言语义而非原措辞。
     """
     text = build_instructions("inbound", "李明", "数字分身", DEFAULT_OUTBOUND_TASK)
     assert "不要冒充李明本人" in text
     assert "数字分身" in text
     # 必须是主动表明，不能只写「被问才说」
-    assert "说明来意" in text or "顺势表明" in text
+    assert "第一个自然时机" in text and "说一次" in text
+    assert "被直接问身份时如实回答" in text  # 被问也要答，但不是唯一触发
 
 
 # ---- 无预设任务（空 task）：不塞元指令、强化「你是主叫不是客服」----
@@ -464,3 +484,93 @@ def test_agent_language_reads_config(monkeypatch):
     assert prompts.agent_language() == "en"
     monkeypatch.setenv("AGENT_LANGUAGE", "zh")
     assert prompts.agent_language() == "zh"
+
+
+# ---- WIL-112：别把要问的事当清单背诵 / 身份只说一次 ----
+
+def test_inbound_prompt_has_no_unfilled_placeholders():
+    """f-string 漏了前缀会让 {owner} 原样进提示词——静默 bug，模型会照着念。"""
+    from agentcall.prompts import build_instructions
+
+    for lang in ("zh", "en"):
+        text = build_instructions("inbound", "李明", "小助理", "", lang)
+        assert "{owner}" not in text, lang
+        assert "{persona}" not in text, lang
+        assert "{task}" not in text, lang
+
+
+def test_outbound_prompt_has_no_unfilled_placeholders():
+    from agentcall.prompts import build_instructions
+
+    for lang in ("zh", "en"):
+        text = build_instructions("outbound", "李明", "小助理", "确认预约", lang)
+        assert "{owner}" not in text and "{persona}" not in text, lang
+
+
+def test_inbound_prompt_tells_model_not_to_recite_or_repeat_identity():
+    """真机 2026-08-12：AI 每轮重复自我介绍 + 一口气问完 4 件事，单轮 14~18 秒，
+    对端要等 5 秒才听到真正的回答（WIL-112）。提示词须明确「逐步问」「只说一次」。"""
+    from agentcall.prompts import build_instructions
+
+    zh = build_instructions("inbound", "李明", "小助理", "", "zh")
+    assert "不是一份要背诵的清单" in zh
+    assert "一次只问其中一件" in zh
+    assert "后续轮次绝不再重复" in zh
+
+    en = build_instructions("inbound", "Shaocheng", "AI assistant", "", "en")
+    assert "not a checklist to recite" in en
+    assert "one of them at a time" in en
+    assert "never repeat it in later turns" in en
+
+
+# ---- WIL-120 三期：任务包注入 ----
+
+
+def test_task_package_injected_into_outbound_instructions():
+    from agentcall.prompts import build_instructions
+
+    package = {
+        "verification": {"户名": "李明"},
+        "negotiation": {"目标价": "$55/mo"},
+        "preauth": {"月费上限": "$70"},
+        "blacklist": ["开通增值业务"],
+    }
+    zh = build_instructions(
+        "outbound", "李明", "AI 助理", "谈账单", "zh", task_package=package
+    )
+    assert "核身信息" in zh and "户名：李明" in zh
+    assert "目标价：$55/mo" in zh
+    assert "月费上限：$70" in zh and "ask_owner" in zh
+    assert "开通增值业务" in zh
+
+    en = build_instructions(
+        "outbound", "Alex", "AI assistant", "negotiate bill", "en",
+        task_package=package,
+    )
+    assert "Verification facts" in en and "Authorized range" in en
+    assert "Never agree to" in en and "$55/mo" in en
+
+    # 空包/None：不产生任何任务资料段。
+    empty = build_instructions("outbound", "李明", "AI 助理", "谈账单", "zh")
+    assert "任务资料" not in empty
+
+
+def test_task_package_ignored_for_inbound():
+    from agentcall.prompts import build_instructions
+
+    text = build_instructions(
+        "inbound", "李明", "AI 助理", "", "zh",
+        task_package={"negotiation": {"目标价": "$55"}},
+    )
+    assert "$55" not in text
+
+
+def test_outbound_voice_menu_role_discipline_present():
+    """真机 1d 教训：AI 对语音菜单说出接线员口吻（"let me connect you"）——
+    外呼 prompt 必须含角色反转自纠条款（zh/en 各自查关键句）。"""
+    zh = build_instructions("outbound", "李明", "AI 助理", "查套餐", "zh")
+    assert "角色说反了" in zh
+    assert "只说它听得懂的内容" in zh
+    en = build_instructions("outbound", "Alex", "AI assistant", "check plan", "en")
+    assert "the roles are flipped" in en
+    assert "say only what it can understand" in en

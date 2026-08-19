@@ -16,6 +16,9 @@ def _isolate_side_effects(tmp_path, monkeypatch):
     """
     monkeypatch.setenv("CALL_LOG_DIR", str(tmp_path / "recordings"))
     monkeypatch.setenv("NUMBER_PROFILES_FILE", str(tmp_path / "number_profiles.json"))
+    # 呼叫情报库（WIL-129）：路径隔离 + 默认关闭，防止单测误触 learner 的真实模型调用
+    monkeypatch.setenv("CALL_PLAYBOOKS_FILE", str(tmp_path / "call_playbooks.json"))
+    monkeypatch.setenv("CALL_PLAYBOOKS_ENABLED", "false")
     monkeypatch.setenv("SUMMARY_ENABLED", "false")
     monkeypatch.setenv("DASHSCOPE_API_KEY", "test-dashscope-key")
     from agentcall.rate_limit import reset_sms_rate_limit_state

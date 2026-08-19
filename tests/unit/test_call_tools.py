@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from fakes import FakeModem
 
@@ -39,6 +40,7 @@ def make_tools(
     sms_gate=None,
     send_dtmf=None,
     effect_guard=None,
+    direction=None,
 ) -> tuple[CallTools, FakeModem, list]:
     modem = modem or FakeModem()
     hangups: list[bool] = []
@@ -51,17 +53,22 @@ def make_tools(
         is_sms_target_allowed=sms_gate,
         send_dtmf=send_dtmf,
         effect_guard=effect_guard,
+        direction=direction,
     )
     return tools, modem, hangups
 
 
 # ---- 注册表：4 个工具全部就位 ----
 
-def test_register_exposes_all_four_tools():
+def test_register_exposes_base_tools():
     tools, _, _ = make_tools()
     registry = tools.register()
     names = {spec["function"]["name"] for spec in registry.specs()}
-    assert names == {"send_sms", "hangup_call", "query_verification_code", "send_dtmf"}
+    # wait_for_sms 与 query_verification_code 同门（WIL-120 三期，同一开关）。
+    assert names == {
+        "send_sms", "hangup_call", "query_verification_code",
+        "wait_for_sms", "send_dtmf",
+    }
 
 
 def test_send_dtmf_tool_description_requires_silent_execution():
@@ -188,6 +195,193 @@ def test_tool_calls_write_sanitized_audit_events():
     assert "secret body" not in str(audits)
     assert "482913" not in str(audits)
     assert hangups == [True]
+
+
+# ---- to="owner"：系统解析机主号码（WIL-116） ----
+
+def test_send_sms_owner_token_resolves_to_configured_number(monkeypatch):
+    """模型只写 owner，真实号码由系统从 OWNER_PHONE 解析；工具结果也只回传
+    owner 标记——结果回流进模型上下文，回号码等于送到模型嘴边念给来电者。"""
+    monkeypatch.setenv("OWNER_PHONE", "+16505550100")
+    tools, modem, _ = make_tools(
+        caller="13800000000", direction="inbound", sms_gate=lambda n: True
+    )
+
+    result = tools._send_sms({"to": "Owner", "content": "张伟找您，说合同的事"})
+
+    assert result["success"] is True
+    number, text = modem.calls[0][1]
+    assert number == "+16505550100"
+    assert "13800000000" in text  # 转告机主仍要带来电号码
+    assert result["to"] == "owner"
+    assert "+16505550100" not in repr(result)  # 机主号码不回流给模型
+
+
+def test_send_sms_owner_token_tolerates_quotes(monkeypatch):
+    """提示词里 owner 带引号展示，模型照抄引号也必须认。"""
+    monkeypatch.setenv("OWNER_PHONE", "18800000000")
+    tools, modem, _ = make_tools(sms_gate=lambda n: True)
+
+    assert tools._send_sms({"to": '"owner"', "content": "hi"})["success"] is True
+    assert modem.calls[0][1][0] == "18800000000"
+
+
+def test_send_sms_owner_token_fails_clearly_when_unconfigured(monkeypatch):
+    monkeypatch.delenv("OWNER_PHONE", raising=False)
+    record = SpyRecord()
+    tools, modem, _ = make_tools(caller="13800000000", record=record)
+
+    result = tools._send_sms({"to": "owner", "content": "hi"})
+
+    assert result["success"] is False
+    assert "OWNER_PHONE" in result["message"]
+    assert modem.calls == []
+    audits = [fields for typ, fields in record.events if typ == "tool_call"]
+    assert audits[0]["args"]["to"] == "owner"
+
+
+def test_send_sms_owner_phone_human_format_sanitized(monkeypatch):
+    """OWNER_PHONE 填人类格式（空格/括号/连字符）也能拨——清洗后再校验。"""
+    monkeypatch.setenv("OWNER_PHONE", "+1 (650) 555-0100")
+    tools, modem, _ = make_tools(sms_gate=lambda n: True)
+
+    assert tools._send_sms({"to": "owner", "content": "hi"})["success"] is True
+    assert modem.calls[0][1][0] == "+16505550100"
+
+
+def test_send_sms_owner_phone_invalid_format_rejected(monkeypatch):
+    """清洗后仍不成号码形状的 OWNER_PHONE 要报格式错误，而不是发到 AT 层才失败。"""
+    monkeypatch.setenv("OWNER_PHONE", "not-a-phone")
+    tools, modem, _ = make_tools(sms_gate=lambda n: True)
+
+    result = tools._send_sms({"to": "owner", "content": "hi"})
+
+    assert result["success"] is False
+    assert "格式无效" in result["message"]
+    assert modem.calls == []
+
+
+def test_send_sms_non_numeric_to_error_teaches_owner_token():
+    """to 既不是号码也不是 owner 标记（如「机主」）时，错误信息要教会模型正确写法。"""
+    tools, modem, _ = make_tools(caller="13800000000")
+
+    result = tools._send_sms({"to": "机主", "content": "hi"})
+
+    assert result["success"] is False
+    assert "owner" in result["message"]
+    assert modem.calls == []
+
+
+# ---- 转给机主的短信必须带来电号码（且只有转给机主的才带） ----
+
+def make_relay_tools(monkeypatch, caller="13800000000", owner="18800000000"):
+    monkeypatch.setenv("OWNER_PHONE", owner)
+    return make_tools(caller=caller, direction="inbound", sms_gate=lambda n: True)
+
+
+def test_relay_sms_appends_caller_number(monkeypatch):
+    """转给机主的短信要带来电号码，否则机主不知道该回给谁（真机 2026-08-14）。"""
+    tools, modem, _ = make_relay_tools(monkeypatch)
+
+    result = tools._send_sms({"to": "owner", "content": "张伟找您，说合同的事"})
+
+    assert result["success"] is True
+    text = modem.calls[0][1][1]
+    assert text.startswith("张伟找您，说合同的事")
+    assert "13800000000" in text
+    assert result["content"] == text  # 回给模型的也是真正发出去的正文
+
+
+def test_explicit_owner_number_also_counts_as_relay(monkeypatch):
+    """模型直接填机主号码（而非 owner 标记）同样算中继，国家码形变也认。"""
+    tools, modem, _ = make_relay_tools(monkeypatch, owner="+8618800000000")
+
+    result = tools._send_sms({"to": "18800000000", "content": "张伟找您"})
+
+    assert "13800000000" in modem.calls[0][1][1]
+    assert result["to"] == "18800000000"  # 模型自己给的号码不用打码
+
+
+def test_third_party_sms_never_carries_caller_number(monkeypatch):
+    """发给第三方的短信绝不附来电号码——那是把来电者的号码泄露给无关的人。"""
+    tools, modem, _ = make_relay_tools(monkeypatch)
+
+    tools._send_sms({"to": "19900000000", "content": "地址是人民路 1 号"})
+
+    assert modem.calls[0][1][1] == "地址是人民路 1 号"
+
+
+def test_caller_line_language_follows_body_script(monkeypatch):
+    """追加行跟正文字符集走：给 ASCII 正文追中文会把整条短信翻成 UCS2（70 字上限）。"""
+    tools, modem, _ = make_relay_tools(monkeypatch, caller="+16505550100")
+
+    tools._send_sms({"to": "owner", "content": "Wei from Acme called."})
+    tools._send_sms({"to": "owner", "content": "张伟来电找您"})
+
+    en_text = modem.calls[0][1][1]
+    assert en_text.endswith("(Caller: +16505550100)")
+    assert en_text.isascii()  # 不因追加行翻成 UCS2
+    assert modem.calls[1][1][1].endswith("（来电号码：+16505550100）")
+
+
+def test_reply_to_caller_keeps_content_untouched(monkeypatch):
+    """回给来电者本人时不标注来源——对方当然知道自己是谁。"""
+    tools, modem, _ = make_relay_tools(monkeypatch)
+
+    tools._send_sms({"content": "地址是人民路 1 号"})
+
+    assert modem.calls[0][1][1] == "地址是人民路 1 号"
+
+
+def test_outbound_call_sms_keeps_content_untouched(monkeypatch):
+    """外呼时对端不是「来电」，这行措辞不成立。"""
+    monkeypatch.setenv("OWNER_PHONE", "18800000000")
+    tools, modem, _ = make_tools(
+        caller="10086", direction="outbound", sms_gate=lambda n: True
+    )
+
+    tools._send_sms({"to": "owner", "content": "客服说下月生效"})
+
+    assert modem.calls[0][1][1] == "客服说下月生效"
+
+
+def test_relay_dedup_tolerates_number_format_variants(monkeypatch):
+    """CLIP 是 +86 全格式、模型写裸号码：算已含，不重复追加。"""
+    tools, modem, _ = make_relay_tools(monkeypatch, caller="+8613800000000")
+
+    tools._send_sms({"to": "owner", "content": "张伟找您，回拨 13800000000"})
+
+    assert modem.calls[0][1][1] == "张伟找您，回拨 13800000000"
+
+
+def test_relay_dedup_respects_digit_boundaries(monkeypatch):
+    """短号是长数字的子串时不算已含：10086 不能被「100863 元」骗过。"""
+    tools, modem, _ = make_relay_tools(monkeypatch, caller="10086")
+
+    tools._send_sms({"to": "owner", "content": "话费余额 100863 元，来电想聊套餐"})
+
+    assert modem.calls[0][1][1].endswith("（来电号码：10086）")
+
+
+def test_relay_without_caller_id_sends_without_line(monkeypatch):
+    """隐藏号码来电（CLIP 为空）：正常发送，不编造号码行。"""
+    monkeypatch.setenv("OWNER_PHONE", "18800000000")
+    tools, modem, _ = make_tools(
+        caller=None, direction="inbound", sms_gate=lambda n: True
+    )
+
+    result = tools._send_sms({"to": "owner", "content": "有人来电找您，没留姓名"})
+
+    assert result["success"] is True
+    assert modem.calls[0][1][1] == "有人来电找您，没留姓名"
+
+
+def test_empty_content_still_rejected_on_owner_relay(monkeypatch):
+    """补号码不能把空正文补成非空，绕过空内容校验。"""
+    tools, modem, _ = make_relay_tools(monkeypatch)
+
+    assert tools._send_sms({"to": "owner", "content": "  "})["success"] is False
+    assert modem.calls == []
 
 
 def test_send_sms_no_gate_allows_all():
@@ -375,3 +569,149 @@ def test_stale_agent_generation_rejects_every_tool_before_side_effect() -> None:
     assert modem.calls == []
     assert hangups == []
     assert record.events == []
+
+
+# ---- WIL-112：工具描述随 AGENT_LANGUAGE 本地化 ----
+
+def test_tool_specs_localized_to_english(monkeypatch):
+    """规格里的中文描述会随 session 发给模型，英文场景下会把模型带偏说中文
+    （真机 2026-08-12：机主配英文、对端说英文，AI 却用中文开口）。"""
+    monkeypatch.setenv("AGENT_LANGUAGE", "en")
+    from agentcall.agents.tools import SEND_SMS_SPEC, ToolRegistry
+
+    registry = ToolRegistry()
+    registry.register(SEND_SMS_SPEC, lambda args: {})
+    spec = registry.specs()[0]["function"]
+    assert "Send an SMS" in spec["description"]
+    assert "收件" not in str(spec)
+    # 原规格常量不得被就地改动（多处共享）
+    assert "收件手机号码" in str(SEND_SMS_SPEC)
+
+
+def test_tool_specs_keep_chinese_by_default(monkeypatch):
+    monkeypatch.setenv("AGENT_LANGUAGE", "zh")
+    from agentcall.agents.tools import SEND_SMS_SPEC, ToolRegistry
+
+    registry = ToolRegistry()
+    registry.register(SEND_SMS_SPEC, lambda args: {})
+    assert "收件手机号码" in str(registry.specs()[0])
+
+
+# ---- WIL-120 二期：ask_owner 机主确认环 ----
+
+
+def test_ask_owner_registered_only_for_outbound():
+    outbound, _, _ = make_tools(direction="outbound")
+    assert "ask_owner" in outbound.register()._tools
+    inbound, _, _ = make_tools(direction="inbound")
+    assert "ask_owner" not in inbound.register()._tools
+
+
+def test_ask_owner_approved_and_declined(monkeypatch):
+    monkeypatch.setenv("OWNER_CONFIRM_TIMEOUT_SECONDS", "5")
+    hub = make_hub()
+    record = SpyRecord()
+
+    # 先把答复灌进 history：wait_for_event 先扫历史，立即命中不真等。
+    import threading
+
+    def answer(choice):
+        def worker():
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                history = hub.history()
+                answered = {
+                    e.get("id") for e in history
+                    if e.get("type") == "owner_confirm_response"
+                }
+                pending = [
+                    e for e in history
+                    if e.get("type") == "owner_confirm_request"
+                    and e.get("id") not in answered
+                ]
+                if pending:
+                    hub.publish({
+                        "type": "owner_confirm_response",
+                        "id": pending[-1]["id"],
+                        "choice": choice,
+                    })
+                    return
+                time.sleep(0.02)
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        return t
+
+    tools, _, _ = make_tools(hub=hub, record=record, direction="outbound")
+    registry = tools.register()
+
+    t = answer("approve")
+    result = registry.dispatch("ask_owner", {"question": "月费 55 刀方案，接受吗？"})
+    t.join()
+    assert result["success"] is True and result["decision"] == "approved"
+
+    t = answer("decline")
+    result = registry.dispatch("ask_owner", {"question": "月费 70 刀方案，接受吗？"})
+    t.join()
+    assert result["decision"] == "declined"
+
+    # 关闭事件总会广播（UI 据此收卡）。
+    closed = [e for e in hub.history() if e.get("type") == "owner_confirm_closed"]
+    assert len(closed) == 2
+    # 审计不含 question 原文（同 WIL-95 §7 口径）。
+    audits = [f for (etype, f) in record.events if etype == "tool_call"
+              and f.get("tool") == "ask_owner"]
+    assert audits and all("55" not in str(f) for f in audits)
+
+
+def test_ask_owner_timeout_is_declined_fail_closed(monkeypatch):
+    monkeypatch.setenv("OWNER_CONFIRM_TIMEOUT_SECONDS", "1")
+    hub = make_hub()
+    tools, _, _ = make_tools(hub=hub, direction="outbound")
+    started = time.monotonic()
+    result = tools.register().dispatch("ask_owner", {"question": "x"})
+    assert time.monotonic() - started >= 0.9
+    assert result["success"] is True and result["decision"] == "timeout"
+
+
+def test_ask_owner_rejects_empty_question():
+    tools, _, _ = make_tools(hub=make_hub(), direction="outbound")
+    result = tools.register().dispatch("ask_owner", {"question": "  "})
+    assert result["success"] is False
+
+
+# ---- WIL-120 三期：wait_for_sms ----
+
+
+def test_wait_for_sms_returns_new_message_and_ignores_old(monkeypatch):
+    monkeypatch.setenv("WAIT_SMS_TIMEOUT_SECONDS", "2")
+    hub = make_hub()
+    # 通话前的旧短信：绝不能被当成「刚到的」返回。
+    hub.publish({"type": "sms_in", "ts": time.time() - 300,
+                 "sender": "10086", "text": "旧验证码 111111"})
+    tools, _, _ = make_tools(hub=hub, direction="outbound")
+    registry = tools.register()
+
+    import threading
+
+    def deliver():
+        time.sleep(0.3)
+        hub.publish({"type": "sms_in", "ts": time.time(),
+                     "sender": "10086", "text": "您的验证码是 654321"})
+
+    t = threading.Thread(target=deliver, daemon=True)
+    t.start()
+    result = registry.dispatch("wait_for_sms", {})
+    t.join()
+    assert result["success"] is True
+    assert result["code"] == "654321"
+    assert result["sender"] == "10086"
+
+
+def test_wait_for_sms_times_out_without_new_message(monkeypatch):
+    monkeypatch.setenv("WAIT_SMS_TIMEOUT_SECONDS", "1")
+    hub = make_hub()
+    hub.publish({"type": "sms_in", "ts": time.time() - 300,
+                 "sender": "10086", "text": "历史短信 999999"})
+    tools, _, _ = make_tools(hub=hub, direction="outbound")
+    result = tools.register().dispatch("wait_for_sms", {})
+    assert result["success"] is False

@@ -259,6 +259,9 @@ class QwenVoiceAgent(VoiceAgent):
             lambda chunk: self._audio_queue.put(chunk),
             on_suppressed=self._nudge_after_repeat_suppressed,
             on_stuck=self._repeat_suppression_stuck,
+            # 复读已开播才被判定时清设备侧积压（专用晚截回调，未注册则无害；
+            # 不走打断回调，以免被计进 barge-in 自激笔数——见 base）。
+            on_late_cut=self._emit_late_cut,
         )
         self._callback = _QwenCallback(self._audio_queue, agent=self)
         self._on_audio_out: Callable[[bytes], None] | None = None
@@ -305,7 +308,8 @@ class QwenVoiceAgent(VoiceAgent):
             "之后用口语化、简洁的方式回答对方问题，每次回答控制在两三句话以内。"
             f"当前真实日期时间是 {now_str}，这是准确信息；对方询问日期、时间、"
             "今天几号或星期几时，必须以此为准回答，不要凭记忆猜测年份。"
-            "你可以调用工具帮用户完成实际操作：发送短信(send_sms，发给本人时号码留空)、"
+            "你可以调用工具帮用户完成实际操作：发送短信(send_sms，发给通话对方时号码留空、"
+            "发给机主时 to 填 owner)、"
             "挂断电话(hangup_call，挂断前先说一句告别语)、查询最近收到的短信验证码"
             "(query_verification_code)。需要时主动调用对应工具，操作完成后用一句话口头确认结果。"
         )

@@ -81,6 +81,69 @@
     animation: breathe 1.5s ease-in-out infinite;
   }
   .state-chip.ended { border-color: rgba(255, 69, 58, .4); color: var(--err); }
+  /* 排队等待徽章（WIL-120 二期）：hold 事件驱动，mm:ss 前端本地计时 */
+  .hold-badge {
+    display: none; align-items: center; gap: 6px; margin-left: 8px;
+    padding: 3px 11px; border-radius: 999px; font-size: 12px;
+    font-family: var(--mono); color: var(--warn);
+    background: var(--warn-dim); border: 1px solid rgba(255, 214, 10, .4);
+  }
+  .hold-badge.show { display: inline-flex; }
+  /* 机主确认卡（WIL-120 二期 Path A）：fixed 覆层，60s 倒计时，超时=拒绝 */
+  .confirm-overlay {
+    position: fixed; inset: 0; z-index: 300; display: none;
+    align-items: center; justify-content: center;
+    background: rgba(5, 8, 14, .66); backdrop-filter: blur(6px);
+  }
+  .confirm-overlay.show { display: flex; }
+  .cc-number { font: 600 22px/1.5 ui-monospace, monospace; letter-spacing: .06em;
+    text-align: center; margin: 10px 0 4px; word-break: break-all; }
+  .confirm-card {
+    width: min(92vw, 460px); border-radius: 20px; padding: 22px;
+    background: var(--surface-strong); border: 1px solid var(--border-strong);
+    box-shadow: 0 24px 64px rgba(0, 0, 0, .6);
+  }
+  .confirm-card h3 { font-size: 15px; margin-bottom: 4px; }
+  .confirm-card .cc-count {
+    font-family: var(--mono); font-size: 12px; color: var(--warn); margin-bottom: 10px;
+  }
+  .confirm-card .cc-question {
+    font-size: 14px; line-height: 1.65; padding: 12px 14px; border-radius: 12px;
+    background: var(--well); border: 1px solid var(--border);
+    max-height: 40vh; overflow-y: auto; white-space: pre-wrap;
+  }
+  .confirm-card .cc-acts { display: flex; gap: 10px; margin-top: 16px; }
+  /* display:flex 会压过 hidden 属性的 UA 样式——显式补回（2026-08-18 真机发现） */
+  .confirm-card .cc-acts[hidden] { display: none; }
+  .confirm-card .cc-acts .btn { flex: 1; }
+  .confirm-card .cc-note { font-size: 11px; color: var(--dim); margin-top: 10px; }
+  /* 对话式建单（WIL-120 三期 b）：GPT 式聊天框 + 任务确认卡 */
+  .intake-card { width: min(94vw, 560px); display: flex; flex-direction: column; max-height: 86vh; }
+  .intake-log { flex: 1; overflow-y: auto; display: flex; flex-direction: column;
+    gap: 8px; padding: 10px 2px; min-height: 180px; }
+  .intake-msg { max-width: 86%; padding: 8px 12px; border-radius: 14px;
+    font-size: 13.5px; line-height: 1.6; white-space: pre-wrap; }
+  .intake-msg.user { align-self: flex-end; background: var(--blue-dim);
+    border: 1px solid rgba(10, 132, 255, .35); }
+  .intake-msg.assistant { align-self: flex-start; background: var(--well);
+    border: 1px solid var(--border); }
+  .intake-msg.pending { color: var(--dim); font-style: italic; }
+  .preset-row { display: flex; gap: 8px; align-items: center; }
+  .preset-row .preset-select { flex: 1; min-width: 0; }
+  .intake-options { display: flex; flex-wrap: wrap; gap: 8px; align-self: flex-start; }
+  .intake-opt { background: var(--blue-dim); border: 1px solid rgba(10, 132, 255, .45);
+    border-radius: 999px; padding: 6px 14px; font-size: 13px; color: var(--text);
+    cursor: pointer; }
+  .intake-opt:hover { filter: brightness(1.2); }
+  .intake-input-row { display: flex; gap: 8px; margin-top: 10px; }
+  .intake-input-row input { flex: 1; }
+  .intake-draft { margin-top: 10px; padding: 12px 14px; border-radius: 12px;
+    background: var(--well); border: 1px solid var(--border-strong);
+    font-size: 13px; line-height: 1.6; }
+  .intake-draft .dr-line { display: flex; gap: 8px; }
+  .intake-draft .dr-key { color: var(--dim); flex: 0 0 auto; }
+  .intake-draft .dr-sect { margin-top: 6px; font-weight: 700; font-size: 12px;
+    color: var(--muted); }
   .state-chip.ended .sdot { background: var(--err); }
   .state-chip .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
   .recording-badge {
@@ -386,6 +449,47 @@
   .tl-row .t  { color: var(--blue); min-width: 64px; flex-shrink: 0; }
   .tl-row .ty { color: var(--text); min-width: 88px; flex-shrink: 0; font-family: inherit; }
   .tl-row .detail { white-space: pre-wrap; word-break: break-word; }
+
+  /* ========= 指标面板 ========= */
+  #page-metrics .wrap { max-width: 900px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+  #page-metrics .inner { overflow-x: auto; }  /* 窄屏时表格横向滚动而非被卡片裁切 */
+  .met-meta { font-size: 12px; color: var(--muted); }
+  .met-schema { font-size: 11px; letter-spacing: .18em; color: var(--muted); font-weight: 700; margin: 14px 0 4px; }
+  .met-dir { font-size: 13px; font-weight: 700; margin: 10px 0 4px; }
+  .met-table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+  .met-table th { text-align: left; font-size: 12px; color: var(--dim); font-weight: 500;
+    padding: 5px 12px 5px 0; border-bottom: 1px solid var(--border); }
+  .met-table td { padding: 6px 12px 6px 0; border-bottom: 1px solid rgba(255, 255, 255, .04); white-space: nowrap; }
+  .met-table td.na { color: var(--dim); }
+  .met-pills { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .met-pill { background: var(--well); border: 1px solid var(--border); border-radius: 999px;
+    padding: 3px 11px; font-size: 12px; color: var(--muted); font-family: var(--mono); }
+  .met-pill.bad { color: var(--err); border-color: rgba(255, 69, 58, .4); }
+  .met-sect { font-size: 12px; font-weight: 700; color: var(--muted); margin: 14px 0 4px; }
+  /* 趋势图：SVG 随容器缩放；指标切换按钮沿用 pill 形态 */
+  .met-trend-btns { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 8px; }
+  .met-trend-btn { background: var(--well); border: 1px solid var(--border); border-radius: 999px;
+    padding: 3px 11px; font-size: 12px; color: var(--muted); font-family: var(--mono); cursor: pointer; }
+  .met-trend-btn.active { color: var(--blue); border-color: rgba(10, 132, 255, .5); }
+  .met-trend-svg { width: 100%; height: auto; display: block; }
+  .met-trend-line { stroke: var(--blue); }
+  .met-trend-dot { cursor: help; }
+  .met-trend-dot.in { fill: var(--ok); }
+  .met-trend-dot.out { fill: var(--blue); }
+  .met-trend-axis { fill: var(--dim); font-size: 10px; font-family: var(--mono); }
+  .met-trend-grid { stroke: rgba(255, 255, 255, .07); }
+  .met-legend { font-size: 11px; color: var(--dim); margin-top: 2px; }
+  /* 悬浮详细说明：可悬浮元素虚线下划线，气泡用 fixed 单例（防被卡片 overflow 裁剪） */
+  .tip { cursor: help; border-bottom: 1px dashed var(--dim); }
+  .met-tipbox {
+    position: fixed; z-index: 200; max-width: 360px;
+    background: rgba(18, 24, 35, .97); border: 1px solid var(--border-strong);
+    border-radius: 12px; padding: 10px 13px;
+    font-size: 12px; line-height: 1.55; color: var(--text); font-weight: 400;
+    box-shadow: 0 10px 32px rgba(0, 0, 0, .55);
+    opacity: 0; pointer-events: none; transition: opacity .12s;
+  }
+  .met-tipbox.show { opacity: 1; }
 
   /* ========= 设置面板 ========= */
   #page-settings .wrap { max-width: 760px; margin: 0 auto; }
@@ -756,6 +860,7 @@
       <span class="sdot"></span><span id="stateText">待命</span><span class="num" id="stateNum"></span>
       <span class="recording-badge" id="recordingBadge">REC</span>
     </span>
+    <span class="hold-badge" id="holdBadge">☕ <span data-i18n="hold_badge"></span> <span id="holdTimer">0:00</span></span>
     <div class="quick-acts" id="quickActs">
       <button class="btn sm ghost" id="keypadBtn">⌗ <span data-i18n="keypad"></span></button>
       <button class="btn sm danger" id="hangupBtn" data-i18n="hangup"></button>
@@ -791,7 +896,10 @@
             <div class="dial-col">
               <div class="col-label" data-i18n="dial_label"></div>
               <div class="col-label preset-label" data-i18n="preset_label"></div>
-              <select id="dialPreset" class="preset-select"></select>
+              <div class="preset-row">
+                <select id="dialPreset" class="preset-select"></select>
+                <button class="btn sm danger" id="dialPresetDelete" type="button" hidden data-i18n="preset_delete"></button>
+              </div>
               <input id="dialNumber" class="dial-input" type="text" data-i18n-ph="ph_number" />
               <input id="dialTask" class="task-input" type="text" data-i18n-ph="ph_task" />
               <div class="remote-cloud" id="remoteCloudPanel">
@@ -802,6 +910,7 @@
               </div>
               <div class="dial-actions">
                 <button class="btn primary" id="dialBtn" data-i18n="dial"></button>
+                <button class="btn ghost" id="intakeBtn" data-i18n="intake_open"></button>
                 <button class="btn ghost" id="remotePairBtn" data-i18n="remote_pair" hidden></button>
                 <button class="btn ghost" id="remoteInviteBtn" data-i18n="remote_invite" hidden></button>
               </div>
@@ -885,6 +994,16 @@
       </div>
     </div>
 
+    <!-- 指标看板 -->
+    <div class="panel-page" id="page-metrics">
+      <div class="wrap">
+        <section class="card">
+          <h2><span data-i18n="met_title"></span><span class="sub" data-i18n="met_sub"></span></h2>
+          <div class="inner" id="metricsRoot"><div class="empty" data-i18n="met_loading"></div></div>
+        </section>
+      </div>
+    </div>
+
     <!-- 预设任务库 -->
     <div class="panel-page" id="page-profiles">
       <div class="wrap">
@@ -955,6 +1074,19 @@
                     <span class="profile-switch-label" id="profileDtmfSpokenFollowupLabel" data-i18n="profile_dtmf_spoken_followup"></span>
                     <label class="switch" for="profileDtmfSpokenFollowup">
                       <input id="profileDtmfSpokenFollowup" type="checkbox" aria-labelledby="profileDtmfSpokenFollowupLabel" />
+                      <span class="knob"></span>
+                    </label>
+                  </div>
+                </div>
+                <div class="profile-topline">
+                  <div class="profile-field">
+                    <label for="profileMaxCallSeconds" class="tip" data-i18n="profile_max_call_seconds" data-i18n-tip="profile_max_call_seconds_tip"></label>
+                    <input id="profileMaxCallSeconds" type="number" min="0" max="7200" step="1" data-i18n-ph="profile_max_call_seconds_ph" />
+                  </div>
+                  <div class="profile-enabled-field">
+                    <span class="profile-switch-label tip" id="profileWrapUpJudgeLabel" data-i18n="profile_wrap_up_judge" data-i18n-tip="profile_wrap_up_judge_tip"></span>
+                    <label class="switch" for="profileWrapUpJudge">
+                      <input id="profileWrapUpJudge" type="checkbox" aria-labelledby="profileWrapUpJudgeLabel" />
                       <span class="knob"></span>
                     </label>
                   </div>
@@ -1041,6 +1173,7 @@
     <button data-page="live"><span class="ico">💬</span><span data-i18n="nav_live"></span><span class="dot"></span></button>
     <button data-page="sms"><span class="ico">✉️</span><span data-i18n="nav_sms"></span><span class="dot"></span></button>
     <button data-page="history"><span class="ico">🕘</span><span data-i18n="nav_history"></span><span class="dot"></span></button>
+    <button data-page="metrics"><span class="ico">📊</span><span data-i18n="nav_metrics"></span><span class="dot"></span></button>
     <button data-page="profiles"><span class="ico">☷</span><span data-i18n="nav_profiles"></span><span class="dot"></span></button>
     <button data-page="settings"><span class="ico">⚙️</span><span data-i18n="nav_settings"></span><span class="dot"></span></button>
   </nav>
@@ -1202,7 +1335,7 @@ const $ = (id) => document.getElementById(id);
 const I18N = {
   en: {
     slogan: "Your calls, handled by AI",
-    nav_phone: "Phone", nav_live: "Live", nav_sms: "SMS", nav_history: "History", nav_profiles: "Presets", nav_settings: "Settings",
+    nav_phone: "Phone", nav_live: "Live", nav_sms: "SMS", nav_history: "History", nav_metrics: "Metrics", nav_profiles: "Presets", nav_settings: "Settings",
     st_idle: "Standby", st_ringing: "Ringing", st_dialing: "Dialing", st_answered: "On call", st_ended: "Ended",
     conn_on: "Connected", conn_retry: "Reconnecting", conn_ing: "Connecting",
     modem_on: "Modem ready", modem_off: "Modem offline",
@@ -1237,6 +1370,10 @@ const I18N = {
     profile_label: "Dropdown label", profile_task: "Matching task", profile_scenario: "Scenario strategy", profile_opening: "First sentence",
     profile_opening_mode: "Opening mode", profile_opening_mode_say: "Say immediately (default)", profile_opening_mode_wait: "Wait for IVR menu", profile_dtmf_spoken_followup: "Recover spoken keypress",
     profile_result_verification: "Result verification", profile_result_verification_none: "Transcript only", profile_result_verification_carrier_sms: "Official carrier SMS",
+    profile_max_call_seconds: "Max call length (s)", profile_max_call_seconds_ph: "empty = global default",
+    profile_max_call_seconds_tip: "Per-scenario override of the global outbound time limit (default 150 s). 0 = unlimited, up to 7200. Long calls (30+ min support queues) are a scenario property — only open this up for presets that need it (WIL-120 phase 1).",
+    profile_wrap_up_judge: "Wrap-up judge",
+    profile_wrap_up_judge_tip: "The LLM judge that decides when an outbound call should wrap up. Turn OFF for long hold-queue scenarios — looping hold music gets misjudged as \"going in circles\" and the call is ended early. Phase 2 will replace this switch with hold-state freezing.",
     profile_save: "Save", profile_cancel: "Cancel", profile_duplicate: "Duplicate", profile_delete: "Delete",
     profile_saving: "Saving…", profile_saved: "Preset saved", profile_deleted: "Preset deleted",
     profile_need_number: "Enter a dialable phone number.", profile_need_scenario: "Add a scenario strategy in at least one language.",
@@ -1267,6 +1404,99 @@ const I18N = {
     sms_title: "SMS", empty_sms: "No messages", ph_sms_text: "Message text",
     sms_send: "Send SMS", sending: "Sending…", sent: "Sent", send_fail: "Send failed: ",
     need_sms: "Enter number and text", sms_in: "IN ← ", sms_out: "OUT → ",
+    met_title: "Metrics", met_sub: "WIL-95 · per schema version, versions never averaged together",
+    met_loading: "Loading…", met_load_fail: "Failed to load: ",
+    met_meta_calls: "{n} calls analyzed ({skip} skipped — recorded before metrics collection landed)",
+    met_empty: "No data yet — it grows here after the first call on current main.",
+    met_schema_label: "SCHEMA v{v} · {n} CALLS",
+    met_dir_inbound: "Inbound", met_dir_outbound: "Outbound", met_dir_calls: "{n} calls",
+    met_hdr_metric: "Metric (ms)", met_no_sample: "no samples",
+    met_tip_n: "Number of samples (turns or calls) behind this row.",
+    met_tip_p50: "Median — half of the samples were faster than this.",
+    met_tip_p95: "95th percentile — the bad-case tail.",
+    met_tip_max: "Worst single sample seen.",
+    met_lat_local: "Local response (speech end → first reply chunk)",
+    met_tip_local: "Per turn: from your speech ending locally (uplink audio tail) to the first chunk of the AI's reply arriving back on this machine. Covers uplink upload, model thinking, TTS first chunk and network round-trips — the two cellular legs are outside what we can observe. Turns that ran a tool include the tool's execution time, so they read much longer.",
+    met_lat_first_delta: "VAD stop → first audio (generation)",
+    met_tip_first_delta: "From the provider deciding you stopped speaking (speech_stopped) to the first audio delta arriving. Pure generation + network segment; compare with local response to tell whether latency lives in stop detection or in generation.",
+    met_lat_backlog: "Playout backlog (perceived-lag culprit)",
+    met_tip_backlog: "When this turn's first reply chunk is queued, how much earlier audio is still waiting to play. Anything above 0 means the playback queue is congested — the #1 reason instruments say 1.7 s while ears hear 3 s+. Ideal is a flat 0.",
+    met_lat_tool: "Tool call duration",
+    met_tip_tool: "Time from a tool invocation (hang up, send SMS, take note…) to its result. Tool time is included in that turn's local response — which is why tool turns look slow.",
+    met_lat_first: "First audio of the call (greeting sent → arrival)",
+    met_tip_first: "From the greeting being dispatched to the first AI audio arriving. One sample per call. Does not include the answer→greeting startup chain — see the answer→first-audio row for the full user-facing wait.",
+    met_lat_ans_first: "Answer → first audio (arrival)",
+    met_tip_ans_first: "Whole-call first impression: from the call being answered to the first AI audio chunk arriving, derived from the answered/greeting marks plus first-audio. Stage-1 doc target for inbound: p95 < 1000 ms. Arrival, not playout — the speaker tail and cellular leg are outside observation. Calls with opening_mode=wait send no greeting and record no value.",
+    met_lat_takeover: "Takeover latency (request → connected)",
+    met_tip_takeover: "From the AI requesting owner takeover to the owner's media actually connected (takeover_committed). Doc group F 'transfer setup time' — the call-bridging form is inherently slower than a native carrier-side implementation, so use it for usability judgment only.",
+    met_lat_hangup: "Hangup latency (last dialog event → call end)",
+    met_tip_hangup: "From the last dialog activity (transcript, DTMF outcome or tool action) to the call actually ending. Event-based approximation — the playout tail is not included; a large value means the goodbye drags.",
+    met_hdr_profile: "Dialog profile", met_no_data: "no data",
+    met_prof_duration: "Call duration (s)",
+    met_tip_duration: "Whole-call duration in seconds. The distribution is a rough proxy for dialog structure (L1 single-turn vs L2 multi-turn); a cluster of short drops hints at systematic line failures (doc D asks for exactly this histogram).",
+    met_prof_turns: "Peer turns (count)",
+    met_prof_hold: "Hold time (s)",
+    met_tip_hold: "Seconds spent in a hold queue, as judged by the hold-aware wrap-up judge (on_hold verdict). Only measured on outbound calls with the judge enabled; doc group G 'queue-wait detection'.",
+    met_tip_turns: "How many turns the other party spoke. Together with duration, a rough proxy for the scenario-matrix dialog-structure dimension until real scenario tags land.",
+    met_term_title: "How calls ended (kind · cause)",
+    met_hdr_kind: "Kind", met_hdr_reason: "Cause", met_hdr_count: "calls",
+    met_kind_agent_hangup: "AI hung up", met_kind_peer_hangup: "Peer hung up first",
+    met_kind_dead_media: "Dead media", met_kind_error: "Error",
+    met_kind_takeover: "Owner takeover", met_kind_not_connected: "Not connected",
+    met_tip_kind_agent_hangup: "The AI ended the call deliberately — the cause column says whether it was a natural wind-down, the hangup tool, or the inbound time limit. Whether it hung up at the right moment (early/late) needs the judge layer; these are the counts only.",
+    met_tip_kind_peer_hangup: "Inferred by elimination: the call ended with no local hangup signal, so the other side hung up first. Normal for IVR and voicemail; a high share on human calls is an experience warning (doc group D).",
+    met_tip_kind_dead_media: "Uplink audio went digitally silent and the watchdog hung up. This is the cellular fingerprint of an abnormal drop — often paired with the PCM enable failure pill below.",
+    met_tip_kind_error: "The call loop exited abnormally (exception). Counted as an abnormal drop.",
+    met_tip_kind_takeover: "The owner took the call over from the AI.",
+    met_tip_kind_not_connected: "Outbound calls that never connected (no answer, rejected or timeout). Excluded from latency stats.",
+    met_pill_dtmf: "DTMF", met_tip_dtmf: "IVR keypad activity: keys actually sent, over how many calls. The outcome pills count peer-side evidence of whether the menu really advanced — not our own send success, which was a proven false positive (WIL-72).",
+    met_tip_dtmf_out: "DTMF navigation outcome judged from the peer's next utterance (advanced / no progress / unknown). Per-level IVR breakdown comes later with scenario tags.",
+    met_pill_takeover: "takeover", met_tip_takeover_pill: "Calls where the AI requested owner takeover → how many actually connected. The gap is offers that expired or failed to bridge.",
+    met_tip_tool_pill: "How many times this tool was invoked across these calls.",
+    met_pill_abnormal: "abnormal drops", met_tip_abnormal: "Calls ending in dead media or error — unexpected line drops (doc group D). Check the duration distribution above for systematic drop timing.",
+    met_pill_pcm_failed: "silent calls (PCM enable failed)",
+    met_tip_pcm_failed: "AT+CPCMREG=1 never succeeded during the call — the peer heard nothing the whole call. This is the SIM7600 degradation fingerprint (doc D's 'abnormal drop fingerprint', cellular form). Denominator: instrumented calls only (v3+, SIM7600).",
+    met_pill_pcm_degraded: "PCM degraded",
+    met_tip_pcm_degraded: "Enabling PCM needed retries — the modem's PCM subsystem is degraded (the peer hears stutter); a USB recovery is requested after such calls.",
+    met_trend_title: "Per-call trend",
+    met_tip_trend: "One point per call, in time order. Per-turn metrics plot the call's median; whole-call metrics plot the raw value. This answers 'is it getting better over time' — per-call distributions live in the tables above. Green dots = inbound, blue = outbound.",
+    met_trend_empty: "Not enough data points for this metric.",
+    met_legend: "● inbound · ● outbound — hover a dot for the call id",
+    met_btn_local: "local response", met_btn_first_delta: "generation", met_btn_backlog: "backlog",
+    met_btn_tool: "tool", met_btn_first: "first audio", met_btn_ans_first: "answer→audio",
+    met_btn_hangup: "hangup", met_btn_takeover: "takeover",
+    met_pill_dtmf_fmt: "{a} keys / {c} calls",
+    met_pill_known: "known caller", met_tip_known: "Calls where the caller was recognized as a known contact (affects greeting and strategy).",
+    met_tip_combo: "The provider / turn-detection / barge-in configuration these calls ran with. Different configs are counted separately so their numbers never blend.",
+    met_pill_fallback: "self-echo fallback", met_tip_fallback: "Calls where suspected self-echo (downlink audio re-captured as uplink) triggered the half-duplex fallback.",
+    preset_delete: "Delete", preset_delete_title: "Delete this preset?",
+    preset_delete_msg: "\"{name}\" will be removed from the task library. Call history is not affected.",
+    preset_deleted: "Preset deleted.", preset_delete_fail: "Delete failed: ",
+    intake_open: "Chat to set up a call",
+    intake_title: "Set up a call by chatting",
+    intake_greeting: "Tell me what call you want made — who to call, what to get done, and any limits (e.g. \"call Xfinity, my bill jumped from $50 to $93, get it back near $55, no contracts\").",
+    intake_thinking: "Thinking…",
+    intake_error: "Something went wrong — please say that again.",
+    intake_ph: "Describe the task, or answer the question…",
+    intake_send: "Send", intake_close: "Close",
+    intake_note: "When enough is gathered you'll get a task card to review — nothing is dialed until you press the button. Saved as a preset in the task library either way.",
+    intake_cost_note: "💳 This chat calls the {provider} API with your own key — usage is billed to your account (roughly a cent per turn; the phone call itself costs more).",
+    intake_saved: "Saved to the task library.",
+    intake_save_fail: "Save failed: ",
+    intake_dial_now: "Save & dial", intake_save_only: "Save as preset",
+    dial_confirm_title: "Confirm the number",
+    dial_confirm_ask: "Dial this number now?",
+    dial_confirm_yes: "Dial", dial_confirm_no: "Cancel",
+    dial_confirm_note: "This number was proposed by the AI. Check it before dialling.",
+    intake_dr_number: "Number", intake_dr_task: "Task",
+    intake_dr_verification: "Verification facts", intake_dr_negotiation: "Negotiation brief",
+    intake_dr_preauth: "Authorized range", intake_dr_blacklist: "Never agree to",
+    hold_badge: "On hold",
+    confirm_title: "The assistant needs your decision",
+    confirm_countdown: "Auto-decline in {s}s",
+    confirm_approve: "Approve", confirm_decline: "Decline", confirm_me: "Let me talk",
+    confirm_me_tip: "Joins you into the live call via 3-way calling — coming in WIL-120 phase 4 (needs the AT+CHLD probe on real hardware first).",
+    confirm_note: "No response counts as decline: the assistant will politely pass and ask the rep to note the offer on the account.",
     hist_title: "Call History", hist_sub: "Click to expand timeline", empty_history: "No call records",
     hist_clear: "Clear all", hist_clear_title: "Clear all call history?",
     hist_clear_msg: "Finished call records and recordings will be deleted. Active calls are kept.",
@@ -1373,7 +1603,7 @@ const I18N = {
   },
   zh: {
     slogan: "电话，交给 AI",
-    nav_phone: "电话", nav_live: "对话", nav_sms: "短信", nav_history: "历史", nav_profiles: "任务库", nav_settings: "设置",
+    nav_phone: "电话", nav_live: "对话", nav_sms: "短信", nav_history: "历史", nav_metrics: "指标", nav_profiles: "任务库", nav_settings: "设置",
     st_idle: "待命", st_ringing: "振铃中", st_dialing: "拨号中", st_answered: "通话中", st_ended: "已结束",
     conn_on: "已连接", conn_retry: "重连中", conn_ing: "连接中",
     modem_on: "模组就绪", modem_off: "模组未连接",
@@ -1408,6 +1638,10 @@ const I18N = {
     profile_label: "下拉显示名称", profile_task: "匹配任务", profile_scenario: "场景策略", profile_opening: "第一句话",
     profile_opening_mode: "开场模式", profile_opening_mode_say: "直接说开场白（默认）", profile_opening_mode_wait: "等待 IVR 菜单播报", profile_dtmf_spoken_followup: "补发已口述按键",
     profile_result_verification: "结果校验", profile_result_verification_none: "仅通话听写", profile_result_verification_carrier_sms: "运营商官方短信",
+    profile_max_call_seconds: "时长上限（秒）", profile_max_call_seconds_ph: "留空=跟随全局",
+    profile_max_call_seconds_tip: "按场景覆盖全局外呼时长上限（默认 150 秒）。0=不限时，最大 7200。长通话（客服排队 30 分钟+）是场景属性——只给需要的预设放开（WIL-120 一期）。",
+    profile_wrap_up_judge: "收尾裁判",
+    profile_wrap_up_judge_tip: "判断外呼何时该收尾挂断的 LLM 裁判。长排队场景请关闭——循环等待音会被误判成「对话打转」而提前挂断。二期会换成 hold 状态冻结后收回此开关。",
     profile_save: "保存", profile_cancel: "取消", profile_duplicate: "复制", profile_delete: "删除",
     profile_saving: "保存中…", profile_saved: "预设已保存", profile_deleted: "预设已删除",
     profile_need_number: "请输入可以拨打的电话号码。", profile_need_scenario: "请至少填写一种语言的场景策略。",
@@ -1438,6 +1672,99 @@ const I18N = {
     sms_title: "短信", empty_sms: "暂无短信", ph_sms_text: "短信内容",
     sms_send: "发送短信", sending: "发送中…", sent: "已发送", send_fail: "发送失败：",
     need_sms: "请填写号码和内容", sms_in: "收 ← ", sms_out: "发 → ",
+    met_title: "指标看板", met_sub: "WIL-95 · 逐 schema 版本出数，版本间不平均",
+    met_loading: "加载中…", met_load_fail: "加载失败：",
+    met_meta_calls: "通话 {n} 通（跳过 {skip} 通无指标——录制于指标采集合入之前）",
+    met_empty: "还没有数据——在当前 main 上打第一通电话后，这里会长出来。",
+    met_schema_label: "SCHEMA v{v} · {n} 通",
+    met_dir_inbound: "来电", met_dir_outbound: "外呼", met_dir_calls: "{n} 通",
+    met_hdr_metric: "指标（ms）", met_no_sample: "无样本",
+    met_tip_n: "该行背后的样本数（轮数或通数）。",
+    met_tip_p50: "中位数——一半样本比它快。",
+    met_tip_p95: "95 分位——坏情况的尾部。",
+    met_tip_max: "最差的一次。",
+    met_lat_local: "本机应答（音尾→首块回复）",
+    met_tip_local: "每一轮：从本机检测到你话音结束（上行音尾）到 AI 回复的第一块音频回到本机的耗时。含上行上传、模型思考、TTS 首块与网络往返；蜂窝网两条腿在观测范围之外。该轮若调用了工具，工具执行时间也计入，因此会明显偏长。",
+    met_lat_first_delta: "判停→首音频（生成）",
+    met_tip_first_delta: "云端判定你说完（speech_stopped）到第一个音频增量到达的耗时。纯「生成 + 网络」段；与「本机应答」对比，可定位延迟出在判停还是生成。",
+    met_lat_backlog: "播出积压（体感主因）",
+    met_tip_backlog: "本轮首块回复入队时，前面还排着没播完的音频时长。大于 0 即播放队列积压——「仪器测 1.7 秒、耳朵听 3 秒+」的头号元凶；理想是恒为 0。",
+    met_lat_tool: "工具调用耗时",
+    met_tip_tool: "工具（挂断、发短信、记录等）从调用到返回的耗时。工具时间计入该轮「本机应答」——这就是带工具的轮次显得慢的原因。",
+    met_lat_first: "整通首音频（开场白下发→到达）",
+    met_tip_first: "开场白下发到首块 AI 音频到达的耗时，每通一条。不含「接起→开场白」的启动链——完整的用户侧等待看下面「接起→首字」一行。",
+    met_lat_ans_first: "接起→首字（到达）",
+    met_tip_ans_first: "整通第一印象：从接起到首块 AI 音频到达，由 answered/greeting 标记加首音频推导。文档 Stage 1 对 inbound 的目标：p95 < 1000ms。「到达」不等于对方听到——播出尾巴与蜂窝腿在观测范围外。opening_mode=wait（不发开场白）的通话无此值。",
+    met_lat_takeover: "接管时延（请求→接通）",
+    met_tip_takeover: "AI 发起真人接管到机主媒体真正接通（takeover_committed）的耗时。文档 F 组「转接建立时延」——呼叫桥接形态先天慢于运营商网内原生实现，只作本阶段可用性判断，不外推。",
+    met_lat_hangup: "挂断时延（末条对话事件→结束）",
+    met_tip_hangup: "最后一条对话活动（转写 / 按键结果 / 工具动作）到通话真正结束的间隔。事件近似、不含播出尾巴；偏大说明收尾拖沓。",
+    met_hdr_profile: "对话画像", met_no_data: "无数据",
+    met_prof_duration: "通话时长（秒）",
+    met_tip_duration: "整通时长（秒）。分布是对话结构（L1 单轮 vs L2 多轮）的粗代理；短时长扎堆提示系统性掉线（文档 D 组要求的正是这张直方图）。",
+    met_prof_turns: "对方轮次（次）",
+    met_prof_hold: "排队等待（秒）",
+    met_tip_hold: "由 hold-aware 收尾裁判（on_hold 判定）测得的排队等待秒数。仅外呼且裁判开启时可测；对应文档 G 组「排队等待检测」。",
+    met_tip_turns: "对方说话的轮数。与时长一起，在场景标签落地前充当场景矩阵「对话结构」维度的粗代理。",
+    met_term_title: "通话怎么收场（方式 · 起因）",
+    met_hdr_kind: "方式", met_hdr_reason: "起因", met_hdr_count: "通数",
+    met_kind_agent_hangup: "AI 主动挂断", met_kind_peer_hangup: "对端先挂",
+    met_kind_dead_media: "媒体死寂", met_kind_error: "异常退出",
+    met_kind_takeover: "真人接管", met_kind_not_connected: "未接通",
+    met_tip_kind_agent_hangup: "AI 有意结束通话——起因列区分自然收尾、挂断工具还是来电时限。挂得对不对（早挂/晚挂）要判官层裁决，这里只是计数。",
+    met_tip_kind_peer_hangup: "排除法推断：通话结束时本机没有任何主动挂断信号，即对方先挂。IVR/留言机场景属正常；真人场景占比偏高是体验警报（文档 D 组）。",
+    met_tip_kind_dead_media: "上行音频数字静默、守护挂断。这是异常断线的蜂窝指纹——常与下方「PCM 启用失败」并发。",
+    met_tip_kind_error: "通话主循环异常退出。计入异常断线。",
+    met_tip_kind_takeover: "机主从 AI 手里接管了通话。",
+    met_tip_kind_not_connected: "外呼未接通（无人接听/拒接/超时）。不进时延统计。",
+    met_pill_dtmf: "按键", met_tip_dtmf: "IVR 按键活动：实际发出的按键次数 / 涉及通数。旁边的结果 pill 按「对端下一句证据」统计菜单是否真的推进了——不是本机发送成功（那是已证实的假阳性，WIL-72）。",
+    met_tip_dtmf_out: "按对端下一句证据判定的按键推进结果（advanced=菜单真推进了 / no_progress=没动 / 其他=判不出）。逐层 IVR 统计等场景标签落地后补。",
+    met_pill_takeover: "接管", met_tip_takeover_pill: "AI 发起真人接管的通数 → 真正接通的通数。差值是过期或桥接失败的 offer。",
+    met_tip_tool_pill: "该工具在这批通话里被调用的总次数。",
+    met_pill_abnormal: "异常断线", met_tip_abnormal: "以媒体死寂或异常退出收场的通数——非预期断线（文档 D 组）。配合上方时长分布可发现系统性掉线时点。",
+    met_pill_pcm_failed: "无声通（PCM 启用失败）",
+    met_tip_pcm_failed: "整通 AT+CPCMREG=1 从未成功——对端全程听不到 AI。这是 SIM7600 劣化的通级指纹（文档 D 组「异常掉话指纹」的蜂窝形态）。分母只算已埋点的通（v3 起、仅 SIM7600）。",
+    met_pill_pcm_degraded: "PCM 已劣化",
+    met_tip_pcm_degraded: "启用 PCM 需要重试——模组 PCM 子系统已劣化（对端会听到卡顿）；此类通话结束后会请求 USB 自愈。",
+    met_trend_title: "逐通趋势",
+    met_tip_trend: "每通一个点、按时间排序。逐轮指标取该通中位数，整通指标取原值。回答「有没有越来越好」——通内分布看上面的表。绿点=呼入，蓝点=呼出。",
+    met_trend_empty: "该指标的数据点还不够。",
+    met_legend: "● 呼入 · ● 呼出 —— 悬浮圆点看通话 ID",
+    met_btn_local: "本机应答", met_btn_first_delta: "生成段", met_btn_backlog: "播出积压",
+    met_btn_tool: "工具", met_btn_first: "首音频", met_btn_ans_first: "接起→首字",
+    met_btn_hangup: "挂断", met_btn_takeover: "接管",
+    met_pill_dtmf_fmt: "{a} 次 / {c} 通",
+    met_pill_known: "熟人", met_tip_known: "来电被识别为通讯录熟人的通数（影响开场白与策略）。",
+    met_tip_combo: "该批通话运行时的 provider / 判停 / barge-in 配置组合。不同配置分开统计，数字绝不混平均。",
+    met_pill_fallback: "自激兜底", met_tip_fallback: "疑似自激（下行音频被回采成上行）触发半双工兜底的通数。",
+    preset_delete: "删除", preset_delete_title: "删除这个预设？",
+    preset_delete_msg: "「{name}」将从任务库移除，不影响通话历史。",
+    preset_deleted: "预设已删除。", preset_delete_fail: "删除失败：",
+    intake_open: "对话建单",
+    intake_title: "聊着把外呼任务建出来",
+    intake_greeting: "告诉我要打给谁、办什么事、有什么底线（比如「帮我打 Xfinity，账单从 50 涨到 93 了，谈回 55 左右，别签合约」）。",
+    intake_thinking: "思考中…",
+    intake_error: "出了点问题，麻烦再说一遍。",
+    intake_ph: "描述任务，或回答上面的问题…",
+    intake_send: "发送", intake_close: "关闭",
+    intake_note: "信息攒够后会出一张任务确认卡——你按下按钮前不会拨任何电话。两种保存方式都会存进任务库成为预设。",
+    intake_cost_note: "💳 本对话调用你绑定的 {provider} API key，按量计费（约每轮 1 美分；之后的通话本身费用更高）。",
+    intake_saved: "已存入任务库。",
+    intake_save_fail: "保存失败：",
+    intake_dial_now: "保存并拨打", intake_save_only: "仅存为预设",
+    dial_confirm_title: "核对号码",
+    dial_confirm_ask: "现在就拨这个号码吗？",
+    dial_confirm_yes: "拨打", dial_confirm_no: "取消",
+    dial_confirm_note: "该号码由 AI 提出，拨号前请先核对。",
+    intake_dr_number: "号码", intake_dr_task: "任务",
+    intake_dr_verification: "核身信息", intake_dr_negotiation: "谈判要点",
+    intake_dr_preauth: "授权范围", intake_dr_blacklist: "绝不同意",
+    hold_badge: "排队等待",
+    confirm_title: "AI 需要你拿主意",
+    confirm_countdown: "{s} 秒后自动按「不同意」处理",
+    confirm_approve: "同意", confirm_decline: "不同意", confirm_me: "我来说",
+    confirm_me_tip: "通过三方通话把你并入当前通话——WIL-120 四期上线（先要真机 AT+CHLD 探针确认支持）。",
+    confirm_note: "超时不回应 = 不同意：AI 会礼貌回绝，并请对方把方案记录在案。",
     hist_title: "通话历史", hist_sub: "点击展开事件时间线", empty_history: "暂无通话记录",
     hist_clear: "清除全部", hist_clear_title: "清除全部通话历史？",
     hist_clear_msg: "已结束的通话记录和录音会被删除，进行中的通话会保留。",
@@ -1510,6 +1837,8 @@ function applyI18n() {
   document.documentElement.lang = LANG === "zh" ? "zh-CN" : "en";
   document.querySelectorAll("[data-i18n]").forEach((n) => { n.textContent = t(n.dataset.i18n); });
   document.querySelectorAll("[data-i18n-ph]").forEach((n) => { n.placeholder = t(n.dataset.i18nPh); });
+  // 悬浮详解通用化：data-i18n-tip 声明式接入 met-tipbox 单例（处理器挂在 document）。
+  document.querySelectorAll("[data-i18n-tip]").forEach((n) => { n.dataset.tip = t(n.dataset.i18nTip); });
   $("slogan").textContent = t("slogan");
   renderLangMenu();
   $("stateText").textContent = t("st_" + callStatus) !== "st_" + callStatus ? t("st_" + callStatus) : callStatus;
@@ -1521,6 +1850,8 @@ function applyI18n() {
   if (typeof refreshProfileEditorText === "function") refreshProfileEditorText();
   if (typeof renderSetupWizard === "function") renderSetupWizard();
   if (typeof syncRecordingUi === "function") syncRecordingUi();
+  // 指标面板内容是动态渲染的，换语言需整体重取重画。
+  if (currentPage === "metrics" && typeof loadMetrics === "function") loadMetrics();
 }
 
 
@@ -1559,6 +1890,7 @@ function switchPage(name) {
     if (b.dataset.page === name) b.classList.remove("notify");
   });
   if (name === "history") loadHistory();
+  if (name === "metrics") loadMetrics();
   if (name === "profiles" && !profileDirty) loadManagedProfiles();
 }
 /* 自定义模态确认框：返回 Promise<所选 action.key>；点遮罩/Esc 视为第一个 action */
@@ -1742,8 +2074,265 @@ function handleEvent(ev) {
     addSms(ev);
   } else if (ev.type === "call_summary") {
     loadHistory(); loadRecent();
+  } else if (ev.type === "hold") {
+    setHoldBadge(!!ev.active);
+  } else if (ev.type === "owner_confirm_request") {
+    showConfirmCard(ev);
+  } else if (ev.type === "owner_confirm_closed") {
+    hideConfirmCard(ev.id);
   }
 }
+
+/* ========= 排队徽章 + 机主确认卡（WIL-120 二期） ========= */
+let holdTimerId = null, holdStartedAt = 0;
+function setHoldBadge(active) {
+  const badge = $("holdBadge");
+  if (active) {
+    holdStartedAt = Date.now();
+    badge.classList.add("show");
+    if (holdTimerId) clearInterval(holdTimerId);
+    holdTimerId = setInterval(() => {
+      const sec = Math.floor((Date.now() - holdStartedAt) / 1000);
+      $("holdTimer").textContent = `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
+    }, 1000);
+    $("holdTimer").textContent = "0:00";
+  } else {
+    badge.classList.remove("show");
+    if (holdTimerId) { clearInterval(holdTimerId); holdTimerId = null; }
+  }
+}
+
+let confirmCardState = null;  // { id, deadline, timerId, overlay }
+function hideConfirmCard(id) {
+  if (!confirmCardState) return;
+  if (id && confirmCardState.id !== id) return;
+  clearInterval(confirmCardState.timerId);
+  confirmCardState.overlay.remove();
+  confirmCardState = null;
+}
+async function answerConfirmCard(choice) {
+  if (!confirmCardState) return;
+  const id = confirmCardState.id;
+  try {
+    await postJson("/api/call/owner_confirm", { id, choice });
+  } catch (err) { console.warn("[confirm] 提交失败", err); }
+  hideConfirmCard(id);
+}
+function showConfirmCard(ev) {
+  hideConfirmCard();  // 同屏只留最新一张（工具层同时只会有一个在等）
+  const overlay = el("div", "confirm-overlay show");
+  const card = el("div", "confirm-card");
+  card.appendChild(el("h3", null, t("confirm_title")));
+  const count = el("div", "cc-count");
+  card.appendChild(count);
+  card.appendChild(el("div", "cc-question", String(ev.question || "")));
+  const acts = el("div", "cc-acts");
+  const approveBtn = el("button", "btn primary", t("confirm_approve"));
+  approveBtn.addEventListener("click", () => answerConfirmCard("approve"));
+  const declineBtn = el("button", "btn danger", t("confirm_decline"));
+  declineBtn.addEventListener("click", () => answerConfirmCard("decline"));
+  const meBtn = el("button", "btn ghost", t("confirm_me"));
+  meBtn.disabled = true;
+  metTip(meBtn, t("confirm_me_tip"));
+  acts.appendChild(approveBtn); acts.appendChild(declineBtn); acts.appendChild(meBtn);
+  card.appendChild(acts);
+  card.appendChild(el("div", "cc-note", t("confirm_note")));
+  overlay.appendChild(card);
+  document.body.appendChild(overlay);
+  const deadline = Date.now() + Number(ev.timeout_s || 60) * 1000;
+  const tick = () => {
+    const left = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+    count.textContent = metFmt("confirm_countdown", { s: left });
+    if (left <= 0) hideConfirmCard(ev.id);  // 超时后端自会按拒绝处理，前端收卡即可
+  };
+  tick();
+  confirmCardState = { id: ev.id, deadline, timerId: setInterval(tick, 500), overlay };
+}
+
+/* ========= 对话式建单（WIL-120 三期 b）========= */
+let intakeMessages = [];   // {role, content} 全量历史，服务端无状态
+let intakeOptions = [];    // 最新一条 assistant 追问附带的候选选项（点击即发送）
+let intakeDraft = null;
+let intakeOverlay = null;
+let intakeBusy = false;
+
+function intakeClose() {
+  if (intakeOverlay) { intakeOverlay.remove(); intakeOverlay = null; }
+  intakeMessages = []; intakeOptions = []; intakeDraft = null; intakeBusy = false;
+}
+
+function intakeRenderLog(log) {
+  log.textContent = "";
+  for (const m of intakeMessages)
+    log.appendChild(el("div", "intake-msg " + m.role, m.content));
+  if (intakeBusy)
+    log.appendChild(el("div", "intake-msg assistant pending", t("intake_thinking")));
+  // 选项 chips（像 Claude Code 的问题弹窗）：点击即作为回答发送；自由输入仍可用。
+  if (!intakeBusy && intakeOptions.length) {
+    const row = el("div", "intake-options");
+    for (const opt of intakeOptions) {
+      const chip = el("button", "intake-opt", opt);
+      chip.type = "button";
+      chip.addEventListener("click", () => {
+        const input = intakeOverlay?.querySelector(".intake-input-row input");
+        if (input) { input.value = opt; input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true })); }
+      });
+      row.appendChild(chip);
+    }
+    log.appendChild(row);
+  }
+  log.scrollTop = log.scrollHeight;
+}
+
+function intakeRenderDraft(box) {
+  box.textContent = "";
+  if (!intakeDraft) { box.hidden = true; return; }
+  box.hidden = false;
+  const d = intakeDraft;
+  const line = (key, value) => {
+    const row = el("div", "dr-line");
+    row.appendChild(el("span", "dr-key", key));
+    row.appendChild(el("span", null, value));
+    box.appendChild(row);
+  };
+  line(t("intake_dr_number"), d.number);
+  line(t("intake_dr_task"), d.task);
+  const pkg = d.task_package || {};
+  const sections = [["verification", "intake_dr_verification"],
+                    ["negotiation", "intake_dr_negotiation"],
+                    ["preauth", "intake_dr_preauth"]];
+  for (const [sect, key] of sections) {
+    const entries = Object.entries(pkg[sect] || {});
+    if (!entries.length) continue;
+    box.appendChild(el("div", "dr-sect", t(key)));
+    for (const [k, v] of entries) line(k, v);
+  }
+  if ((pkg.blacklist || []).length) {
+    box.appendChild(el("div", "dr-sect", t("intake_dr_blacklist")));
+    for (const item of pkg.blacklist) line("·", item);
+  }
+}
+
+async function intakeSend(input, log, draftBox, actions) {
+  const text = input.value.trim();
+  if (!text || intakeBusy) return;
+  input.value = "";
+  intakeMessages.push({ role: "user", content: text });
+  intakeBusy = true; intakeDraft = null; intakeOptions = [];
+  intakeRenderLog(log); intakeRenderDraft(draftBox); actions.hidden = true;
+  try {
+    const { httpOk, res } = await postJson("/api/intake/chat",
+      { messages: intakeMessages, lang: LANG });
+    intakeBusy = false;
+    if (!httpOk) throw new Error(res.error || "intake failed");
+    intakeMessages.push({ role: "assistant", content: res.reply });
+    intakeOptions = Array.isArray(res.options) ? res.options : [];
+    if (res.ready && res.draft) {
+      intakeDraft = res.draft;
+      actions.hidden = false;
+    }
+  } catch (err) {
+    intakeBusy = false;
+    intakeMessages.push({ role: "assistant", content: t("intake_error") });
+  }
+  intakeRenderLog(log); intakeRenderDraft(draftBox);
+}
+
+/* 拨号前二次确认（WIL-130）：号码来自模型，逐位显示、由机主确认后才真拨。
+   刻意不用原生 confirm()——它不换行、长号码会被截断，且无法把数字拆开显示。 */
+function confirmIntakeDial(number, onConfirm) {
+  const overlay = el("div", "confirm-overlay show");
+  const card = el("div", "confirm-card");
+  card.appendChild(el("h3", null, t("dial_confirm_title")));
+  // 逐位分隔：连读一串数字最容易看漏一位，而看漏一位就是拨错人。
+  card.appendChild(el("div", "cc-number", String(number).split("").join(" ")));
+  card.appendChild(el("div", "cc-question", t("dial_confirm_ask")));
+  const acts = el("div", "cc-acts");
+  const yes = el("button", "btn primary", t("dial_confirm_yes"));
+  yes.addEventListener("click", () => { overlay.remove(); onConfirm(); });
+  const no = el("button", "btn ghost", t("dial_confirm_no"));
+  no.addEventListener("click", () => overlay.remove());
+  acts.appendChild(yes); acts.appendChild(no);
+  card.appendChild(acts);
+  card.appendChild(el("div", "cc-note", t("dial_confirm_note")));
+  overlay.appendChild(card);
+  document.body.appendChild(overlay);
+  yes.focus();
+}
+
+async function intakeSaveAndDial(dialAfter) {
+  if (!intakeDraft) return;
+  const d = intakeDraft;
+  const payload = {
+    number: d.number, match_mode: "exact",
+    label: { [LANG]: d.label || d.task.slice(0, 20) },
+    task: { [LANG]: d.task },
+    scenario: { [LANG]: d.scenario || d.task },
+  };
+  if (d.task_package) payload.task_package = d.task_package;
+  try {
+    const { httpOk, res } = await postJson("/api/number_profiles", payload);
+    if (!httpOk) throw new Error(res.error || "save failed");
+    intakeClose();
+    await loadDialPresets();
+    if (dialAfter) {
+      $("dialNumber").value = d.number;
+      $("dialTask").value = d.task;
+      dialPresetId = res.profile.id; dialPresetHint = d.task;
+      if (typeof syncDialPresetDelete === "function") syncDialPresetDelete();
+      // 不直落 doDial()：这个号码是**模型产出**的，硬约束要求「拨号前核对屏幕
+      // 号码」，一键直拨等于绕过它。逐位显示后由机主再点一次（WIL-130）。
+      confirmIntakeDial(d.number, doDial);
+    } else {
+      setToast("dialToast", "ok", t("intake_saved"));
+    }
+  } catch (err) {
+    setToast("dialToast", "err", t("intake_save_fail") + (err.message || ""));
+  }
+}
+
+function intakeOpen() {
+  intakeClose();
+  intakeOverlay = el("div", "confirm-overlay show");
+  const card = el("div", "confirm-card intake-card");
+  card.appendChild(el("h3", null, t("intake_title")));
+  const log = el("div", "intake-log");
+  card.appendChild(log);
+  const draftBox = el("div", "intake-draft");
+  draftBox.hidden = true;
+  card.appendChild(draftBox);
+  const actions = el("div", "cc-acts");
+  actions.hidden = true;
+  const dialNow = el("button", "btn primary", t("intake_dial_now"));
+  dialNow.addEventListener("click", () => intakeSaveAndDial(true));
+  const saveOnly = el("button", "btn ghost", t("intake_save_only"));
+  saveOnly.addEventListener("click", () => intakeSaveAndDial(false));
+  actions.appendChild(dialNow); actions.appendChild(saveOnly);
+  card.appendChild(actions);
+  const inputRow = el("div", "intake-input-row");
+  const input = el("input");
+  input.type = "text";
+  input.placeholder = t("intake_ph");
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") intakeSend(input, log, draftBox, actions);
+  });
+  const sendBtn = el("button", "btn primary", t("intake_send"));
+  sendBtn.addEventListener("click", () => intakeSend(input, log, draftBox, actions));
+  const closeBtn = el("button", "btn ghost", t("intake_close"));
+  closeBtn.addEventListener("click", intakeClose);
+  inputRow.appendChild(input); inputRow.appendChild(sendBtn); inputRow.appendChild(closeBtn);
+  card.appendChild(inputRow);
+  card.appendChild(el("div", "cc-note", t("intake_note")));
+  const provider = ($("provider")?.textContent || "").trim();
+  card.appendChild(el("div", "cc-note", metFmt("intake_cost_note",
+    { provider: provider && provider !== "-" ? provider : "AI" })));
+  intakeOverlay.appendChild(card);
+  document.body.appendChild(intakeOverlay);
+  intakeMessages.push({ role: "assistant", content: t("intake_greeting") });
+  intakeRenderLog(log);
+  input.focus();
+}
+$("intakeBtn").addEventListener("click", intakeOpen);
 let ws;
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -1880,6 +2469,7 @@ function blankManagedProfile() {
     id: "", enabled: true, number: "", match_mode: "exact",
     label: { ...blank }, task: { ...blank }, scenario: { ...blank }, opening: { ...blank },
     opening_mode: "say", dtmf_spoken_followup: false, result_verification: "none",
+    max_call_seconds: null, wrap_up_judge: true,
   };
 }
 
@@ -1996,6 +2586,10 @@ function openProfileEditor(profile) {
   $("profileResultVerification").value = (
     item.result_verification === "carrier_sms" ? "carrier_sms" : "none"
   );
+  $("profileMaxCallSeconds").value = (
+    Number.isInteger(item.max_call_seconds) ? String(item.max_call_seconds) : ""
+  );
+  $("profileWrapUpJudge").checked = item.wrap_up_judge !== false;
   $("profileDelete").hidden = !item.id;
   $("profileToast").className = "toast profile-toast";
   $("profileToast").textContent = "";
@@ -2024,6 +2618,9 @@ function readProfileForm() {
     opening_mode: $("profileOpeningMode").value,
     dtmf_spoken_followup: $("profileDtmfSpokenFollowup").checked,
     result_verification: $("profileResultVerification").value,
+    max_call_seconds: $("profileMaxCallSeconds").value.trim() === ""
+      ? null : Number($("profileMaxCallSeconds").value),
+    wrap_up_judge: $("profileWrapUpJudge").checked,
   };
 }
 
@@ -2207,9 +2804,40 @@ function applyDialPreset() {
   $("dialNumber").value = String(profile.number || "");
   $("dialTask").value = String(profile.task || "");
 }
-$("dialPreset").addEventListener("change", applyDialPreset);
+function syncDialPresetDelete() {
+  // 只有带稳定 id 的预设可从这里删（legacy 无 id 条目去任务库处理）。
+  $("dialPresetDelete").hidden = !dialPresetId;
+}
+$("dialPreset").addEventListener("change", () => { applyDialPreset(); syncDialPresetDelete(); });
+$("dialPresetDelete").addEventListener("click", async () => {
+  if (!dialPresetId) return;
+  const profile = dialProfiles.find((item) => String(item.id || "") === dialPresetId);
+  const name = String(profile?.label || profile?.task || profile?.number || "");
+  const choice = await showModal({
+    tone: "danger",
+    title: t("preset_delete_title"),
+    message: metFmt("preset_delete_msg", { name }),
+    actions: [
+      { key: "ok", label: t("preset_delete"), kind: "danger" },
+      { key: "cancel", label: t("modal_cancel"), kind: "ghost" },
+    ],
+  });
+  if (choice !== "ok") return;
+  try {
+    const r = await fetch(`/api/number_profiles/${encodeURIComponent(dialPresetId)}`, { method: "DELETE" });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    dialPresetHint = null; dialPresetId = null;
+    $("dialPreset").value = "";
+    await loadDialPresets();
+    if (typeof loadManagedProfiles === "function") loadManagedProfiles();
+    setToast("dialToast", "ok", t("preset_deleted"));
+  } catch (e) {
+    setToast("dialToast", "err", t("preset_delete_fail") + (e.message || ""));
+  }
+  syncDialPresetDelete();
+});
 // 手动改号码=脱离预设；改事项框（子主题）不清命中键，仍走选中预设的策略框架
-$("dialNumber").addEventListener("input", () => { dialPresetHint = null; dialPresetId = null; $("dialPreset").value = ""; });
+$("dialNumber").addEventListener("input", () => { dialPresetHint = null; dialPresetId = null; $("dialPreset").value = ""; syncDialPresetDelete(); });
 
 async function doDial() {
   const number = $("dialNumber").value.trim();
@@ -2692,6 +3320,265 @@ $("batchDialBtn").addEventListener("click", async () => {
     } else setToast("batchToast", "err", t("enq_fail") + (res.error || ""));
   } catch (err) { setToast("batchToast", "err", t("req_error")); }
   finally { btn.disabled = false; }
+});
+
+/* ========= 指标看板（消费 /api/metrics/summary；el() 全量 textContent 防注入） ========= */
+// 时延字段 → i18n 后缀；标签 met_lat_<k>，悬浮详解 met_tip_<k>。
+const MET_LAT_KEYS = {
+  local_response_latency_ms: "local",
+  first_audio_delta_ms: "first_delta",
+  playout_backlog_ms: "backlog",
+  tool_call_latency_ms: "tool",
+  first_audio_ms: "first",
+  answered_to_first_audio_ms: "ans_first",
+  hangup_latency_ms: "hangup",
+  takeover_latency_ms: "takeover",
+};
+const MET_STAT_COLS = ["n", "p50", "p95", "max"];
+// 趋势图当前选中的指标，按 schema 版本各记各的（切语言重渲染时保持选择）。
+const metTrendSel = {};
+
+function metFmt(tpl, vars) {
+  return Object.entries(vars).reduce((s, [k, v]) => s.replaceAll("{" + k + "}", v), t(tpl));
+}
+function metTip(node, tipText) {
+  if (!tipText) return node;
+  node.classList.add("tip");
+  node.dataset.tip = tipText;
+  return node;
+}
+
+// t() 缺键时原样返回键名；用这个包装把「查不到」折叠成 null。
+function metT(key) { return t(key) !== key ? t(key) : null; }
+
+function metStatTable(headKey, entries) {
+  const table = el("table", "met-table");
+  const head = el("tr");
+  head.appendChild(el("th", null, t(headKey)));
+  for (const col of MET_STAT_COLS)
+    head.appendChild(metTip(el("th", null, col), t("met_tip_" + col)));
+  table.appendChild(head);
+  for (const entry of entries) {
+    const row = el("tr");
+    const labelCell = el("td");
+    labelCell.appendChild(metTip(el("span", null, entry.label), entry.tip));
+    row.appendChild(labelCell);
+    if (!entry.stats) {
+      const td = el("td", "na", t("met_no_sample"));
+      td.colSpan = MET_STAT_COLS.length;
+      row.appendChild(td);
+    } else {
+      for (const col of MET_STAT_COLS)
+        row.appendChild(el("td", null, String(entry.stats[col])));
+    }
+    table.appendChild(row);
+  }
+  return table;
+}
+
+function metLatencyEntries(group) {
+  const rows = { ...group.latency,
+                 first_audio_ms: group.first_audio_ms,
+                 answered_to_first_audio_ms: group.answered_to_first_audio_ms,
+                 hangup_latency_ms: group.hangup_latency_ms,
+                 takeover_latency_ms: group.takeover_latency_ms };
+  // 已知字段按固定顺序，未知字段（未来 schema）原样兜底展示。
+  const fields = [...Object.keys(MET_LAT_KEYS).filter((f) => f in rows),
+                  ...Object.keys(rows).filter((f) => !(f in MET_LAT_KEYS))];
+  return fields.map((field) => {
+    const key = MET_LAT_KEYS[field];
+    return { label: key ? t("met_lat_" + key) : field,
+             tip: key ? t("met_tip_" + key) : null, stats: rows[field] };
+  });
+}
+
+function metPill(text, tip, cls) {
+  return metTip(el("span", "met-pill" + (cls ? " " + cls : ""), text), tip);
+}
+
+// 终止归因表：方式（kind）× 起因（reason）× 通数——文档 D 组要求早挂/晚挂/
+// 对端先挂/异常断线分开看，pill 计数升级成两级表。
+function metTermTable(reasonsByKind) {
+  const table = el("table", "met-table");
+  const head = el("tr");
+  head.appendChild(el("th", null, t("met_hdr_kind")));
+  head.appendChild(el("th", null, t("met_hdr_reason")));
+  head.appendChild(el("th", null, t("met_hdr_count")));
+  table.appendChild(head);
+  for (const [kind, reasons] of Object.entries(reasonsByKind)) {
+    for (const [reason, n] of Object.entries(reasons)) {
+      const row = el("tr");
+      const kindCell = el("td");
+      kindCell.appendChild(metTip(el("span", null, metT("met_kind_" + kind) || kind),
+                                  metT("met_tip_kind_" + kind)));
+      row.appendChild(kindCell);
+      row.appendChild(el("td", null, reason));
+      row.appendChild(el("td", null, String(n)));
+      table.appendChild(row);
+    }
+  }
+  return table;
+}
+
+/* 逐通趋势：每通一点（逐轮指标取该通中位数），SVG 纯前端画，无第三方库 */
+const SVG_NS = "http://www.w3.org/2000/svg";
+function svgEl(tag, attrs) {
+  const n = document.createElementNS(SVG_NS, tag);
+  for (const [k, v] of Object.entries(attrs || {})) n.setAttribute(k, v);
+  return n;
+}
+
+function metTrendSvg(trend, field) {
+  const pts = trend.filter((p) => typeof (p.values || {})[field] === "number");
+  if (pts.length < 2) return el("div", "empty", t("met_trend_empty"));
+  const W = 640, H = 170, L = 48, R = 10, T = 10, B = 20;
+  const ymax = Math.max(...pts.map((p) => p.values[field])) * 1.08 || 1;
+  const x = (i) => L + (W - L - R) * (i / (pts.length - 1));
+  const y = (v) => T + (H - T - B) * (1 - v / ymax);
+  const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, class: "met-trend-svg" });
+  for (const frac of [0, 0.5, 1]) {
+    const v = ymax * frac;
+    svg.appendChild(svgEl("line",
+      { x1: L, y1: y(v), x2: W - R, y2: y(v), class: "met-trend-grid" }));
+    const label = svgEl("text",
+      { x: L - 6, y: y(v) + 3, "text-anchor": "end", class: "met-trend-axis" });
+    label.textContent = String(Math.round(v));
+    svg.appendChild(label);
+  }
+  svg.appendChild(svgEl("polyline", {
+    points: pts.map((p, i) => `${x(i)},${y(p.values[field])}`).join(" "),
+    fill: "none", "stroke-width": "2", class: "met-trend-line",
+  }));
+  pts.forEach((p, i) => {
+    const dot = svgEl("circle", {
+      cx: x(i), cy: y(p.values[field]), r: 4.5,
+      class: "met-trend-dot " + (p.direction === "inbound" ? "in" : "out"),
+    });
+    metTip(dot, `${p.call_id || "?"} · ${p.direction} · ${Math.round(p.values[field])} ms`);
+    svg.appendChild(dot);
+  });
+  return svg;
+}
+
+function metRenderTrend(container, trend, ver) {
+  container.textContent = "";
+  const present = new Set();
+  for (const p of trend) for (const k of Object.keys(p.values || {})) present.add(k);
+  const fields = Object.keys(MET_LAT_KEYS).filter((k) => present.has(k));
+  if (!fields.length) {
+    container.appendChild(el("div", "empty", t("met_trend_empty")));
+    return;
+  }
+  if (!fields.includes(metTrendSel[ver])) metTrendSel[ver] = fields[0];
+  const btns = el("div", "met-trend-btns");
+  for (const f of fields) {
+    const b = el("button",
+      "met-trend-btn" + (f === metTrendSel[ver] ? " active" : ""),
+      t("met_btn_" + MET_LAT_KEYS[f]));
+    b.type = "button";
+    b.addEventListener("click", () => {
+      metTrendSel[ver] = f;
+      metRenderTrend(container, trend, ver);
+    });
+    btns.appendChild(b);
+  }
+  container.appendChild(btns);
+  container.appendChild(metTrendSvg(trend, metTrendSel[ver]));
+  container.appendChild(el("div", "met-legend", t("met_legend")));
+}
+
+function renderMetricsSummary(root, s) {
+  root.textContent = "";
+  root.appendChild(el("div", "met-meta",
+    metFmt("met_meta_calls", { n: s.calls_analyzed, skip: s.calls_skipped })));
+  if (!s.calls_analyzed) { root.appendChild(el("div", "empty", t("met_empty"))); return; }
+  for (const [ver, d] of Object.entries(s.schema_versions)) {
+    root.appendChild(el("div", "met-schema", metFmt("met_schema_label", { v: ver, n: d.calls })));
+    for (const [dir, g] of Object.entries(d.directions)) {
+      const dirLabel = metT("met_dir_" + dir) || dir;
+      root.appendChild(el("div", "met-dir",
+        `${dirLabel}（${metFmt("met_dir_calls", { n: g.calls })}）`));
+      root.appendChild(metStatTable("met_hdr_metric", metLatencyEntries(g)));
+      // 对话画像：时长/轮次的单位不是 ms，单独一张小表。
+      root.appendChild(metStatTable("met_hdr_profile", [
+        { label: t("met_prof_duration"), tip: t("met_tip_duration"), stats: g.duration_s },
+        { label: t("met_prof_turns"), tip: t("met_tip_turns"), stats: g.peer_turns },
+        { label: t("met_prof_hold"), tip: t("met_tip_hold"), stats: g.hold_seconds },
+      ]));
+    }
+    if (Object.keys(d.termination_reasons || {}).length) {
+      root.appendChild(el("div", "met-sect", t("met_term_title")));
+      root.appendChild(metTermTable(d.termination_reasons));
+    }
+    if ((d.trend || []).length) {
+      root.appendChild(metTip(el("div", "met-sect", t("met_trend_title")), t("met_tip_trend")));
+      const trendBox = el("div", "met-trend");
+      root.appendChild(trendBox);
+      metRenderTrend(trendBox, d.trend, ver);
+    }
+    const pills = el("div", "met-pills");
+    const c = d.contact_known || {};
+    if (c.known || c.unknown)
+      pills.appendChild(metPill(`${t("met_pill_known")} ${c.known}/${c.known + c.unknown}`, t("met_tip_known")));
+    const dt = d.dtmf || {};
+    if (dt.actions) {
+      pills.appendChild(metPill(
+        `${t("met_pill_dtmf")} ${metFmt("met_pill_dtmf_fmt", { a: dt.actions, c: dt.calls_with_actions })}`,
+        t("met_tip_dtmf")));
+      for (const [st, n] of Object.entries(dt.outcomes || {}))
+        pills.appendChild(metPill(`${t("met_pill_dtmf")}·${st}: ${n}`, t("met_tip_dtmf_out")));
+    }
+    const tk = d.takeover || {};
+    if (tk.requested)
+      pills.appendChild(metPill(`${t("met_pill_takeover")} ${tk.committed}/${tk.requested}`, t("met_tip_takeover_pill")));
+    for (const [tool, n] of Object.entries(d.tool_calls || {}))
+      pills.appendChild(metPill(`${tool}: ${n}`, t("met_tip_tool_pill")));
+    if (d.abnormal_drop_calls)
+      pills.appendChild(metPill(`${t("met_pill_abnormal")} ${d.abnormal_drop_calls}`, t("met_tip_abnormal"), "bad"));
+    const pcm = d.pcm || {};
+    if (pcm.enable_failed)
+      pills.appendChild(metPill(`${t("met_pill_pcm_failed")} ${pcm.enable_failed}/${pcm.instrumented}`, t("met_tip_pcm_failed"), "bad"));
+    if (pcm.degraded)
+      pills.appendChild(metPill(`${t("met_pill_pcm_degraded")} ${pcm.degraded}/${pcm.instrumented}`, t("met_tip_pcm_degraded"), "bad"));
+    for (const [combo, n] of Object.entries(d.config_combos || {}))
+      pills.appendChild(metPill(`${combo}: ${n}`, t("met_tip_combo")));
+    if (d.barge_in_fallback_calls)
+      pills.appendChild(metPill(`${t("met_pill_fallback")} ${d.barge_in_fallback_calls}`, t("met_tip_fallback"), "bad"));
+    if (pills.children.length) root.appendChild(pills);
+  }
+}
+
+// 判官裁决（复核队列 + 标注）曾在此展示；形态待机主重新设计，2026-08-14 先撤下 UI。
+// 后端 task_verdict / judge_calls / /api/metrics/label 均保留，重接 UI 即可复活。
+async function loadMetrics() {
+  try {
+    const res = await fetch("/api/metrics/summary");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    renderMetricsSummary($("metricsRoot"), data.summary);
+  } catch (e) {
+    const root = $("metricsRoot");
+    root.textContent = "";
+    root.appendChild(el("div", "empty", t("met_load_fail") + e));
+  }
+}
+
+/* 悬浮详解气泡：fixed 单例跟随 .tip 元素，不受卡片 overflow 裁剪 */
+const metTipBox = el("div", "met-tipbox");
+document.body.appendChild(metTipBox);
+document.addEventListener("mouseover", (e) => {
+  const tgt = e.target.closest?.(".tip[data-tip]");
+  if (!tgt) { metTipBox.classList.remove("show"); return; }
+  metTipBox.textContent = tgt.dataset.tip;
+  metTipBox.style.left = "0px";
+  metTipBox.style.top = "0px";
+  metTipBox.classList.add("show");
+  const r = tgt.getBoundingClientRect();
+  const w = metTipBox.offsetWidth, h = metTipBox.offsetHeight;
+  const x = Math.min(Math.max(8, r.left), window.innerWidth - w - 8);
+  const y = r.top - h - 8 >= 8 ? r.top - h - 8 : r.bottom + 8;
+  metTipBox.style.left = x + "px";
+  metTipBox.style.top = y + "px";
 });
 
 /* ========= 设置 ========= */
@@ -3331,6 +4218,8 @@ loadConfig();
 loadDialPresets();
 loadRemoteDialerStatus();
 setInterval(refreshQueue, 2000);
+// 支持 /#metrics 直达指标面板（旧 /static/metrics.html 链接由后端 302 到这里）。
+if (location.hash === "#metrics") navTo("metrics");
 </script>
 </body>
 </html>

@@ -21,6 +21,21 @@ profile，在 Agent 明确说出自己将按键却未调用工具时启用执行
 
 ``result_verification``(可选): ``none``(默认)或 ``carrier_sms``。后者仅用于
 运营商账户查询，要求通话结果由同一运营商公共客服号发来的短信做可信校验。
+
+``max_call_seconds``(WIL-120 一期,可选): 覆盖全局 ``OUTBOUND_MAX_SECONDS``。
+0=不限时,1..7200=该场景的时长上限;缺省=用全局值(150s 安全默认)。长通话
+(客服排队 30 分钟+)是**场景属性**而非全局属性——只给点名的预设放开。
+
+``wrap_up_judge``(WIL-120 一期,可选): 默认 ``true``。长排队场景置 ``false``
+显式关闭收尾裁判——排队循环音会被裁判误判成「对话打转」而提前挂断。
+这是一期的诚实开关;二期换成 hold 状态冻结后收回。
+
+``task_package``(WIL-120 三期,可选): 结构化任务包,四段全可选——
+``verification``(核身事实,仅对方要求时按需提供)/``negotiation``(谈判底牌)/
+``preauth``(预授权区间:AI 只被授权在此范围内直接答应,超出必须 ask_owner)/
+``blacklist``(绝不同意的操作清单)。前三段是自由 键→值 表(都是字符串,键是
+给模型看的自然语言标签,不做字段枚举);值随 prompt 进模型但**绝不进
+events/metrics/日志**(WIL-95 §7)。真实账户信息只存本地 number_profiles.json。
 """
 
 from __future__ import annotations
@@ -63,6 +78,9 @@ _MANAGED_FIELDS = {
     "opening_mode",
     "dtmf_spoken_followup",
     "result_verification",
+    "max_call_seconds",
+    "wrap_up_judge",
+    "task_package",
 }
 
 
@@ -351,6 +369,118 @@ def _load_profiles_file(path: Path) -> dict[str, Any] | None:
     return loaded
 
 
+# task_package 尺寸护栏：键≤40 字符、值≤200、每段≤16 条、blacklist 项≤120。
+# 只限尺寸不限字段名——键是给模型看的自然语言标签，枚举字段名违反非枚举原则。
+_PACKAGE_SECTIONS = ("verification", "negotiation", "preauth")
+_PACKAGE_MAX_ENTRIES = 16
+_PACKAGE_MAX_KEY = 40
+_PACKAGE_MAX_VALUE = 200
+_PACKAGE_MAX_BLACKLIST_ITEM = 120
+
+
+def _normalize_task_package(value: Any) -> dict[str, Any] | None:
+    """宽松读取（call 时用）：非法段丢弃、非法条目跳过，绝不抛。"""
+    if not isinstance(value, dict):
+        return None
+    out: dict[str, Any] = {}
+    for section in _PACKAGE_SECTIONS:
+        raw = value.get(section)
+        if not isinstance(raw, dict):
+            continue
+        entries = {
+            str(k).strip()[:_PACKAGE_MAX_KEY]: str(v).strip()[:_PACKAGE_MAX_VALUE]
+            for k, v in list(raw.items())[:_PACKAGE_MAX_ENTRIES]
+            if str(k).strip() and str(v).strip()
+        }
+        if entries:
+            out[section] = entries
+    raw_blacklist = value.get("blacklist")
+    if isinstance(raw_blacklist, list):
+        items = [
+            str(item).strip()[:_PACKAGE_MAX_BLACKLIST_ITEM]
+            for item in raw_blacklist[:_PACKAGE_MAX_ENTRIES]
+            if str(item).strip()
+        ]
+        if items:
+            out["blacklist"] = items
+    return out or None
+
+
+def _validate_task_package(value: Any) -> dict[str, Any] | None:
+    """严格校验（CRUD 写入用）：结构/尺寸非法直接拒绝，不静默截断。"""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ProfileValidationError("task_package 必须是对象")
+    unknown = set(value) - set(_PACKAGE_SECTIONS) - {"blacklist"}
+    if unknown:
+        raise ProfileValidationError(
+            f"task_package 仅支持 {'/'.join(_PACKAGE_SECTIONS)}/blacklist 段，"
+            f"多余: {sorted(unknown)}"
+        )
+    out: dict[str, Any] = {}
+    for section in _PACKAGE_SECTIONS:
+        raw = value.get(section)
+        if raw is None:
+            continue
+        if not isinstance(raw, dict):
+            raise ProfileValidationError(f"task_package.{section} 必须是对象")
+        if len(raw) > _PACKAGE_MAX_ENTRIES:
+            raise ProfileValidationError(
+                f"task_package.{section} 最多 {_PACKAGE_MAX_ENTRIES} 条"
+            )
+        entries: dict[str, str] = {}
+        for k, v in raw.items():
+            if not isinstance(k, str) or not isinstance(v, str):
+                raise ProfileValidationError(
+                    f"task_package.{section} 的键和值都必须是字符串"
+                )
+            key, val = k.strip(), " ".join(v.strip().split())
+            if not key or not val:
+                continue
+            if len(key) > _PACKAGE_MAX_KEY or len(val) > _PACKAGE_MAX_VALUE:
+                raise ProfileValidationError(
+                    f"task_package.{section} 单条过长"
+                    f"（键≤{_PACKAGE_MAX_KEY}、值≤{_PACKAGE_MAX_VALUE} 字符）"
+                )
+            entries[key] = val
+        if entries:
+            out[section] = entries
+    raw_blacklist = value.get("blacklist")
+    if raw_blacklist is not None:
+        if not isinstance(raw_blacklist, list) or any(
+            not isinstance(item, str) for item in raw_blacklist
+        ):
+            raise ProfileValidationError("task_package.blacklist 必须是字符串数组")
+        if len(raw_blacklist) > _PACKAGE_MAX_ENTRIES:
+            raise ProfileValidationError(
+                f"task_package.blacklist 最多 {_PACKAGE_MAX_ENTRIES} 条"
+            )
+        items = []
+        for item in raw_blacklist:
+            cleaned = " ".join(item.strip().split())
+            if not cleaned:
+                continue
+            if len(cleaned) > _PACKAGE_MAX_BLACKLIST_ITEM:
+                raise ProfileValidationError(
+                    f"task_package.blacklist 单条不能超过 "
+                    f"{_PACKAGE_MAX_BLACKLIST_ITEM} 字符"
+                )
+            items.append(cleaned)
+        if items:
+            out["blacklist"] = items
+    return out or None
+
+
+def _normalize_max_call_seconds(value: Any) -> int | None:
+    """None=未设置(用全局);0=不限;1..7200=场景上限。非法值当未设置,不猜。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if 0 <= value <= 7200:
+        return value
+    return None
+
+
 def _normalize_profile(
     item: dict[str, Any] | None,
     number: str,
@@ -381,6 +511,11 @@ def _normalize_profile(
             if item.get("result_verification") == "carrier_sms"
             else "none"
         ),
+        "max_call_seconds": _normalize_max_call_seconds(
+            item.get("max_call_seconds")
+        ),
+        "wrap_up_judge": item.get("wrap_up_judge") is not False,
+        "task_package": _normalize_task_package(item.get("task_package")),
         "error": None,
         "provider": "",
         "model": "",
@@ -453,6 +588,11 @@ def _managed_profile(item: dict[str, Any], profile_id: str) -> dict[str, Any]:
             if item.get("result_verification") == "carrier_sms"
             else "none"
         ),
+        "max_call_seconds": _normalize_max_call_seconds(
+            item.get("max_call_seconds")
+        ),
+        "wrap_up_judge": item.get("wrap_up_judge") is not False,
+        "task_package": _normalize_task_package(item.get("task_package")),
     }
 
 
@@ -499,6 +639,18 @@ def _validate_profile_payload(payload: Any) -> dict[str, Any]:
         raise ProfileValidationError(
             "result_verification 只能是 none 或 carrier_sms"
         )
+    max_call_seconds = payload.get("max_call_seconds")
+    if max_call_seconds is not None:
+        if isinstance(max_call_seconds, bool) or not isinstance(
+            max_call_seconds, int
+        ) or not (0 <= max_call_seconds <= 7200):
+            raise ProfileValidationError(
+                "max_call_seconds 只能是 0（不限）到 7200 之间的整数，或留空用全局值"
+            )
+    wrap_up_judge = payload.get("wrap_up_judge", True)
+    if not isinstance(wrap_up_judge, bool):
+        raise ProfileValidationError("wrap_up_judge 必须是布尔值")
+    task_package = _validate_task_package(payload.get("task_package"))
 
     profile: dict[str, Any] = {
         "enabled": enabled,
@@ -509,7 +661,13 @@ def _validate_profile_payload(payload: Any) -> dict[str, Any]:
         "opening_mode": opening_mode,
         "dtmf_spoken_followup": dtmf_spoken_followup,
         "result_verification": result_verification,
+        "wrap_up_judge": wrap_up_judge,
     }
+    if max_call_seconds is not None:
+        # 只在显式提供时落盘：缺省=跟随全局，与 0（不限）语义不同。
+        profile["max_call_seconds"] = max_call_seconds
+    if task_package is not None:
+        profile["task_package"] = task_package
     if match_mode == "exact":
         profile["task"] = task
     return profile

@@ -79,6 +79,9 @@ if _menubar_dir.is_dir():
 _seed_profiles = project_root / "data" / "number_profiles.example.json"
 if _seed_profiles.is_file():
     datas.append((str(_seed_profiles), "seed"))
+_seed_playbooks = project_root / "data" / "call_playbooks.example.json"
+if _seed_playbooks.is_file():
+    datas.append((str(_seed_playbooks), "seed"))
 
 ffmpeg_path = os.environ.get("AGENTCALL_FFMPEG_PATH", "").strip()
 if ffmpeg_path:

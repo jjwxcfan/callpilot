@@ -180,6 +180,35 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                         "warm", "energetic"),
                choice_labels={"": "（默认·不追加）"},
                help="https://openai.fm"),
+    # server_vad 判定「对方说完了」所需的静默时长（毫秒）。OpenAI 默认 500；
+    # 电话场景往下调可显著缩短「对方说完→AI 开口」的等待（每 100ms 立省 100ms），
+    # 代价是对方句中停顿稍长就会被抢话。真机体感 250~350 较自然。0/负值=不下发，
+    # 用 OpenAI 默认。仅 OpenAI 链路。
+    ConfigSpec("OPENAI_VAD_SILENCE_MS", "OpenAI VAD 静默判停（毫秒）", "int", "300"),
+    # server_vad 能量阈值（0~1，OpenAI 默认 0.5）。电话线路底噪会拖住判停：真机
+    # 实测音尾→speech_stopped 拖到 0.9~2.7s（静默窗仅 0.3s）。适当抬高让底噪更快
+    # 被认作静音、判停更利落；太高会漏掉小声说话的开头。0=用服务端默认。
+    ConfigSpec("OPENAI_VAD_THRESHOLD", "OpenAI VAD 能量阈值（0=服务端默认）",
+               "float", "0"),
+    # 输入降噪（喂给 VAD 与模型前）：near_field=近讲耳机，far_field=远场/电话。
+    # 与抬 VAD 阈值同攻「判停拖尾」。空=不启用。
+    ConfigSpec("OPENAI_NOISE_REDUCTION", "OpenAI 输入降噪（空/near_field/far_field）",
+               "str", ""),
+    # 判停方式。server_vad 只看静音时长——静默窗短则抢话（对方「OK…」稍顿就被
+    # 接走，2026-08-12 真机复现）、长则每轮都慢，一个旋钮救不了两头。semantic_vad
+    # 按语义判断对方是否说完：完整问句立刻接，明显有下文就等。选 semantic_vad 时
+    # OPENAI_VAD_SILENCE_MS / OPENAI_VAD_THRESHOLD 不生效。
+    ConfigSpec("OPENAI_TURN_DETECTION", "OpenAI 判停方式（server_vad/semantic_vad）",
+               "str", "server_vad"),
+    # semantic_vad 的积极程度：low=多等、medium、high=尽快接话、auto=默认(medium)。
+    ConfigSpec("OPENAI_VAD_EAGERNESS", "semantic_vad 接话积极度", "str", "auto"),
+    # 单轮回复的 token 上限（0=不限）。提示词管不住啰嗦（WIL-83/112 实测：明令
+    # 「说短点」仍单轮 14~18 秒），本地硬切又会把话切在半截；在 provider 侧限长
+    # 才是从源头让它少生成，且转写与对端听到的一致。**注意 audio 与 reasoning
+    # token 都计入**：真机实测一句话 ≈ 250（text 90 + audio 110 + reasoning 48），
+    # 设 200 会把第一句掐成 incomplete。两三句话 ≈ 900。
+    ConfigSpec("OPENAI_MAX_RESPONSE_TOKENS", "OpenAI 单轮回复 token 上限（0=不限）",
+               "int", "0"),
     # 端点覆写（可选）：留空即直连 api.openai.com；仅在用反代/Azure OpenAI，
     # 或所在网络无法直连 OpenAI 时才需要填。
     ConfigSpec("OPENAI_REALTIME_URL", "OpenAI Realtime 端点覆写", "str", "",
@@ -195,6 +224,10 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("CARRIER_HOTLINE", "运营商免费客服号（留空=按 SIM 自动识别）", "str", "",
                requires_restart=True),
     ConfigSpec("OWNER_NAME", "机主姓名", "str", ""),
+    # 机主手机号：AI 把通话口信转发给机主时的短信收件号码（send_sms 的 to 填
+    # owner 时由系统解析成这个号码，模型不接触真实号码）。同时进发信白名单——
+    # 这个号码即使从未与本机通信过也放行（WIL-116）。留空 = 无法代发给机主。
+    ConfigSpec("OWNER_PHONE", "机主手机号（转告短信收件号码）", "str", ""),
     ConfigSpec(
         "INBOUND_TAKEOVER_ENABLED",
         "来电转手机真人接管",
@@ -202,6 +235,14 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
         "false",
         requires_restart=True,
     ),
+    # 机主确认环（WIL-120 二期 Path A）：ask_owner 工具等 Web 确认卡答复的
+    # 窗口；超时=拒绝（fail-closed，机主没看到不等于同意）。
+    ConfigSpec("OWNER_CONFIRM_TIMEOUT_SECONDS", "机主确认等待窗口（秒）", "int", "60"),
+    # Path B「我来说」（WIL-120 四期）：三方并入时拨给机主的第二号码
+    # （不能是本机 SIM 自己的号）。留空 = Path B 不可用，确认卡按钮保持置灰。
+    ConfigSpec("OWNER_SECOND_PHONE", "机主第二号码（三方并入用）", "str", ""),
+    # wait_for_sms 工具（WIL-120 三期）：等新短信（OTP/确认短信）的窗口。
+    ConfigSpec("WAIT_SMS_TIMEOUT_SECONDS", "等新短信窗口（秒）", "int", "60"),
     ConfigSpec(
         "INBOUND_TAKEOVER_PREFERENCE",
         "来电真人接管偏好",
@@ -238,6 +279,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                editable=False, hidden=True),
     ConfigSpec("NUMBER_PROFILES_ENABLED", "预调教任务库", "bool", "true"),
     ConfigSpec("NUMBER_PROFILES_FILE", "预调教任务库文件", "str", ""),
+    ConfigSpec("CALL_PLAYBOOKS_ENABLED", "呼叫情报库", "bool", "true"),
+    ConfigSpec("CALL_PLAYBOOKS_FILE", "呼叫情报库文件", "str", ""),
     # ---- 本地三段式（AGENT_PROVIDER=local）----
     ConfigSpec("LOCAL_LLM_MODEL", "三段式 LLM 模型", "str", "qwen-plus",
                requires_restart=True),
@@ -246,6 +289,11 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("LOCAL_MODELS_DIR", "三段式模型目录", "str", "",
                editable=False, hidden=True, requires_restart=True),
     ConfigSpec("MANUAL_RESPONSE_CONTROL", "手动应答控制", "bool", "false"),
+    # barge-in：对端开口即打断 AI（掐生成+清积压），代替半双工丢上行。开启前提：
+    # 模组无下行→上行回采（SIM7600 CPCMREG 实测互相关 r=0.009，干净；Quectel UAC
+    # 路线未验证，保持默认 false 走半双工）。
+    ConfigSpec("BARGE_IN_ENABLED", "对端插话打断 AI", "bool", "false",
+               requires_restart=True),
     ConfigSpec("MANUAL_RESPONSE_SILENCE_MS", "手动应答静默窗口（毫秒）", "int", "1000"),
     ConfigSpec("MANUAL_RESPONSE_MAX_WAIT_MS", "手动应答最长等待（毫秒）", "int", "8000"),
     # 文本判官本批仅实现旁观模式；enforce 不进 choices，配置写回会在边界拒绝。
@@ -253,6 +301,10 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
                choices=("off", "shadow")),
     ConfigSpec("DTMF_JUDGE_MODEL", "DTMF 判官文本模型", "str", ""),
     # ---- 模组 ----
+    # 模组厂商：quectel=EC20/EG25（UAC/QPCMV 音频）；simcom=SIM7600（CPCMREG
+    # PCM-over-USB 音频，须配 MODEM_AUDIO_MODE=nmea 走串口 PCM 桥）。
+    ConfigSpec("MODEM_VENDOR", "模组厂商", "select", "quectel",
+               choices=("quectel", "simcom"), requires_restart=True),
     # 默认值按当前平台在模块加载时定死（Windows 为 auto 哨兵，连接时扫描）。
     ConfigSpec("MODEM_PORT", "模组 AT 串口", "str", platforms.default_modem_port(),
                requires_restart=True),
@@ -322,6 +374,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("REPEAT_SUPPRESS_SIMILARITY", "复读抑制相似度阈值", "float", "0.9"),
     # 外呼硬时限（秒）：LLM 收尾裁判失灵/漏判时的最后防线，到点自动道别挂断；
     # 0 = 不限制。（正常收尾由 summarizer.judge_wrap_up 提前判定。）
+    # 长通话场景（客服排队）不改这里——用 number_profiles 的 max_call_seconds
+    # 按场景覆盖（WIL-120 一期），全局保持安全默认。
     ConfigSpec("OUTBOUND_MAX_SECONDS", "外呼最长时长（秒）", "int", "150"),
     # 来电缺失 NO CARRIER 且 CLCC 轮询也停活时的会话级最后防线。
     ConfigSpec("INBOUND_MAX_SECONDS", "来电最长时长（秒）", "int", "1800"),
@@ -333,6 +387,8 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     ConfigSpec("RECORDING_RETENTION_DAYS", "录音保留天数", "int", "30"),
     ConfigSpec("SUMMARY_ENABLED", "通话摘要开关", "bool", "true"),
     ConfigSpec("SUMMARY_MODEL", "摘要模型", "str", ""),
+    # 对话建单模型（WIL-120 三期 b）：留空 = provider 强档默认（openai=gpt-4o）
+    ConfigSpec("INTAKE_MODEL", "对话建单模型", "str", ""),
     # 摘要 API 超时秒数（真机实测 15s 对长转写不够用），调试项不进面板。
     ConfigSpec("SUMMARY_TIMEOUT", "摘要超时（秒）", "float", "30",
                editable=False, hidden=True),
@@ -665,6 +721,10 @@ _NUMERIC_RANGES: dict[str, tuple[float, float, bool]] = {
     "DTMF_TONE_MS": (0, 2000, True),          # >0 且 ≤2000ms
     "DTMF_TONE_AMPLITUDE": (0.0, 1.0, True),  # (0, 1]
     "INBOUND_MAX_SECONDS": (0, 86400, True),   # >0 且 ≤24h
+    # 0=不限时合法（number_profiles 的 max_call_seconds 可按场景覆盖，WIL-120）。
+    "OUTBOUND_MAX_SECONDS": (0, 86400, False),  # ≥0 且 ≤24h
+    "OWNER_CONFIRM_TIMEOUT_SECONDS": (0, 600, True),  # >0 且 ≤10min
+    "WAIT_SMS_TIMEOUT_SECONDS": (0, 600, True),       # >0 且 ≤10min
 }
 
 

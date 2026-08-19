@@ -1595,3 +1595,85 @@ def test_meta_exposes_unknown_sim_block():
 
     sim = api(app, fn)["sim"]
     assert sim["present"] is False and sim["carrier"] == "未知"
+
+
+# ---- WIL-120 二期：/api/call/owner_confirm ----
+
+
+def test_owner_confirm_publishes_response_event():
+    service = FakeService()
+    service.hub = FakeHub()
+    app = make_app(service)
+
+    async def fn(client):
+        good = await client.post(
+            "/api/call/owner_confirm",
+            json={"id": "a" * 32, "choice": "approve"},
+        )
+        bad_id = await client.post(
+            "/api/call/owner_confirm",
+            json={"id": "not-hex", "choice": "approve"},
+        )
+        bad_choice = await client.post(
+            "/api/call/owner_confirm",
+            json={"id": "a" * 32, "choice": "maybe"},
+        )
+        return good.status, bad_id.status, bad_choice.status
+
+    good, bad_id, bad_choice = api(app, fn)
+    assert good == 200 and bad_id == 400 and bad_choice == 400
+    assert service.hub.events == [
+        {"type": "owner_confirm_response", "id": "a" * 32, "choice": "approve"}
+    ]
+
+
+# ---- WIL-120 三期 b：/api/intake/chat ----
+
+
+def test_intake_chat_endpoint_validates_and_delegates(monkeypatch):
+    from agentcall import task_intake
+
+    monkeypatch.setattr(
+        task_intake, "intake_step",
+        lambda messages, *, owner, lang: {
+            "ok": True, "reply": f"收到 {len(messages)} 条 / {lang}",
+            "ready": False, "draft": None, "error": None,
+        },
+    )
+    app = make_app(FakeService())
+
+    async def fn(client):
+        good = await client.post("/api/intake/chat", json={
+            "messages": [{"role": "user", "content": "帮我打 Xfinity"}],
+            "lang": "zh",
+        })
+        bad = await client.post("/api/intake/chat", json={"messages": []})
+        return good.status, await good.json(), bad.status
+
+    status, body, bad_status = api(app, fn)
+    assert status == 200 and body["reply"] == "收到 1 条 / zh"
+    assert bad_status == 400
+
+
+def test_playbooks_endpoint_lists_entries(tmp_path, monkeypatch):
+    """GET /api/playbooks（WIL-129 P1）：只读返回情报库内容与开关状态。"""
+    pb = tmp_path / "pb.json"
+    pb.write_text(
+        json.dumps(
+            {"playbooks": [{"id": "att_prepaid_611", "numbers": ["611"]}]},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CALL_PLAYBOOKS_FILE", str(pb))
+    monkeypatch.setenv("CALL_PLAYBOOKS_ENABLED", "true")
+    app = make_app(FakeService())
+
+    async def fn(client):
+        res = await client.get("/api/playbooks")
+        return res.status, await res.json()
+
+    status, body = api(app, fn)
+    assert status == 200
+    assert body["ok"] is True and body["enabled"] is True
+    assert body["playbooks"][0]["id"] == "att_prepaid_611"

@@ -54,6 +54,45 @@ def test_extract_spoken_dtmf_rejects_questions_negation_conditions_and_quotes(te
     assert extract_spoken_dtmf(text) is None
 
 
+# ---- WIL-120 一期：英文变体（AGENT_LANGUAGE=en 时护窗此前完全失效） ----
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("Let me press 2.", "2"),
+        ("I'll press two.", "2"),
+        ("I will press 1 and 3.", "13"),
+        ("I'm going to press pound.", "#"),
+        ("Okay, let me go ahead and press 0.", "0"),
+    ],
+)
+def test_extract_spoken_dtmf_accepts_english_first_person_statements(
+    text, expected
+):
+    assert extract_spoken_dtmf(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Should I press 2?",
+        "Please press 2.",
+        "You can press 3 to continue.",
+        "The menu says press 3.",
+        "The system prompts: press 1 for billing.",
+        "I won't press anything yet.",
+        "I don't need to press 2.",
+        "If it asks, I press 1.",
+        "Press 1 for English.",  # 复述菜单原话
+        "I pressed the wrong key, 3.",
+        "Let me press ten.",  # 非法按键词
+    ],
+)
+def test_extract_spoken_dtmf_rejects_english_questions_negation_and_quotes(text):
+    assert extract_spoken_dtmf(text) is None
+
+
 class _ExternalResultAgent(FakeAgent):
     def __init__(self, *, accept_external_result: bool = True) -> None:
         super().__init__()
@@ -68,11 +107,17 @@ class _ExternalResultAgent(FakeAgent):
 
 
 class _SpyCallRecord:
+    recording_enabled = False
+
     def __init__(self) -> None:
         self.events: list[tuple[str, dict]] = []
 
     def log_event(self, event_type: str, **fields) -> None:
         self.events.append((event_type, fields))
+
+    def log_latency(self, stage: str, ms: float, **fields) -> None:
+        # 与真 CallRecord 同构：latency 是 log_event 的糖（call_log.py:205）。
+        self.log_event("latency", stage=stage, ms=ms, **fields)
 
     def write_downlink(self, _pcm: bytes) -> None:
         pass

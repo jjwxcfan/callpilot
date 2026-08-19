@@ -94,6 +94,17 @@ def test_none_sources_reject_but_extra_allowed_still_works():
     assert is_reply_target_allowed("10086", None, None, extra_allowed="10086")
 
 
+def test_owner_number_bypasses_history():
+    """机主号码即使从未与本机通信过也放行——给机主转口信是产品目的（WIL-116）。"""
+    assert is_reply_target_allowed(
+        "+16505550100", FakeHub([]), FakeCallLogger([]), owner_number="+16505550100"
+    )
+    assert is_reply_target_allowed("10086", None, None, owner_number="10086")
+    # 未配置（空串）不放行任何号码，更不放行空号码
+    assert not is_reply_target_allowed("10086", None, None, owner_number="")
+    assert not is_reply_target_allowed("", None, None, owner_number="")
+
+
 def test_allow_any_bypasses_contact_check_for_nonempty_number():
     """开发期总开关:allow_any 放行任意非空号码,无需已联系过。"""
     assert is_reply_target_allowed(

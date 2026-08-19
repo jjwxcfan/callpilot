@@ -150,7 +150,11 @@ def test_start_sends_session_update_with_expected_fields(monkeypatch):
             assert session["output_modalities"] == ["audio"]
             audio = session["audio"]
             assert audio["output"]["voice"] == "alloy"
-            assert audio["input"]["turn_detection"] == {"type": "server_vad"}
+            # 默认下发注册表里的静默判停窗（OPENAI_VAD_SILENCE_MS=300，电话场景提速）。
+            assert audio["input"]["turn_detection"] == {
+                "type": "server_vad",
+                "silence_duration_ms": 300,
+            }
             assert audio["input"]["format"] == {"type": "audio/pcm", "rate": 24000}
             assert audio["output"]["format"] == {"type": "audio/pcm", "rate": 24000}
             assert audio["input"]["transcription"] == {
@@ -240,7 +244,11 @@ def test_manual_response_control_sets_create_response_false_and_debounces(monkey
         try:
             ws = instances[0]
             turn_detection = ws.sent[0]["session"]["audio"]["input"]["turn_detection"]
-            assert turn_detection == {"type": "server_vad", "create_response": False}
+            assert turn_detection == {
+                "type": "server_vad",
+                "silence_duration_ms": 300,
+                "create_response": False,
+            }
             for text in ("第一段菜单", "第二段菜单", "第三段菜单"):
                 ws.feed(
                     {
@@ -497,7 +505,7 @@ def test_transcripts_emitted_for_user_and_agent(monkeypatch):
 
 
 def test_repetitive_agent_response_audio_is_suppressed(monkeypatch, caplog):
-    """下行转写命中复读判重时，该 response 已缓存音频不得输出。"""
+    """复读判定后，该 response 的后续音频分块不得再输出（streaming 语义，WIL-112）。"""
     monkeypatch.setenv("REPEAT_SUPPRESS_SIMILARITY", "0.9")
     instances, _calls = _patch_connect(monkeypatch)
     agent = _make_agent()
@@ -542,12 +550,19 @@ def test_repetitive_agent_response_audio_is_suppressed(monkeypatch, caplog):
                     "response_id": "r3",
                     "transcript": repeated,
                 })
+                # 判定为复读之后，同 response 的迟到分块必须被丢弃。
+                instances[0].feed({
+                    "type": "response.output_audio.delta",
+                    "response_id": "r3",
+                    "delta": base64.b64encode(b"late-tail").decode("ascii"),
+                })
                 await _drain()
         finally:
             await agent.stop()
 
     asyncio.run(scenario())
-    assert received == [b"first", b"repeat"]
+    # streaming 语义：判定前到达的分块（含 r3 首块）已放行，迟到分块被丢弃。
+    assert received == [b"first", b"repeat", b"repeat-again"]
     assert "抑制复读" in caplog.text
     assert any(
         msg.get("type") == "response.create"
@@ -987,3 +1002,282 @@ def test_factory_unknown_provider_mentions_openai():
     with pytest.raises(ValueError) as excinfo:
         factory.create_agent("gpt")
     assert "openai" in str(excinfo.value)
+
+
+# ---- barge-in：speech_started 打断 ----
+
+def test_barge_in_speech_started_cancels_and_fires_interrupt(monkeypatch):
+    """回调接受打断时：对端开口 → 发 response.cancel（仅回复生成中）+ 触发回调。"""
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+    interrupts: list[int] = []
+
+    def accept_interrupt() -> bool:
+        interrupts.append(1)
+        return True
+
+    agent.set_user_interrupt_handler(accept_interrupt)
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            ws = instances[0]
+            ws.feed({"type": "response.created", "response": {"id": "r1"}})
+            ws.feed({"type": "input_audio_buffer.speech_started"})
+            await _drain()
+            await _wait_for_sent_count(ws, "response.cancel", 1)
+            assert interrupts
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
+def test_barge_in_no_active_response_skips_cancel_but_fires_interrupt(monkeypatch):
+    """回复已结束（response.done 后）对端开口：不发 cancel（避免无谓 error），仍清积压。"""
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+    interrupts: list[int] = []
+
+    def accept_interrupt() -> bool:
+        interrupts.append(1)
+        return True
+
+    agent.set_user_interrupt_handler(accept_interrupt)
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            ws = instances[0]
+            ws.feed({"type": "response.created", "response": {"id": "r1"}})
+            ws.feed({"type": "response.done", "response": {"id": "r1"}})
+            ws.feed({"type": "input_audio_buffer.speech_started"})
+            await _drain()
+            await asyncio.sleep(0.05)
+            assert "response.cancel" not in ws.sent_types()
+            assert interrupts
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
+def test_barge_in_rejected_by_handler_skips_cancel(monkeypatch):
+    """回调拒绝打断（DTMF 护窗让位 / 自激兜底，WIL-94）：即使回复生成中也不 cancel。"""
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+    interrupts: list[int] = []
+
+    def reject_interrupt() -> bool:
+        interrupts.append(1)
+        return False
+
+    agent.set_user_interrupt_handler(reject_interrupt)
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            ws = instances[0]
+            ws.feed({"type": "response.created", "response": {"id": "r1"}})
+            ws.feed({"type": "input_audio_buffer.speech_started"})
+            await _drain()
+            await asyncio.sleep(0.05)
+            assert "response.cancel" not in ws.sent_types()
+            assert interrupts, "回调必须被问到（由它记录让位原因）"
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
+def test_speech_started_without_handler_stays_noop(monkeypatch):
+    """未注册回调（半双工模式）：speech_started 维持原忽略行为，不发 cancel。"""
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            ws = instances[0]
+            ws.feed({"type": "response.created", "response": {"id": "r1"}})
+            ws.feed({"type": "input_audio_buffer.speech_started"})
+            await _drain()
+            await asyncio.sleep(0.05)
+            assert "response.cancel" not in ws.sent_types()
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
+def test_vad_silence_zero_omits_silence_duration(monkeypatch):
+    """OPENAI_VAD_SILENCE_MS<=0 时不下发 silence_duration_ms，用服务端默认。"""
+    monkeypatch.setenv("OPENAI_VAD_SILENCE_MS", "0")
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            ws = instances[0]
+            turn_detection = ws.sent[0]["session"]["audio"]["input"]["turn_detection"]
+            assert turn_detection == {"type": "server_vad"}
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
+def test_turn_latency_logged_between_speech_stopped_and_first_audio(monkeypatch, caplog):
+    """逐轮延迟度量：speech_stopped → 首个音频增量，打一条 latency 日志后复位。"""
+    import logging as _logging
+
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            ws = instances[0]
+            with caplog.at_level(_logging.INFO):
+                ws.feed({"type": "input_audio_buffer.speech_stopped"})
+                ws.feed(
+                    {
+                        "type": "response.output_audio.delta",
+                        "response": {"id": "r1"},
+                        "delta": base64.b64encode(b"\x00\x00").decode(),
+                    }
+                )
+                ws.feed(  # 第二个增量不应再打延迟日志
+                    {
+                        "type": "response.output_audio.delta",
+                        "response": {"id": "r1"},
+                        "delta": base64.b64encode(b"\x00\x00").decode(),
+                    }
+                )
+                await _drain()
+            assert caplog.text.count("轮次响应延迟") == 1
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
+def test_turn_latency_emitted_via_latency_handler(monkeypatch):
+    """判停→首音频经 set_latency_handler 上交（WIL-95 第一期：落盘管道）。"""
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+    samples: list[tuple[str, float]] = []
+    agent.set_latency_handler(lambda stage, ms: samples.append((stage, ms)))
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            ws = instances[0]
+            ws.feed({"type": "input_audio_buffer.speech_stopped"})
+            ws.feed(
+                {
+                    "type": "response.output_audio.delta",
+                    "response": {"id": "r1"},
+                    "delta": base64.b64encode(b"\x00\x00").decode(),
+                }
+            )
+            ws.feed(  # 第二个增量不应再产生样本（每轮一条）
+                {
+                    "type": "response.output_audio.delta",
+                    "response": {"id": "r1"},
+                    "delta": base64.b64encode(b"\x00\x00").decode(),
+                }
+            )
+            await _drain()
+            assert len(samples) == 1
+            stage, ms = samples[0]
+            assert stage == "first_audio_delta"
+            assert ms >= 0
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# 失聪看门狗（WIL-122）
+# ---------------------------------------------------------------------------
+
+_VOICED_FRAME = b"\x00\x02" * 240  # int16=512，超过有声阈值 350
+_SILENT_FRAME = b"\x00\x00" * 240
+
+
+def test_deaf_watchdog_warns_then_reconnects_on_event_silence(monkeypatch):
+    """有声上行持续但服务端零事件：先落 provider_deaf 告警，超限主动断开借道重连。"""
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+    samples: list[tuple[str, float]] = []
+    agent.set_latency_handler(lambda stage, ms: samples.append((stage, ms)))
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            ws = instances[0]
+            now = openai_agent.time.monotonic()
+            await agent.send_audio(_VOICED_FRAME)  # 喂「有声上行」时钟
+            # 事件静默超过告警阈但未到重连阈：只告警不断开
+            agent._last_event_at = now - openai_agent._DEAF_WARN_SECONDS - 1
+            await agent._deaf_tick(now)
+            assert [s for s, _ in samples] == ["provider_deaf"]
+            assert not ws.closed
+            # 再次 tick 不重复告警（同一段失聪期只告警一次）
+            await agent._deaf_tick(now)
+            assert [s for s, _ in samples] == ["provider_deaf"]
+            # 静默达到重连阈：主动 close，交给既有断线重连路径
+            agent._last_event_at = now - openai_agent._DEAF_RECONNECT_SECONDS - 1
+            await agent._deaf_tick(now)
+            assert "provider_deaf_reconnect" in [s for s, _ in samples]
+            assert ws.closed
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
+def test_deaf_watchdog_quiet_uplink_never_triggers(monkeypatch):
+    """近窗口只有纯静默上行（安静等待）：服务端久无事件也不算失聪。"""
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+    samples: list[tuple[str, float]] = []
+    agent.set_latency_handler(lambda stage, ms: samples.append((stage, ms)))
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            now = openai_agent.time.monotonic()
+            await agent.send_audio(_SILENT_FRAME)  # 静默帧不喂有声时钟
+            agent._last_event_at = now - openai_agent._DEAF_RECONNECT_SECONDS - 1
+            await agent._deaf_tick(now)
+            assert samples == []
+            assert not instances[0].closed
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())
+
+
+def test_deaf_watchdog_event_resets_warned_flag(monkeypatch):
+    """任何服务端事件都喂时钟并复位告警位：恢复后再失聪要重新告警。"""
+    instances, _calls = _patch_connect(monkeypatch)
+    agent = _make_agent()
+
+    async def scenario():
+        await agent.start(lambda pcm: None)
+        try:
+            agent._deaf_warned = True
+            before = agent._last_event_at
+            instances[0].feed({"type": "rate_limits.updated"})
+            await _drain()
+            assert agent._deaf_warned is False
+            assert agent._last_event_at is not None
+            assert before is None or agent._last_event_at >= before
+        finally:
+            await agent.stop()
+
+    asyncio.run(scenario())

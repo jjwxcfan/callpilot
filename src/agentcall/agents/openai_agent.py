@@ -17,6 +17,7 @@ import json
 import logging
 import threading
 import time
+from array import array
 from datetime import datetime
 from typing import Any, Callable
 
@@ -41,6 +42,22 @@ _MANUAL_RESPONSE_SEND_TIMEOUT_SECONDS = 5.0
 # 重连成功后让 Agent 主动安抚对方的提示词（与 qwen_agent 语义一致）。
 RECONNECT_NOTICE = "请直接用中文说：抱歉刚才信号不太好，请继续。"
 
+# provider 失聪看门狗（WIL-122）：真机 2026-08-17 出现「ws 活着、上行有声帧
+# 一直在发、但服务端整整 60s 零事件」——机主接通只听到沉默，且现有 fatal
+# 只覆盖重连全败，覆盖不了这种无声失聪。判定条件是「近窗口内仍在发**有声**
+# 上行、但已连续 N 秒没收到任何服务端事件」；纯静默期（无人说话）不计，
+# 避免把安静等待误判成失聪。
+# 与 call_agent._VOICED_PEAK_THRESHOLD 同值：判「这帧有声」的 int16 峰值阈。
+_DEAF_VOICED_PEAK_THRESHOLD = 350
+# 有声帧多久内算「仍在发」；比看门狗轮询周期(5s)略宽即可。
+_DEAF_VOICED_WINDOW_SECONDS = 6.0
+# 连续无事件达到该时长先 WARNING + 落 provider_deaf 事件（可观测）。
+_DEAF_WARN_SECONDS = 20.0
+# 达到该时长主动断开 ws，借道既有断线重连路径自愈；重连全败走既有 fatal。
+# 留意：若服务端对排队音乐类声音本就长期不发事件，这里会形成周期性重连——
+# 代价是重连后的安抚语可能打破等待静默，但比整通「AI 已聋」可接受。
+_DEAF_RECONNECT_SECONDS = 45.0
+
 
 def _response_id(event: dict[str, Any]) -> str | None:
     raw_response = event.get("response")
@@ -59,6 +76,33 @@ def _reconnect_max() -> int:
     return config.get_int("OPENAI_RECONNECT_MAX")
 
 
+def _vad_silence_ms() -> int:
+    """server_vad 静默判停窗（注册表 OPENAI_VAD_SILENCE_MS，≤0 表示用服务端默认）。"""
+    return config.get_int("OPENAI_VAD_SILENCE_MS")
+
+
+def _vad_threshold() -> float:
+    """server_vad 能量阈值（注册表 OPENAI_VAD_THRESHOLD，≤0 表示用服务端默认）。"""
+    return config.get_float("OPENAI_VAD_THRESHOLD")
+
+
+def _noise_reduction() -> str:
+    """输入降噪模式（注册表 OPENAI_NOISE_REDUCTION，空=不启用）。"""
+    return config.get_str("OPENAI_NOISE_REDUCTION").strip()
+
+
+def _turn_detection_type() -> str:
+    """判停方式（注册表 OPENAI_TURN_DETECTION）。非法值回落 server_vad。"""
+    value = config.get_str("OPENAI_TURN_DETECTION").strip()
+    return value if value in ("server_vad", "semantic_vad") else "server_vad"
+
+
+def _vad_eagerness() -> str:
+    """semantic_vad 接话积极度（注册表 OPENAI_VAD_EAGERNESS）。非法值回落 auto。"""
+    value = config.get_str("OPENAI_VAD_EAGERNESS").strip()
+    return value if value in ("low", "medium", "high", "auto") else "auto"
+
+
 def _default_instructions() -> str:
     """无外部指令时的默认系统提示词（与 qwen_agent 的默认语义对齐）。"""
     weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
@@ -69,7 +113,8 @@ def _default_instructions() -> str:
         "之后用口语化、简洁的方式回答对方问题，每次回答控制在两三句话以内。"
         f"当前真实日期时间是 {now_str}，这是准确信息；对方询问日期、时间、"
         "今天几号或星期几时，必须以此为准回答，不要凭记忆猜测年份。"
-        "你可以调用工具帮用户完成实际操作：发送短信(send_sms，发给本人时号码留空)、"
+        "你可以调用工具帮用户完成实际操作：发送短信(send_sms，发给通话对方时号码留空、"
+        "发给机主时 to 填 owner)、"
         "挂断电话(hangup_call，挂断前先说一句告别语)、查询最近收到的短信验证码"
         "(query_verification_code)。需要时主动调用对应工具，操作完成后用一句话口头确认结果。"
     )
@@ -101,9 +146,26 @@ class OpenAIVoiceAgent(VoiceAgent):
             self._emit_audio_out,
             on_suppressed=self._nudge_after_repeat_suppressed,
             on_stuck=self._repeat_suppression_stuck,
+            # 复读已开播才被判定时清设备侧积压。与 barge-in 是同一个清积压
+            # 动作、不同语义——晚截是自己复读被掐，不是对端插话，走专用回调
+            # 以免被计进自激笔数（见 base.set_late_cut_handler）。
+            on_late_cut=self._emit_late_cut,
         )
         self._running = False
         self._handled_tool_calls: set[str] = set()
+        # 当前是否有回复轮次在生成（response.created→True / response.done→False）。
+        # barge-in 用：对端开口时仅在生成中才发 response.cancel，避免无回复时
+        # cancel 引来一条无谓的 error 事件。
+        self._response_active = False
+        # 最近一次 VAD 判停时刻（speech_stopped），用于逐轮响应延迟度量；
+        # 首个音频增量到达时消费并置回 None。
+        self._speech_stopped_at: float | None = None
+        # 失聪看门狗状态（WIL-122）：最近一次收到任何服务端事件 / 最近一次
+        # 发出「有声」上行帧的时刻；warned 防止同一段失聪期重复告警。
+        self._last_event_at: float | None = None
+        self._last_voiced_sent_at: float | None = None
+        self._deaf_warned = False
+        self._deaf_task: asyncio.Task | None = None
         self._instructions: str | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._manual_response_enabled = False
@@ -163,15 +225,44 @@ class OpenAIVoiceAgent(VoiceAgent):
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcm", "rate": self.input_rate},
-                    # 打断事件本轮忽略，半双工由 call_agent 统一管理。
+                    # 打断事件的消费见 _handle_event 的 speech_started 分支
+                    # （barge-in 模式），半双工模式下仍由 call_agent 统一管理。
                     "turn_detection": {
-                        "type": "server_vad",
+                        "type": _turn_detection_type(),
+                        # semantic_vad：按语义判断对方说完没有——「OK…」稍顿不抢，
+                        # 完整问句立刻接（server_vad 只看静音时长，两头顾不上）。
+                        **(
+                            {"eagerness": _vad_eagerness()}
+                            if _turn_detection_type() == "semantic_vad"
+                            else {
+                                # 电话场景收窄静默判停窗（OpenAI 默认 500ms），
+                                # 缩短「对方说完→AI 开口」；0/负值=服务端默认。
+                                **(
+                                    {"silence_duration_ms": _vad_silence_ms()}
+                                    if _vad_silence_ms() > 0
+                                    else {}
+                                ),
+                                # 能量阈值；0/负值=服务端默认。
+                                **(
+                                    {"threshold": _vad_threshold()}
+                                    if _vad_threshold() > 0
+                                    else {}
+                                ),
+                            }
+                        ),
                         **(
                             {"create_response": False}
                             if self._manual_response_enabled
                             else {}
                         ),
                     },
+                    # 喂给 VAD 与模型前先降噪；far_field 适合电话/远场拾音，
+                    # 与抬阈值同攻「判停拖尾」。空=不启用。
+                    **(
+                        {"noise_reduction": {"type": _noise_reduction()}}
+                        if _noise_reduction()
+                        else {}
+                    ),
                     "transcription": {"model": TRANSCRIPTION_MODEL},
                 },
                 "output": {
@@ -180,6 +271,15 @@ class OpenAIVoiceAgent(VoiceAgent):
                 },
             },
         }
+        max_tokens = config.get_int("OPENAI_MAX_RESPONSE_TOKENS")
+        if max_tokens > 0:
+            # 从源头限长，比本地丢下行更干净：转写与对端听到的一致，不会出现
+            # 「日志里说了 4 句、对端只听到 2 句」（WIL-112）。
+            # 字段名 max_output_tokens 是**实测**出来的：GA 会话结构下
+            # max_response_output_tokens / max_tokens / audio.output.max_output_tokens
+            # 都被服务端拒为 unknown_parameter（2026-08-12 连线逐个试过）。
+            session["max_output_tokens"] = max_tokens
+
         tool_specs = self._tool_specs()
         if tool_specs:
             session["tools"] = tool_specs
@@ -249,7 +349,9 @@ class OpenAIVoiceAgent(VoiceAgent):
         self._reset_manual_response_state()
         self._instructions = self._compose_instructions(self._session_instructions)
         await self._connect()
+        self._last_event_at = time.monotonic()
         self._recv_task = asyncio.create_task(self._recv_loop())
+        self._deaf_task = asyncio.create_task(self._deaf_watchdog())
 
     async def _reconnect(self) -> bool:
         """断线重连（参照 qwen_agent 语义）；全部失败返回 False。"""
@@ -285,6 +387,58 @@ class OpenAIVoiceAgent(VoiceAgent):
             return True
         return False
 
+    async def _deaf_watchdog(self) -> None:
+        """provider 失聪看门狗（WIL-122）：有声上行仍在发、服务端却持续零事件时
+        先告警落证据，超限主动断开 ws 借道既有重连路径自愈。
+
+        只在「_ws 非 None」时判定：重连窗口本身有专门日志，不重复掺和。
+        断开动作只 close 不重连——recv 循环收到 ConnectionClosed 后走统一的
+        重连/fatal 路径，避免两处重连逻辑竞态。
+        """
+        while self._running:
+            await asyncio.sleep(5.0)
+            if self._running:
+                await self._deaf_tick(time.monotonic())
+
+    async def _deaf_tick(self, now: float) -> None:
+        """看门狗单拍判定；从循环拆出便于单测（不含睡眠与运行态判断）。"""
+        if self._ws is None:
+            return
+        last_event = self._last_event_at
+        last_voiced = self._last_voiced_sent_at
+        if last_event is None or last_voiced is None:
+            return
+        if (now - last_voiced) >= _DEAF_VOICED_WINDOW_SECONDS:
+            return  # 近窗口没有声上行：安静等待，不算失聪
+        silent_for = now - last_event
+        if silent_for < _DEAF_WARN_SECONDS:
+            return
+        if not self._deaf_warned:
+            self._deaf_warned = True
+            logger.warning(
+                "provider 疑似失聪：有声上行仍在发，但已连续 %.0fs "
+                "未收到任何服务端事件",
+                silent_for,
+            )
+            # 借 latency 事件通道落盘（{stage, ms} 形状吻合），让
+            # events.jsonl 里留下失聪证据（WIL-95 归因惯例）。
+            self._emit_latency("provider_deaf", round(silent_for * 1000, 1))
+        if silent_for >= _DEAF_RECONNECT_SECONDS:
+            logger.error(
+                "provider 失聪 %.0fs，主动断开连接触发重连自愈", silent_for
+            )
+            self._emit_latency(
+                "provider_deaf_reconnect", round(silent_for * 1000, 1)
+            )
+            # 重置计时：close 到 recv 循环真正察觉有窗口，别重复 close。
+            self._last_event_at = now
+            ws = self._ws
+            if ws is not None:
+                try:
+                    await ws.close()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("失聪看门狗关闭连接异常: %s", exc)
+
     # ---- 收发 ----
 
     def _emit_audio_out(self, pcm: bytes) -> None:
@@ -304,6 +458,14 @@ class OpenAIVoiceAgent(VoiceAgent):
         except Exception as exc:  # noqa: BLE001
             # 连接刚死：丢弃本帧，重连由接收循环统一负责。
             logger.warning("发送音频失败，丢弃本帧: %s", exc)
+            return
+        # 失聪看门狗的「有声上行」时钟：只记有声帧，纯静默不喂时钟，
+        # 否则安静等待期会被误判成失聪。峰值扫描每帧几百样本，开销可忽略。
+        usable = len(pcm) - (len(pcm) % 2)
+        if usable:
+            samples = array("h", pcm[:usable])
+            if max(max(samples), -min(samples)) >= _DEAF_VOICED_PEAK_THRESHOLD:
+                self._last_voiced_sent_at = time.monotonic()
 
     async def say(self, instructions: str) -> None:
         ws = self._ws
@@ -578,6 +740,11 @@ class OpenAIVoiceAgent(VoiceAgent):
                 await ws.close()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("关闭 OpenAI 连接异常: %s", exc)
+        if self._deaf_task:
+            # 看门狗最长睡 5s 且醒来即见 _running=False 退出；直接取消最省事。
+            self._deaf_task.cancel()
+            await asyncio.gather(self._deaf_task, return_exceptions=True)
+            self._deaf_task = None
         if self._recv_task:
             # 有界等待：接收任务可能正阻塞在重连的 websockets.connect
             # （open_timeout × 重试次数可达 20s+），而 CallSession 收尾对
@@ -630,13 +797,35 @@ class OpenAIVoiceAgent(VoiceAgent):
 
     def _handle_event(self, event: dict) -> None:
         event_type = event.get("type", "")
+        # 任何服务端事件都喂失聪看门狗的时钟（含未识别类型）。
+        self._last_event_at = time.monotonic()
+        self._deaf_warned = False
         if event_type in ("response.audio.delta", "response.output_audio.delta"):
             # beta 与 GA 两代事件名的下行音频增量
             delta = event.get("delta", "")
             if delta:
+                # 逐轮响应延迟（WIL-104 度量）：VAD 判停（speech_stopped，已含
+                # 静默窗）→ 本轮首个音频增量到达。到对端耳朵还要加播出+蜂窝
+                # 链路 ~0.5s（固定，不在此计）。
+                if self._speech_stopped_at is not None:
+                    latency_ms = (time.monotonic() - self._speech_stopped_at) * 1000
+                    self._speech_stopped_at = None
+                    logger.info("轮次响应延迟(判停→首音频): %.0fms", latency_ms)
+                    # first_audio_delta_ms（2026-08-14 定义，WIL-95 2.2：语音到
+                    # 语音架构下 TTFT/TTFB 的唯一可观测合并量）→ 经回调落盘。
+                    self._emit_latency("first_audio_delta", round(latency_ms, 1))
                 self._audio_gate.push_audio(
                     _response_id(event), base64.b64decode(delta)
                 )
+        elif event_type == "input_audio_buffer.speech_stopped":
+            self._speech_stopped_at = time.monotonic()
+            # audio_end_ms 是 provider 认定的语音终点（其输入缓冲时间轴）。
+            # 与 speech_started 的 audio_start_ms 相减 = 它听到的语音时长，
+            # 拿来与本地录音对账，定位判停拖尾在哪一侧（WIL-112）。
+            logger.info(
+                "[timing] provider 判停 (speech_stopped, audio_end_ms=%s)",
+                event.get("audio_end_ms"),
+            )
         elif event_type == "conversation.item.input_audio_transcription.completed":
             transcript = (event.get("transcript") or "").strip()
             if transcript:
@@ -667,11 +856,25 @@ class OpenAIVoiceAgent(VoiceAgent):
                     self._dispatch_tool_call(name, call_id, arguments, self._ws)
                 )
         elif event_type == "response.created":
+            self._response_active = True
             self._on_response_created()
         elif event_type == "input_audio_buffer.speech_started":
-            # server_vad 的打断事件本轮忽略（半双工由 call_agent 管理）。
-            pass
+            # 与 call_agent 的「本地检测到语音起点」对表用（WIL-112 暗区定位）。
+            # audio_start_ms 是 provider 认定的语音起点在其输入缓冲时间轴上的
+            # 位置——与 speech_stopped 的 audio_end_ms 相减即它听到的语音时长。
+            logger.info(
+                "[timing] provider 判定开口 (speech_started, audio_start_ms=%s)",
+                event.get("audio_start_ms"),
+            )
+            # barge-in：对端在 AI 说话期间开口 → 先问 call_agent 接不接受这次
+            # 打断（DTMF 护窗期让位、自激兜底退回半双工时会拒绝，WIL-94 坑 1/4），
+            # 接受才掐当前生成；本地未播积压由回调自己清。未注册回调
+            # （半双工模式，BARGE_IN_ENABLED=false）时维持原行为：事件忽略。
+            if self._on_user_interrupt is not None:
+                if self._emit_user_interrupt() and self._response_active:
+                    asyncio.get_running_loop().create_task(self.cancel_response())
         elif event_type == "response.done":
+            self._response_active = False
             status = (event.get("response") or {}).get("status")
             if status in ("failed", "incomplete"):
                 # 轮次异常结束（内容审核/额度/服务端错误）：连接还活着，
@@ -679,10 +882,23 @@ class OpenAIVoiceAgent(VoiceAgent):
                 logger.error("OpenAI 回复轮次异常结束: %s", event.get("response"))
             else:
                 self._audio_gate.complete_response(_response_id(event))
-                logger.debug("OpenAI 回复轮次完成")
+                # INFO 而非 debug（WIL-122）：真机排查「通着但沉默」时，响应
+                # 轮次是否正常收尾是关键证据，debug 级在现场日志里看不见。
+                logger.info("OpenAI 回复轮次完成 (status=%s)", status)
             self._on_response_done()
         elif event_type == "error":
-            logger.error("OpenAI Realtime 错误: %s", event)
+            code = (event.get("error") or {}).get("code")
+            if code == "response_cancel_not_active":
+                # barge-in 的 cancel 与 response.done 的固有竞态：response.created
+                # 后我们置 _response_active，但服务端可能在 cancel 送达前已生成完。
+                # 无副作用，降级为 info 免得像故障。
+                logger.info("response.cancel 晚到（响应已自然结束），忽略")
+            else:
+                logger.error("OpenAI Realtime 错误: %s", event)
+        else:
+            # 未识别的事件类型不再完全静默（WIL-122）：若服务端引入新形态的
+            # 会话级错误/状态事件，至少 debug 级留痕可查。
+            logger.debug("未处理的 OpenAI 事件类型: %s", event_type)
 
     async def _dispatch_tool_call(
         self, name: str, call_id: str, arguments: str, ws: Any

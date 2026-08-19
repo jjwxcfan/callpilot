@@ -9,6 +9,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable
 
+from .. import config
+
 logger = logging.getLogger(__name__)
 
 ToolHandler = Callable[[dict[str, Any]], dict[str, Any]]
@@ -23,13 +25,19 @@ SEND_SMS_SPEC: dict[str, Any] = {
             "给指定手机号发送一条短信，支持中文。当用户在通话中要求发短信时调用本工具，"
             "例如“给我发一条短信”“给这个号码发条广告”。若用户说发给他本人/发到当前号码，"
             "可以把 to 留空，系统会自动使用当前通话对方的号码。"
+            "若这条短信是把通话里的事转达给不在通话中的人（例如来电者请你给机主留言），"
+            "正文要写成收信人只看这条短信就够用：先写清对方是谁（通话里说到的姓名、"
+            "单位或身份；对方没说就如实写没留姓名），再写要转达什么事。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "to": {
                     "type": "string",
-                    "description": "收件手机号码；若指当前通话对方本人则可留空。",
+                    "description": (
+                        "收件手机号码；若指当前通话对方本人则可留空；"
+                        "要发给机主本人时填 owner，系统会用机主配置的号码。"
+                    ),
                 },
                 "content": {
                     "type": "string",
@@ -95,6 +103,49 @@ QUERY_CODE_SPEC: dict[str, Any] = {
 }
 
 
+WAIT_SMS_SPEC: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "wait_for_sms",
+        "description": (
+            "等待一条**新**短信到达并返回内容（最多等约一分钟）。适用于刚请求"
+            "对方发送验证码/确认短信、短信还没到的场景——与 query_verification_code"
+            "（查已收到的历史短信）互补。返回短信全文、发件号码，以及其中的数字"
+            "验证码（若能识别）。等待期间你不能说话，所以调用前先对对方说一句"
+            "「稍等，我看一下短信」。"
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+
+ASK_OWNER_SPEC: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "ask_owner",
+        "description": (
+            "把一个需要机主拿主意的决定推送给机主确认，等机主答复（约一分钟）。"
+            "仅在对方给出的方案/报价超出你被授权的范围、或事情确实必须机主本人"
+            "决定时调用；调用前先对通话对方说明「稍等，我跟机主确认一下」。"
+            "question 里把要决定的事说完整（方案内容、价格、期限等关键数字），"
+            "机主看到的就是这段文字。返回机主的决定：approved（同意）、"
+            "declined（不同意）或 timeout（没回应——按不同意处理，并请对方"
+            "把方案记录在案以便后续跟进）。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "要机主决定的事项，含关键数字与条款，一段话说完整。",
+                }
+            },
+            "required": ["question"],
+        },
+    },
+}
+
+
 REQUEST_OWNER_TAKEOVER_SPEC: dict[str, Any] = {
     "type": "function",
     "function": {
@@ -119,6 +170,8 @@ TERMINAL_TOOLS: frozenset[str] = frozenset({"hangup_call"})
 SILENT_AFTER_TOOLS: frozenset[str] = frozenset(
     {"send_dtmf", "request_owner_takeover"}
 )
+# ask_owner 不进 SILENT_AFTER_TOOLS：拿到机主决定后模型要立刻把结果转达给
+# 通话对方（接受报价/婉拒），沉默反而失礼。
 _DTMF_LOG_MODES: frozenset[str] = frozenset(
     {"inband", "qvts", "both", "unknown"}
 )
@@ -141,6 +194,88 @@ def _dtmf_log_mode(result: dict[str, Any]) -> str:
     return mode if isinstance(mode, str) and mode in _DTMF_LOG_MODES else "unknown"
 
 
+# ---- 工具描述本地化 ----
+# 规格里的中文描述会**随 session 一起发给模型**；英文场景下模型看到满屏中文
+# 会跟着说中文（真机 2026-08-12：机主配置 AGENT_LANGUAGE=en、对端全程说英文，
+# AI 却用中文开口）。这里在注册时按语言替换，不改动既有规格结构。
+_EN_TEXT: dict[tuple[str, str | None], str] = {
+    ("send_sms", None): (
+        "Send an SMS on the owner's behalf. Use it when the caller asks for "
+        "something in writing, or to pass a message along. When the message "
+        "relays something from this call to someone who is not on it (e.g. the "
+        "caller asks you to leave a message for the owner), write the body so "
+        "the recipient needs nothing else: start with who is calling (the name, "
+        "company, or role given during the call — say plainly that they gave no "
+        "name if they didn't), then what they want passed on."
+    ),
+    ("send_sms", "to"): (
+        "Recipient phone number; leave empty to text the current caller; "
+        "pass \"owner\" to text the owner (the system fills in the owner's "
+        "configured number)."
+    ),
+    ("send_sms", "content"): "Message body.",
+    ("hangup_call", None): (
+        "End the call. Say a short goodbye line before calling this."
+    ),
+    ("send_dtmf", None): (
+        "Send DTMF keypad tones, for navigating phone menus."
+    ),
+    ("send_dtmf", "digits"): "Key sequence to send; only 0-9, * and # are allowed.",
+    ("query_verification_code", None): (
+        "Look up the most recently received SMS verification code."
+    ),
+    ("request_owner_takeover", None): (
+        "Hand the live call over to the owner's phone."
+    ),
+    ("ask_owner", None): (
+        "Push a decision to the owner and wait (about a minute) for their "
+        "answer. Call it only when an offer or decision exceeds what you are "
+        "authorized to accept, or truly needs the owner personally; tell the "
+        "other party \"one moment, let me check with the account holder\" "
+        "BEFORE calling. Put the full decision in `question` (plan, price, "
+        "term — the key numbers); that text is exactly what the owner sees. "
+        "Returns the owner's decision: approved, declined, or timeout (treat "
+        "timeout as declined and ask the rep to note the offer on the account "
+        "for follow-up)."
+    ),
+    ("ask_owner", "question"): (
+        "The decision for the owner, complete in one passage with the key "
+        "numbers and terms."
+    ),
+    ("wait_for_sms", None): (
+        "Wait for a NEW incoming SMS and return it (up to about a minute). Use "
+        "when a verification/confirmation text was just requested and has not "
+        "arrived yet — complements query_verification_code, which searches "
+        "already-received messages. Returns the full text, the sender, and the "
+        "numeric code if one can be recognized. You cannot speak while "
+        "waiting, so tell the other party \"one moment, let me check the "
+        "text\" before calling."
+    ),
+}
+
+
+def localize_spec(spec: dict[str, Any]) -> dict[str, Any]:
+    """按 AGENT_LANGUAGE 本地化工具描述；非英文原样返回（不复制、零开销）。"""
+    if config.get_str("AGENT_LANGUAGE").strip().lower() != "en":
+        return spec
+    name = _tool_name(spec)
+    if not name:
+        return spec
+    fn = dict(spec.get("function", {}))
+    top = _EN_TEXT.get((name, None))
+    if top:
+        fn["description"] = top
+    params = fn.get("parameters") or {}
+    props = params.get("properties") or {}
+    if props:
+        new_props = {}
+        for key, schema in props.items():
+            text = _EN_TEXT.get((name, key))
+            new_props[key] = {**schema, "description": text} if text else schema
+        fn["parameters"] = {**params, "properties": new_props}
+    return {**spec, "function": fn}
+
+
 class ToolRegistry:
     """工具注册表：保存规格与对应处理函数，供 Agent 调用。"""
 
@@ -151,7 +286,7 @@ class ToolRegistry:
         name = _tool_name(spec)
         if not name:
             raise ValueError("工具规格缺少 name")
-        self._tools[name] = (spec, handler)
+        self._tools[name] = (localize_spec(spec), handler)
 
     def specs(self) -> list[dict[str, Any]]:
         return [spec for spec, _ in self._tools.values()]

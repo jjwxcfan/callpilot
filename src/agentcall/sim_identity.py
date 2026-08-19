@@ -42,10 +42,29 @@ _SERVICE_NUMBERS: dict[str, str] = {
     "中国广电": "10099",
 }
 
-# 可作为人工覆盖值的合法客服号 = 上表的全部取值。限定在这个集合里，是因为
+# 国家级兜底：MCC → (展示用运营商名, 免费客服号)。仅用于 PLMN 精确表未命中时。
+#
+# 为什么按 MCC 而不是逐家 MNC（WIL-133）：611 是 NANP 定义的**全国通用**运营商
+# 客服短码，AT&T / Verizon / T-Mobile 乃至各家 MVNO 都拨得通。逐家列 MNC 反而
+# 更差——MVNO 会漏、并购一发生就漂移，而漏一个就等于误拨保护对那张卡失效。
+# 安全相关的字段（号码）给精确值，展示字段（运营商名）诚实到国家粒度即可。
+#
+# 另注：美国 MNC 是 3 位（如 AT&T 310-410），而 plmn 取的是 imsi[:5]，切出来是
+# MCC+MNC 前两位，本来就对不齐——这也是必须按 MCC 兜底的原因。
+_MCC_FALLBACK: dict[str, tuple[str, str]] = {
+    "310": ("美国运营商", "611"),
+    "311": ("美国运营商", "611"),
+    "312": ("美国运营商", "611"),
+    "313": ("美国运营商", "611"),
+    "316": ("美国运营商", "611"),
+}
+
+# 可作为人工覆盖值的合法客服号 = 上面两张表的全部取值。限定在这个集合里，是因为
 # 误填会让保护**反向失效**：移动卡误填 10010 时，本卡免费的 10086 被拦、而对
 # 移动收费的 10010 反而放行（Codex 评审 P1 复现）。
-VALID_SERVICE_NUMBERS: frozenset[str] = frozenset(_SERVICE_NUMBERS.values())
+VALID_SERVICE_NUMBERS: frozenset[str] = frozenset(_SERVICE_NUMBERS.values()) | {
+    number for _carrier, number in _MCC_FALLBACK.values()
+}
 
 _IMSI_RE = re.compile(r"\b(\d{14,15})\b")
 _CREG_RE = re.compile(r"\+CREG:\s*(?:\d+\s*,\s*)?(\d+)(?:\s|$)")
@@ -114,13 +133,19 @@ def identify(imsi_raw: str, creg_raw: str = "") -> SimIdentity:
             registered=registered, reg_status=reg_status,
         )
     plmn = imsi[:5]
-    carrier = _PLMN_CARRIERS.get(plmn, "未知")
+    carrier = _PLMN_CARRIERS.get(plmn)
+    service_number = _SERVICE_NUMBERS.get(carrier or "", "")
+    if carrier is None:
+        # 精确表未命中再退到国家粒度（WIL-133）。不这么做的话，非大陆卡的
+        # service_number 恒为空，dial_guard 的误拨保护会整个失效——而跨运营商
+        # 客服号按普通通话计费，从美国卡拨 10086 更是国际长途。
+        carrier, service_number = _MCC_FALLBACK.get(imsi[:3], ("未知", ""))
     registered, reg_status = parse_creg(creg_raw)
     return SimIdentity(
         present=True,
         plmn=plmn,
         carrier=carrier,
-        service_number=_SERVICE_NUMBERS.get(carrier, ""),
+        service_number=service_number,
         registered=registered,
         reg_status=reg_status,
     )
