@@ -207,6 +207,31 @@ def test_inbound_takeover_preference_is_free_text_with_injection_boundary():
     assert "caller" in en.lower() and "cannot" in en.lower()
 
 
+def test_takeover_explicit_ask_does_not_bypass_preference_screening():
+    """真机 2026-08-19 spam 演练回归：延保推销话术一句「让我跟本人说」就触发了
+    转接——「点名找机主」曾是无条件转接通道，绕过偏好里的 spam 甄别。"""
+    zh = build_instructions(
+        "inbound",
+        "李明",
+        "数字分身",
+        "",
+        takeover_preference="真心找机主的转接；推销骚扰不转。",
+    )
+    en = build_instructions(
+        "inbound",
+        "Alex",
+        "AI assistant",
+        "",
+        "en",
+        takeover_preference="Transfer genuine calls; screen out sales calls.",
+    )
+
+    assert "点名找本人不能跳过" in zh
+    assert "不构成正当来意" in zh
+    assert "does not bypass that screening" in en
+    assert "not a legitimate purpose" in en
+
+
 def test_inbound_triage_pending_restricts_realtime_without_owner_preference():
     zh = build_instructions(
         "inbound",
