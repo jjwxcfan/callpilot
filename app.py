@@ -15,7 +15,6 @@ import threading
 import webbrowser
 
 from aiohttp import web
-from dotenv import load_dotenv
 
 from agentcall import call_playbooks, config, number_profiles
 from agentcall.call_agent import CallAgentService
@@ -52,6 +51,14 @@ def _restart_after_cleanup() -> None:
         if os.environ.get("XPC_SERVICE_NAME") == APP_LABEL:
             logging.getLogger("app").info("清理完成，退出并交由 launchd 重新启动服务…")
             return
+    # exec 子进程继承 os.environ，会遮蔽手工编辑过的 .env（load_dotenv 不覆盖
+    # 已存在变量）——先清掉 .env 来源的变量，让子进程重新从文件取值。
+    cleared = config.clear_dotenv_environ()
+    if cleared:
+        logging.getLogger("app").info(
+            "exec 重启前清理 .env 来源环境变量（子进程将重读 .env）: %s",
+            ", ".join(cleared),
+        )
     argv = (
         [sys.executable, *sys.argv[1:]]
         if config._is_frozen()
@@ -120,7 +127,7 @@ def _enable_thread_dump() -> None:
 
 
 def main() -> None:
-    load_dotenv(config.env_file_path())
+    config.load_env_file()
     _force_utf8()
 
     log_dir = config.log_dir()
