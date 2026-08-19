@@ -995,3 +995,78 @@ def test_dtmf_tone_numeric_ranges_rejected_on_write(tmp_path):
     assert set(updated) == {"DTMF_TONE_MS", "DTMF_TONE_AMPLITUDE"}
     os.environ.pop("DTMF_TONE_MS", None)
     os.environ.pop("DTMF_TONE_AMPLITUDE", None)
+
+
+# ---- .env 重载（/api/restart 原地 exec 回归）----
+
+
+def test_clear_dotenv_environ_unshadows_manual_env_edit(tmp_path, monkeypatch):
+    """回归（2026-08-19 实测）：手工改 .env 后 /api/restart，新值被继承的旧
+    环境变量遮蔽（load_dotenv 默认 override=False）——exec 前清理后应生效。"""
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "REMOTE_CLOUD_URL=https://old.example.workers.dev\n", encoding="utf-8"
+    )
+    _unset(monkeypatch, "REMOTE_CLOUD_URL")
+    monkeypatch.setattr(config, "_DOTENV_KEYS_AT_LOAD", frozenset())
+
+    config.load_env_file(env_file)
+    assert os.environ["REMOTE_CLOUD_URL"] == "https://old.example.workers.dev"
+
+    # 手工编辑 .env（不经 update_env_file，不会同步 os.environ）
+    env_file.write_text(
+        "REMOTE_CLOUD_URL=https://new.example.workers.dev\n", encoding="utf-8"
+    )
+
+    cleared = config.clear_dotenv_environ(env_file)
+    assert "REMOTE_CLOUD_URL" in cleared
+    assert "REMOTE_CLOUD_URL" not in os.environ
+
+    config.load_env_file(env_file)  # exec 后子进程的启动动作
+    assert os.environ["REMOTE_CLOUD_URL"] == "https://new.example.workers.dev"
+
+
+def test_clear_dotenv_environ_covers_keys_deleted_from_env_file(tmp_path, monkeypatch):
+    """手工从 .env 删掉整行后重启，应回落注册表默认值而非保留旧环境变量。"""
+    env_file = tmp_path / ".env"
+    env_file.write_text("AGENT_LANGUAGE=en\n", encoding="utf-8")
+    _unset(monkeypatch, "AGENT_LANGUAGE")
+    monkeypatch.setattr(config, "_DOTENV_KEYS_AT_LOAD", frozenset())
+
+    config.load_env_file(env_file)
+    env_file.write_text("", encoding="utf-8")
+
+    cleared = config.clear_dotenv_environ(env_file)
+    assert "AGENT_LANGUAGE" in cleared
+    assert "AGENT_LANGUAGE" not in os.environ
+
+
+def test_clear_dotenv_environ_keeps_shell_exported_vars(tmp_path, monkeypatch):
+    """只经 shell 显式导出、从未写进 .env 的变量不受清理影响。"""
+    env_file = tmp_path / ".env"
+    env_file.write_text("AGENT_LANGUAGE=en\n", encoding="utf-8")
+    _unset(monkeypatch, "AGENT_LANGUAGE")
+    monkeypatch.setenv("SHELL_ONLY_VAR", "from-shell")
+    monkeypatch.setattr(config, "_DOTENV_KEYS_AT_LOAD", frozenset())
+
+    config.load_env_file(env_file)
+    cleared = config.clear_dotenv_environ(env_file)
+
+    assert "SHELL_ONLY_VAR" not in cleared
+    assert os.environ["SHELL_ONLY_VAR"] == "from-shell"
+
+
+def test_clear_dotenv_environ_ignores_bare_name_lines(tmp_path, monkeypatch):
+    """.env 里的裸名行（无 =，dotenv 值为 None）不算 .env 来源：
+    同名的纯 shell 导出变量不能被误清。"""
+    env_file = tmp_path / ".env"
+    env_file.write_text("SHELL_ONLY_VAR\nAGENT_LANGUAGE=en\n", encoding="utf-8")
+    _unset(monkeypatch, "AGENT_LANGUAGE")
+    monkeypatch.setenv("SHELL_ONLY_VAR", "from-shell")
+    monkeypatch.setattr(config, "_DOTENV_KEYS_AT_LOAD", frozenset())
+
+    config.load_env_file(env_file)
+    cleared = config.clear_dotenv_environ(env_file)
+
+    assert cleared == ["AGENT_LANGUAGE"]
+    assert os.environ["SHELL_ONLY_VAR"] == "from-shell"

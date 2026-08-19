@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from dotenv import dotenv_values, load_dotenv
+
 from . import platforms
 
 logger = logging.getLogger(__name__)
@@ -88,6 +90,51 @@ def call_log_dir() -> Path:
     if override:
         return Path(override).expanduser()
     return data_dir() / "recordings"
+
+
+# load_env_file 记录加载当时 .env 里出现的 key，供 clear_dotenv_environ 在
+# 原地 exec 重启前一并清理（覆盖此后被手工删掉的行）。
+_DOTENV_KEYS_AT_LOAD: frozenset[str] = frozenset()
+
+
+def _dotenv_assigned_keys(path: Path) -> frozenset[str]:
+    """.env 里真正赋了值的 key。裸名行（无 ``=``）在 dotenv_values 里值为
+    None、load_dotenv 也不会写进环境——不算 .env 来源，不进清理范围。"""
+    return frozenset(
+        key for key, value in dotenv_values(path).items() if value is not None
+    )
+
+
+def load_env_file(env_path: str | Path | None = None) -> None:
+    """读取 .env 进程环境并记录文件内的 key。
+
+    沿用 python-dotenv 默认语义（override=False）：shell 显式导出、launchd
+    plist 注入的变量优先级高于 .env。因此原地 exec 重启前必须先经
+    ``clear_dotenv_environ`` 清掉继承自父进程的 .env 来源变量，否则手工编辑
+    .env 修改「已存在」的配置项后重启不生效。
+    """
+    global _DOTENV_KEYS_AT_LOAD
+    path = Path(env_path) if env_path is not None else env_file_path()
+    _DOTENV_KEYS_AT_LOAD = _dotenv_assigned_keys(path)
+    load_dotenv(path)
+
+
+def clear_dotenv_environ(env_path: str | Path | None = None) -> list[str]:
+    """从 ``os.environ`` 清掉来自 .env 的变量；返回清掉的 key（已排序）。
+
+    web 面板 /api/restart 的手动运行路径靠原地 exec 重启，子进程继承
+    ``os.environ``，而 ``load_dotenv`` 默认不覆盖已存在变量——手工编辑 .env
+    后重启，新值被继承的旧值遮蔽（2026-08-19 实测：改 REMOTE_CLOUD_URL 后
+    Edge 仍连旧云端）。exec 前调用本函数，让子进程重新从 .env 取值。
+
+    清理范围 = 启动时 .env 里的 key ∪ 当前 .env 里的 key：手工删掉的行同样
+    回落注册表默认值；只经 shell 导出、从未写进 .env 的变量不动。launchd
+    路径无需清理——KeepAlive 全新拉起，环境来自 plist，不继承旧进程。
+    """
+    path = Path(env_path) if env_path is not None else env_file_path()
+    stale = _DOTENV_KEYS_AT_LOAD | _dotenv_assigned_keys(path)
+    cleared = [key for key in stale if os.environ.pop(key, None) is not None]
+    return sorted(cleared)
 
 
 @dataclass(frozen=True)
@@ -1009,6 +1056,7 @@ __all__ = [
     "any_provider_credentials_ready",
     "app_support_dir",
     "call_log_dir",
+    "clear_dotenv_environ",
     "complete_setup",
     "credential_status",
     "data_dir",
@@ -1018,6 +1066,7 @@ __all__ = [
     "get_int",
     "get_spec",
     "get_str",
+    "load_env_file",
     "log_dir",
     "read_panel_values",
     "runtime_meta",

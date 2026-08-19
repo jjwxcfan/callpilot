@@ -72,6 +72,7 @@ def test_restart_after_cleanup_execs_manual_process_without_duplicate_argv0(monk
     monkeypatch.setattr(app.sys, "platform", "darwin")
     monkeypatch.delenv("XPC_SERVICE_NAME", raising=False)
     monkeypatch.setattr(app.config, "_is_frozen", lambda: True)
+    monkeypatch.setattr(app.config, "clear_dotenv_environ", lambda: [])
     monkeypatch.setattr(app.sys, "executable", "/tmp/CallPilot")
     monkeypatch.setattr(app.sys, "argv", ["/tmp/CallPilot", "--service"])
     monkeypatch.setattr(app.os, "execv", lambda path, argv: calls.append((path, argv)))
@@ -85,6 +86,7 @@ def test_restart_after_cleanup_preserves_script_for_source_mode(monkeypatch):
     calls = []
     monkeypatch.setattr(app.sys, "platform", "linux")
     monkeypatch.setattr(app.config, "_is_frozen", lambda: False)
+    monkeypatch.setattr(app.config, "clear_dotenv_environ", lambda: [])
     monkeypatch.setattr(app.sys, "executable", "/tmp/python")
     monkeypatch.setattr(app.sys, "argv", ["/repo/app.py", "--service"])
     monkeypatch.setattr(app.os, "execv", lambda path, argv: calls.append((path, argv)))
@@ -92,6 +94,38 @@ def test_restart_after_cleanup_preserves_script_for_source_mode(monkeypatch):
     app._restart_after_cleanup()
 
     assert calls == [("/tmp/python", ["/tmp/python", "/repo/app.py", "--service"])]
+
+
+def test_restart_after_cleanup_clears_dotenv_environ_before_exec(monkeypatch):
+    """回归：exec 前必须清 .env 来源变量，否则手工编辑 .env 后重启不生效。"""
+    order = []
+    monkeypatch.setattr(app.sys, "platform", "linux")
+    monkeypatch.setattr(app.config, "_is_frozen", lambda: False)
+    monkeypatch.setattr(
+        app.config,
+        "clear_dotenv_environ",
+        lambda: order.append("clear") or ["REMOTE_CLOUD_URL"],
+    )
+    monkeypatch.setattr(app.os, "execv", lambda path, argv: order.append("exec"))
+
+    app._restart_after_cleanup()
+
+    assert order == ["clear", "exec"]
+
+
+def test_restart_after_cleanup_launchd_path_skips_dotenv_clear(monkeypatch):
+    """launchd 由 KeepAlive 全新拉起（环境来自 plist），无继承问题，不清理。"""
+    calls = []
+    monkeypatch.setattr(app.sys, "platform", "darwin")
+    monkeypatch.setenv("XPC_SERVICE_NAME", "com.agentcall.app")
+    monkeypatch.setattr(
+        app.config, "clear_dotenv_environ", lambda: calls.append("clear") or []
+    )
+    monkeypatch.setattr(app.os, "execv", lambda *args: calls.append("exec"))
+
+    app._restart_after_cleanup()
+
+    assert calls == []
 
 
 def test_invalid_optional_cloud_url_does_not_crash_core_app(monkeypatch, caplog):
