@@ -230,6 +230,17 @@ def test_takeover_explicit_ask_does_not_bypass_preference_screening():
     assert "不构成正当来意" in zh
     assert "does not bypass that screening" in en
     assert "not a legitimate purpose" in en
+    # 旧的无条件通道措辞不得回潮（「明确要求找机主本人，或…」= 独立充分条件）
+    assert "明确要求找机主本人，或" not in zh
+    assert "explicitly asks for the owner, or" not in en
+
+    # 工具描述与系统提示必须同源：转不转只归接管规则判断，工具描述不得另立
+    # 「点名即转」触发条件（真机 2026-08-19 spam 演练里两处指令打架的教训）。
+    from agentcall.agents.tools import REQUEST_OWNER_TAKEOVER_SPEC
+
+    tool_desc = REQUEST_OWNER_TAKEOVER_SPEC["function"]["description"]
+    assert "真人接管规则" in tool_desc
+    assert "明确要求找机主本人" not in tool_desc
 
 
 def test_inbound_triage_pending_restricts_realtime_without_owner_preference():
