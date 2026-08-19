@@ -360,9 +360,13 @@ def merge_learned(
 _LEARNER_SYSTEM = """You maintain a per-hotline knowledge base for an AI phone agent.
 Given a call transcript, the hotline's current known requirements, and the list of
 verification KEYS the caller already had, identify ONLY:
-1. new_required_info: identity/verification items the remote side demanded that are
-   NOT in the known keys (e.g. account PIN, ZIP code, account number). Use short
-   snake_case keys. NEVER include actual values or digits — describe the field only.
+1. new_required_info: identity/verification items the remote side EXPLICITLY DEMANDED
+   the caller provide during THIS call as a prerequisite to proceed (e.g. "please say
+   or enter your PIN"), that are NOT in the known keys. A demand means the call could
+   not move forward without it. Do NOT include anything merely mentioned in
+   announcements, marketing, or website/app-login instructions ("your user ID and
+   password are unchanged" is an ad, not a demand). Use short snake_case keys.
+   NEVER include actual values or digits — describe the field only.
 2. ivr_notes_update: one short factual note about how this hotline's IVR flow works,
    ONLY if the transcript reveals something not already in the current notes
    (menu behavior, transfer path, verification order). Otherwise null.
