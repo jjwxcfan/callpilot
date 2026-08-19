@@ -427,3 +427,11 @@ def test_learn_from_call_privacy_rejection_is_swallowed(tmp_path, monkeypatch):
         )
         is None
     )
+
+
+def test_learner_system_prompt_is_demand_gated():
+    """真机教训（2026-08-18 测试2）：IVR 广告词"user ID and password unchanged"
+    被 learner 当成必备信息写库。规则必须是"仅限本通被明确索要"。"""
+    s = call_playbooks._LEARNER_SYSTEM
+    assert "EXPLICITLY DEMANDED" in s
+    assert "announcements, marketing" in s
