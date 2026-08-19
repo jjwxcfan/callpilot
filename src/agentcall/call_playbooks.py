@@ -20,9 +20,13 @@ number_profiles 的 ``task_package.verification``（WIL-95 §7：值只进模型
         ...
       ],
       "ivr_notes": {"zh": ..., "en": ...},
+      "use_cases": [{"label": {...}, "notes": {...}}, ...],
       "updated": "2026-08-18",
       "source": {"zh": ..., "en": ...}
     }
+
+``use_cases`` 是该热线常见办理事项的知识（自助 vs 转人工、费用、部门路由），
+P1 只存储与 API 暴露，P2 由建单/intake 消费。
 
 ``required_info[].key`` 与 number_profiles ``task_package.verification`` 的键
 对齐：拨前拦截即"该热线要的 key，预设的 verification 里有没有"。

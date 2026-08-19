@@ -21,7 +21,7 @@ from agentcall.call_playbooks import (
 SEED = Path(__file__).resolve().parents[2] / "data" / "call_playbooks.example.json"
 
 # 种子只允许公共客服热线；新增条目必须同步维护这份白名单。
-_ALLOWED_SEED_NUMBERS = {"611", "8003310500", "8009346489"}
+_ALLOWED_SEED_NUMBERS = {"611", "8009019878", "8003310500", "8009346489"}
 
 
 def write_playbooks(path: Path, playbooks: list) -> None:
@@ -74,6 +74,11 @@ def test_seed_file_is_valid_and_bilingual():
             assert re.fullmatch(r"[a-z0-9_]{1,40}", entry["key"])
             assert entry["label"].get("zh") and entry["label"].get("en")
             assert entry["purpose"].get("zh") and entry["purpose"].get("en")
+        # use_cases：常见办理事项知识（建单/intake 消费），双语齐备
+        assert p["use_cases"], p["id"]
+        for case in p["use_cases"]:
+            assert case["label"].get("zh") and case["label"].get("en")
+            assert case["notes"].get("zh") and case["notes"].get("en")
 
 
 def test_seed_file_contains_no_value_like_digits():
