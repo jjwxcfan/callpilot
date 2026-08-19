@@ -96,6 +96,8 @@
     background: rgba(5, 8, 14, .66); backdrop-filter: blur(6px);
   }
   .confirm-overlay.show { display: flex; }
+  .cc-number { font: 600 22px/1.5 ui-monospace, monospace; letter-spacing: .06em;
+    text-align: center; margin: 10px 0 4px; word-break: break-all; }
   .confirm-card {
     width: min(92vw, 460px); border-radius: 20px; padding: 22px;
     background: var(--surface-strong); border: 1px solid var(--border-strong);
@@ -1482,6 +1484,10 @@ const I18N = {
     intake_saved: "Saved to the task library.",
     intake_save_fail: "Save failed: ",
     intake_dial_now: "Save & dial", intake_save_only: "Save as preset",
+    dial_confirm_title: "Confirm the number",
+    dial_confirm_ask: "Dial this number now?",
+    dial_confirm_yes: "Dial", dial_confirm_no: "Cancel",
+    dial_confirm_note: "This number was proposed by the AI. Check it before dialling.",
     intake_dr_number: "Number", intake_dr_task: "Task",
     intake_dr_verification: "Verification facts", intake_dr_negotiation: "Negotiation brief",
     intake_dr_preauth: "Authorized range", intake_dr_blacklist: "Never agree to",
@@ -1746,6 +1752,10 @@ const I18N = {
     intake_saved: "已存入任务库。",
     intake_save_fail: "保存失败：",
     intake_dial_now: "保存并拨打", intake_save_only: "仅存为预设",
+    dial_confirm_title: "核对号码",
+    dial_confirm_ask: "现在就拨这个号码吗？",
+    dial_confirm_yes: "拨打", dial_confirm_no: "取消",
+    dial_confirm_note: "该号码由 AI 提出，拨号前请先核对。",
     intake_dr_number: "号码", intake_dr_task: "任务",
     intake_dr_verification: "核身信息", intake_dr_negotiation: "谈判要点",
     intake_dr_preauth: "授权范围", intake_dr_blacklist: "绝不同意",
@@ -2228,6 +2238,28 @@ async function intakeSend(input, log, draftBox, actions) {
   intakeRenderLog(log); intakeRenderDraft(draftBox);
 }
 
+/* 拨号前二次确认（WIL-130）：号码来自模型，逐位显示、由机主确认后才真拨。
+   刻意不用原生 confirm()——它不换行、长号码会被截断，且无法把数字拆开显示。 */
+function confirmIntakeDial(number, onConfirm) {
+  const overlay = el("div", "confirm-overlay show");
+  const card = el("div", "confirm-card");
+  card.appendChild(el("h3", null, t("dial_confirm_title")));
+  // 逐位分隔：连读一串数字最容易看漏一位，而看漏一位就是拨错人。
+  card.appendChild(el("div", "cc-number", String(number).split("").join(" ")));
+  card.appendChild(el("div", "cc-question", t("dial_confirm_ask")));
+  const acts = el("div", "cc-acts");
+  const yes = el("button", "btn primary", t("dial_confirm_yes"));
+  yes.addEventListener("click", () => { overlay.remove(); onConfirm(); });
+  const no = el("button", "btn ghost", t("dial_confirm_no"));
+  no.addEventListener("click", () => overlay.remove());
+  acts.appendChild(yes); acts.appendChild(no);
+  card.appendChild(acts);
+  card.appendChild(el("div", "cc-note", t("dial_confirm_note")));
+  overlay.appendChild(card);
+  document.body.appendChild(overlay);
+  yes.focus();
+}
+
 async function intakeSaveAndDial(dialAfter) {
   if (!intakeDraft) return;
   const d = intakeDraft;
@@ -2248,7 +2280,9 @@ async function intakeSaveAndDial(dialAfter) {
       $("dialTask").value = d.task;
       dialPresetId = res.profile.id; dialPresetHint = d.task;
       if (typeof syncDialPresetDelete === "function") syncDialPresetDelete();
-      doDial();
+      // 不直落 doDial()：这个号码是**模型产出**的，硬约束要求「拨号前核对屏幕
+      // 号码」，一键直拨等于绕过它。逐位显示后由机主再点一次（WIL-130）。
+      confirmIntakeDial(d.number, doDial);
     } else {
       setToast("dialToast", "ok", t("intake_saved"));
     }

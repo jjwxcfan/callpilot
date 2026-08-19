@@ -283,3 +283,18 @@ def test_dashboard_has_pairing_device_list_revoke_and_legacy_invite_fallback():
     assert 'fetch("/api/remote_dialer/devices"' in text
     assert 'method: "DELETE"' in text
     assert '"/api/remote_dialer/devices/" + encodeURIComponent(deviceId)' in text
+
+
+def test_intake_dial_goes_through_a_confirmation_step():
+    """模型给的号码不得一键直拨（WIL-130）。
+
+    硬约束要求「拨号前核对屏幕号码」；建单流程里号码由模型产出，直落
+    doDial() 等于绕过这条。删掉确认环节本测试必须变红。
+    """
+    text = INDEX.read_text(encoding="utf-8")
+    assert "function confirmIntakeDial(" in text, "确认弹窗被删了"
+    assert "confirmIntakeDial(d.number, doDial)" in text, "建单拨号未走确认"
+    # 逐位分隔展示：连读一串数字最容易看漏一位。
+    assert 'String(number).split("").join(" ")' in text
+    for key in ("dial_confirm_title", "dial_confirm_ask", "dial_confirm_yes"):
+        assert text.count(key) >= 3, f"{key} 缺中英任一份文案或未被引用"

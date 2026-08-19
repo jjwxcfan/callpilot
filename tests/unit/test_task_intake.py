@@ -176,3 +176,48 @@ def test_intake_step_passes_through_sanitized_options(monkeypatch):
         '"number": "611", "task": "查流量"}}', None))
     final = intake_step([{"role": "user", "content": "开始"}], owner="李明", lang="zh")
     assert final["ready"] is True and final["options"] == []
+
+
+# ---- 号码收严：模型产出的号码不能拨成补充业务码（WIL-130）----
+
+
+@pytest.mark.parametrize(
+    "mmi",
+    [
+        "*21*13800000000#",   # 无条件呼叫转移：拨出去=改机主 SIM 设置，不是打电话
+        "**21*13800000000#",
+        "#21#",               # 撤销转移
+        "*#21#",              # 查询转移状态
+        "*67*13800000000#",
+        "611#",
+        "*611",
+    ],
+)
+def test_sanitize_draft_rejects_supplementary_service_codes(mmi):
+    """模型给出 * / # 形态时必须整条草稿作废。
+
+    这类码拨出去不会接通任何人，而是在机主 SIM 上改设置（最典型的是把所有
+    来电转走），机主几乎不会察觉。建单聊天是机主粘贴外部文本的地方，号码字段
+    因此间接可被攻击者影响，不能沿用人工手输那档宽松校验。
+    """
+    assert _sanitize_draft({"number": mmi, "task": "查账单"}) is None
+
+
+@pytest.mark.parametrize(
+    "good",
+    ["611", "10086", "13800000000", "+8613800000000", "+18005551234"],
+)
+def test_sanitize_draft_still_accepts_real_numbers(good):
+    """收严不能误伤：短号（611/911）与带国码的长号都要照常通过。"""
+    out = _sanitize_draft({"number": good, "task": "查账单"})
+    assert out is not None and out["number"] == good
+
+
+def test_human_entered_presets_keep_the_looser_rule():
+    """人工手输预设走的仍是 number_profiles 那条（允许 * / #），本次不动它。
+
+    收严只发生在**模型产出**的入口；把两者混为一谈会改掉上游既有行为。
+    """
+    from agentcall.number_profiles import _DIAL_NUMBER_RE
+
+    assert _DIAL_NUMBER_RE.fullmatch("*21*13800000000#")
