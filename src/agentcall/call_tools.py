@@ -130,8 +130,16 @@ class CallTools:
         self._effect_guard = effect_guard or (lambda: True)
 
     def register(self) -> ToolRegistry:
+        # external_effect 标记 = 该工具对通话之外的世界产生副作用（把内容送达
+        # 第三方 / 打扰机主），分诊等待态等门禁据此拦截（#126）。挂断与 DTMF
+        # 只作用于当前通话本身，查验证码/等短信是纯读，都不打标记——等待态
+        # 也要能正常挂断、按 IVR 键。
         registry = ToolRegistry()
-        registry.register(SEND_SMS_SPEC, self._timed("send_sms", self._send_sms))
+        registry.register(
+            SEND_SMS_SPEC,
+            self._timed("send_sms", self._send_sms),
+            external_effect=True,
+        )
         registry.register(HANGUP_SPEC, self._timed("hangup_call", self._hangup))
         if config.get_bool("TOOL_QUERY_CODE_ENABLED"):
             registry.register(
@@ -145,7 +153,11 @@ class CallTools:
         if self._direction == "outbound":
             # 机主确认环（WIL-120 二期）：外呼专用。inbound 的对应机制是
             # takeover（把电话整个交给机主），语义不同，不共用。
-            registry.register(ASK_OWNER_SPEC, self._timed("ask_owner", self._ask_owner))
+            registry.register(
+                ASK_OWNER_SPEC,
+                self._timed("ask_owner", self._ask_owner),
+                external_effect=True,
+            )
         return registry
 
     def _timed(

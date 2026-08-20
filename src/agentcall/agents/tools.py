@@ -281,19 +281,42 @@ def localize_spec(spec: dict[str, Any]) -> dict[str, Any]:
 
 
 class ToolRegistry:
-    """工具注册表：保存规格与对应处理函数，供 Agent 调用。"""
+    """工具注册表：保存规格与对应处理函数，供 Agent 调用。
+
+    注册时可为工具打 ``external_effect`` 标记——「对通话之外的世界产生副作用」
+    （发短信、打扰机主等），区别于只作用于当前通话的工具（挂断、DTMF）或纯读
+    工具（查验证码）。这是代码结构上的性质分类，不是对话话术枚举（#126）。
+    ``set_external_effect_gate`` 注入的门禁只对带此标记的工具生效：门禁返回
+    None 放行，返回结果 dict 则该次调用被拒并把 dict 原样回传给模型——
+    行为约束走机制层，不依赖提示词（WIL-134 的课）。
+    """
 
     def __init__(self) -> None:
-        self._tools: dict[str, tuple[dict[str, Any], ToolHandler]] = {}
+        self._tools: dict[str, tuple[dict[str, Any], ToolHandler, bool]] = {}
+        self._external_effect_gate: (
+            Callable[[str], dict[str, Any] | None] | None
+        ) = None
 
-    def register(self, spec: dict[str, Any], handler: ToolHandler) -> None:
+    def register(
+        self,
+        spec: dict[str, Any],
+        handler: ToolHandler,
+        *,
+        external_effect: bool = False,
+    ) -> None:
         name = _tool_name(spec)
         if not name:
             raise ValueError("工具规格缺少 name")
-        self._tools[name] = (localize_spec(spec), handler)
+        self._tools[name] = (localize_spec(spec), handler, external_effect)
+
+    def set_external_effect_gate(
+        self, gate: Callable[[str], dict[str, Any] | None]
+    ) -> None:
+        """注入对外副作用门禁：gate(工具名) 返回 None 放行、dict 拒绝。"""
+        self._external_effect_gate = gate
 
     def specs(self) -> list[dict[str, Any]]:
-        return [spec for spec, _ in self._tools.values()]
+        return [spec for spec, _handler, _external in self._tools.values()]
 
     def has_tools(self) -> bool:
         return bool(self._tools)
@@ -303,7 +326,16 @@ class ToolRegistry:
         if entry is None:
             logger.warning("请求了未知工具: %s", name)
             return {"success": False, "message": f"未知工具: {name}"}
-        _spec, handler = entry
+        _spec, handler, external_effect = entry
+        if external_effect and self._external_effect_gate is not None:
+            blocked = self._external_effect_gate(name)
+            if blocked is not None:
+                logger.warning(
+                    "对外副作用工具被门禁拦截: tool=%s code=%s",
+                    name,
+                    blocked.get("code"),
+                )
+                return blocked
         dtmf_count = _dtmf_count(args) if name == "send_dtmf" else None
         if dtmf_count is None:
             logger.info("执行工具 %s，参数=%s", name, args)
