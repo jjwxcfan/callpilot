@@ -69,6 +69,17 @@ final class CallKitConfigurationTests: XCTestCase {
         XCTAssertTrue(model.contains("callKit.delegate = self"))
     }
 
+    func testIncomingPushWindowConfiguresPlayAndRecordCategory() throws {
+        // LiveKit CallKit 实测契约:类别必须在 push 回调窗口(prepareForIncoming)
+        // 内设好,否则麦克风引擎无法初始化,锁屏接听双向无声。
+        let source = try source("ios/CallPilot/Call/CallKitCoordinator.swift")
+        let prepare = try XCTUnwrap(
+            source.components(separatedBy: "static func prepareForIncoming").last?
+                .components(separatedBy: "static func didActivate").first
+        )
+        XCTAssertTrue(prepare.contains(".playAndRecord"))
+    }
+
     private func source(_ path: String) throws -> String {
         try String(
             contentsOf: repositoryRoot.appendingPathComponent(path),

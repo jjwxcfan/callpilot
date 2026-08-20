@@ -2,6 +2,7 @@
 @preconcurrency import CallKit
 import Foundation
 import LiveKit
+import os
 @preconcurrency import PushKit
 
 @MainActor
@@ -336,9 +337,28 @@ private final class PushCompletion: @unchecked Sendable {
 }
 
 enum CallKitAudioSessionBridge {
+    private static let log = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "CallPilot",
+        category: "callkit-audio"
+    )
+
     static func prepareForIncoming() {
+        // LiveKit 官方 CallKit 示例的实测结论(swift-example-collection/callkit):
+        // 会话类别必须在 VoIP push 回调窗口内就设为 playAndRecord,否则麦克风引擎
+        // 无法初始化——等 didActivate 再设已太晚。缺这一步的真机表现(2026-08-20
+        // 锁屏接听实测):入房成功但采集全静音(peak=0)、下行无声。
+        do {
+            try AVAudioSession.sharedInstance()
+                .setCategory(.playAndRecord, mode: .voiceChat, options: [.mixWithOthers])
+        } catch {
+            Self.log.error("prepareForIncoming setCategory failed: \(error.localizedDescription, privacy: .public)")
+        }
         AudioManager.shared.audioSession.isAutomaticConfigurationEnabled = false
-        try? AudioManager.shared.setEngineAvailability(.none)
+        do {
+            try AudioManager.shared.setEngineAvailability(.none)
+        } catch {
+            Self.log.error("prepareForIncoming setEngineAvailability failed: \(error.localizedDescription, privacy: .public)")
+        }
     }
 
     static func didActivate(_ session: AVAudioSession) {
@@ -346,16 +366,26 @@ enum CallKitAudioSessionBridge {
             try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.mixWithOthers])
             try AudioManager.shared.setEngineAvailability(.default)
         } catch {
+            // 静默吞掉等于双向无声还查不到:失败必须可见。
+            Self.log.error("didActivate audio bring-up failed: \(error.localizedDescription, privacy: .public)")
             try? AudioManager.shared.setEngineAvailability(.none)
         }
     }
 
     static func didDeactivate() {
-        try? AudioManager.shared.setEngineAvailability(.none)
+        do {
+            try AudioManager.shared.setEngineAvailability(.none)
+        } catch {
+            Self.log.error("didDeactivate setEngineAvailability failed: \(error.localizedDescription, privacy: .public)")
+        }
     }
 
     static func prepareForStandaloneCall() {
         AudioManager.shared.audioSession.isAutomaticConfigurationEnabled = true
-        try? AudioManager.shared.setEngineAvailability(.default)
+        do {
+            try AudioManager.shared.setEngineAvailability(.default)
+        } catch {
+            Self.log.error("prepareForStandaloneCall setEngineAvailability failed: \(error.localizedDescription, privacy: .public)")
+        }
     }
 }
