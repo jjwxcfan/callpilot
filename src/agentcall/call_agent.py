@@ -318,6 +318,9 @@ class CallSession:
         self._triage_terminal = False
         self._triage_reject_deadline: float | None = None
         self._triage_clarification_spoken = False
+        # 最近一条转写的角色（agent/user）：clarify 判决据此判断 agent 是否
+        # 已在回应，避免固定澄清语与 agent 话轮叠问（#128）。
+        self._last_transcript_role: str | None = None
         # 按键护窗截止时刻（monotonic）：DTMF 期间丢弃 Agent 下行。
         self._dtmf_guard_until = 0.0
         # 本轮护窗内被丢弃的 Agent 下行字节数，窗口结束时汇总成一条事件（#81）。
@@ -690,6 +693,10 @@ class CallSession:
             if not self._agent_effect_allowed(generation):
                 return
             transcripts.append((role, text))
+            # 判官 clarify 判决要参考「agent 是否已在回应」（#128）：判决
+            # 从提交到到达约 1-2s，期间 agent 往往已开口问了同样的问题，
+            # 再叠一句固定澄清语就是当着 caller 连问两遍。
+            self._last_transcript_role = role
             if record is not None:
                 record.log_event("transcript", role=role, text=text)
             self._publish(
@@ -881,6 +888,19 @@ class CallSession:
             )
         self._turn_trimmed_bytes = 0
 
+    async def _say_orchestrated_line(self, agent: VoiceAgent, text: str) -> None:
+        """播一句编排层话术：能等就等到本轮音频投递完成再返回。
+
+        provider 支持 say_and_wait（目前 openai）时等 response.done——调用方
+        随后关音频闸门才不会把话术增量一并丢掉；不支持的 provider 回退
+        fire-and-forget 的 say，行为与旧版一致。
+        """
+        say_and_wait = getattr(agent, "say_and_wait", None)
+        if say_and_wait is not None:
+            await say_and_wait(text)
+        else:
+            await agent.say(text)
+
     async def _speak_takeover_hold_if_needed(
         self, agent: VoiceAgent, bridge: AudioBridge, generation: int
     ) -> None:
@@ -906,7 +926,14 @@ class CallSession:
                 dropped = bridge.discard_pending_output()
                 if dropped:
                     logger.info("接管垫话前丢弃桥内旧音频 %d 字节", dropped)
-            await agent.say(_INBOUND_TAKEOVER_HOLD_TEXT[agent_language()])
+            # say 是 fire-and-forget：TTS 音频几百毫秒后才回来，而 finally
+            # 一置 _takeover_hold_done 闸门即关、垫话增量全被丢弃——真机上
+            # caller 听到的是静音而不是「正在转接」（#125）。有 say_and_wait
+            # 能力的 provider 等本轮 response.done（音频已全部投递）再收闸；
+            # 没有的 provider 维持原状（fire-and-forget），真机验证其时序。
+            await self._say_orchestrated_line(
+                agent, _INBOUND_TAKEOVER_HOLD_TEXT[agent_language()]
+            )
             # Flush the one permitted hold line before closing the AI gate; the
             # regular loop deliberately drops queued AI audio after this point.
             self._drain_agent_audio(bridge)
@@ -1718,6 +1745,7 @@ class CallSession:
         self._triage_terminal = False
         self._triage_reject_deadline = None
         self._triage_clarification_spoken = False
+        self._last_transcript_role = None
         if direction != "inbound" or self._triage_mode == "off":
             return
 
@@ -1811,6 +1839,13 @@ class CallSession:
             if result.outcome == "clarify":
                 if self._triage_clarification_spoken:
                     continue
+                # 判决从提交到到达约 1-2s，期间 agent 往往已开口问了同一个
+                # 问题（真机 2026-08-19，#128：连问两遍车轱辘话）。最近一条
+                # 转写是 agent 说的 = 它已在回应、正等 caller 接话，固定澄清
+                # 语跳过；caller 下一轮发言后判官自然会再判。
+                if self._last_transcript_role == "agent":
+                    self._log_triage_clarify_skipped(result)
+                    continue
                 self._triage_clarification_spoken = True
                 try:
                     await agent.say(_INBOUND_TRIAGE_CLARIFY_TEXT[agent_language()])
@@ -1839,7 +1874,18 @@ class CallSession:
                 # free-form policy. Fence immediately after its audio is flushed.
                 self._clear_outgoing_audio()
                 try:
-                    await agent.say(_INBOUND_TRIAGE_REJECT_TEXT[agent_language()])
+                    # 与转接垫话同因（#125）：应用队列清了，桥里可能还躺着
+                    # 数秒旧话轮；拒绝语也必须等音频投递完成再收闸，否则
+                    # caller 听到旧话戛然而止后被静默挂断。
+                    if hasattr(bridge, "discard_pending_output"):
+                        dropped = bridge.discard_pending_output()
+                        if dropped:
+                            logger.info(
+                                "分诊拒绝语前丢弃桥内旧音频 %d 字节", dropped
+                            )
+                    await self._say_orchestrated_line(
+                        agent, _INBOUND_TRIAGE_REJECT_TEXT[agent_language()]
+                    )
                     self._drain_agent_audio(bridge)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
@@ -1873,6 +1919,15 @@ class CallSession:
         else:
             logger.warning(
                 "分诊放行: provider 不支持中途更新提示词，AI 仍受限于分诊话术"
+            )
+
+    def _log_triage_clarify_skipped(self, result: TriageConsumption) -> None:
+        record = self._record
+        if record is not None:
+            record.log_event(
+                "inbound_triage_clarify_skipped",
+                reason="agent_already_responding",
+                **result.verdict.public_fields(),
             )
 
     def _log_triage_consumption(self, result: TriageConsumption) -> None:

@@ -676,11 +676,21 @@ class FfmpegAudioBridge:
         except OSError:
             return
 
-    def _drop_stale_tx_buffer(self) -> None:
+    def discard_pending_output(self) -> int:
+        """立即丢弃未播的下行积压（barge-in 打断 / 转接拒绝垫话用）。
+
+        与 SerialPcmAudioBridge 的同名方法对齐（#125）：此前缺这个方法，
+        uac_ffmpeg 模式下 barge-in 与转接前的丢积压经 hasattr 探测静默不
+        生效——正常积压可达 10-30 秒，旧话轮照播。
+        """
         with self._tx_lock:
             dropped = len(self._tx_buffer)
             self._tx_buffer.clear()
             self._dropped_bytes += dropped
+        return dropped
+
+    def _drop_stale_tx_buffer(self) -> None:
+        dropped = self.discard_pending_output()
         if dropped:
             logger.warning("ffmpeg 播放重启，丢弃陈旧下行 PCM: dropped=%d", dropped)
 
