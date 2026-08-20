@@ -19,6 +19,7 @@ from agentcall.cloud_credentials import (
 )
 from agentcall.content_sync import ContentSyncError
 from agentcall.takeover_coordinator import (
+    InboundTakeoverContextUpdate,
     InboundTakeoverOfferRequest,
     InboundTakeoverRevoke,
     TakeoverRejection,
@@ -34,6 +35,7 @@ class _Service:
         self.claims: list[dict] = []
         self.offers: list[InboundTakeoverOfferRequest] = []
         self.revokes: list[InboundTakeoverRevoke] = []
+        self.context_updates: list[InboundTakeoverContextUpdate] = []
 
     def remote_dialer_status(self) -> dict:
         return {"active": False}
@@ -54,6 +56,11 @@ class _Service:
         self, timeout: float = 0.0
     ) -> InboundTakeoverRevoke | None:
         return self.revokes.pop(0) if self.revokes else None
+
+    def next_inbound_takeover_context_update(
+        self, timeout: float = 0.0
+    ) -> InboundTakeoverContextUpdate | None:
+        return self.context_updates.pop(0) if self.context_updates else None
 
     def accept_inbound_takeover_claim(self, **fields) -> TakeoverResult:
         self.claims.append(fields)
@@ -288,6 +295,7 @@ def test_edge_sends_opaque_takeover_offer_then_revoke_with_frozen_schema() -> No
             "generation": 7,
             "nonce": "takeover-nonce-abcdefghijkl",
             "expiresAtUnixMs": 130000,
+            "context": None,
         },
         {
             "v": 1,
@@ -298,7 +306,9 @@ def test_edge_sends_opaque_takeover_offer_then_revoke_with_frozen_schema() -> No
         },
     ]
     assert "preference" not in repr(sent).lower()
-    assert "number" not in repr(sent).lower()
+    # 没有展示上下文时 offer 仍不含任何号码/身份（WIL-137 之前的全量不变量，
+    # 现在收窄为「context 为 null 时」——带上下文的形态见下一个测试）。
+    assert "+1" not in repr(sent)
 
 
 def test_cloud_client_accepts_strict_inbound_claim_and_acks_offer() -> None:
@@ -756,3 +766,68 @@ def test_cloud_api_redacts_structured_http_failure(monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="EDGE_REVOKED") as caught:
         CloudControlApi("https://api.bondings.ai")._request("GET", "/v1/test")
     assert "sensitive detail" not in str(caught.value)
+
+
+def test_edge_sends_offer_context_and_later_context_update() -> None:
+    """接管展示上下文（WIL-137）：offer 带 context，问清身份后再发 context 更新。
+
+    形状是 iOS/Worker 的对接契约——字段名与毫秒时间戳固定，空字段显式 null。
+    """
+    from agentcall.takeover_context import build_context
+
+    service = _Service()
+    service.offers.append(
+        InboundTakeoverOfferRequest(
+            offer_id="offer_takeover_abcdefghijkl",
+            call_id="call_takeover_abcdefghijkl",
+            generation=7,
+            nonce="takeover-nonce-abcdefghijkl",
+            created_at=100.0,
+            expires_at=130.0,
+            # offer 发出时通常只知道号码
+            context=build_context(
+                peer_number="+15105550123", updated_at_ms=100000
+            ),
+        )
+    )
+    service.context_updates.append(
+        InboundTakeoverContextUpdate(
+            offer_id="offer_takeover_abcdefghijkl",
+            call_id="call_takeover_abcdefghijkl",
+            generation=7,
+            context=build_context(
+                peer_number="+15105550123",
+                claimed_name="Kevin",
+                purpose="约机主周六吃饭",
+                updated_at_ms=112000,
+            ),
+        )
+    )
+    client = CloudEdgeClient("https://api.bondings.ai", service, _Store())
+    sent: list[dict] = []
+
+    client._drain_takeover_events(lambda raw: sent.append(json.loads(raw)))
+
+    assert sent[0]["context"] == {
+        "v": 1,
+        "peerNumber": "+15105550123",
+        "claimedName": None,
+        "purpose": None,
+        "updatedAtUnixMs": 100000,
+    }
+    assert sent[1] == {
+        "v": 1,
+        "type": "inbound.offer.context",
+        "offerId": "offer_takeover_abcdefghijkl",
+        "callId": "call_takeover_abcdefghijkl",
+        "generation": 7,
+        "context": {
+            "v": 1,
+            "peerNumber": "+15105550123",
+            "claimedName": "Kevin",
+            "purpose": "约机主周六吃饭",
+            "updatedAtUnixMs": 112000,
+        },
+    }
+    # 后补的上下文必须比 offer 里的新，消费方据此判断覆盖
+    assert sent[1]["context"]["updatedAtUnixMs"] > sent[0]["context"]["updatedAtUnixMs"]

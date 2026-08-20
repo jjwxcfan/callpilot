@@ -19,6 +19,7 @@ from .cloud_credentials import CloudCredentialStore, EdgeCredential
 from .content_sync import ContentSyncError
 from .remote_dialer import IssuedLiveKitSession, RemoteDialerInvite
 from .takeover_coordinator import (
+    InboundTakeoverContextUpdate,
     InboundTakeoverOfferRequest,
     InboundTakeoverRevoke,
     TakeoverResult,
@@ -45,6 +46,10 @@ class CloudSessionService(Protocol):
     def next_inbound_takeover_revoke(
         self, timeout: float = 0.0
     ) -> InboundTakeoverRevoke | None: ...
+
+    def next_inbound_takeover_context_update(
+        self, timeout: float = 0.0
+    ) -> InboundTakeoverContextUpdate | None: ...
 
     def accept_inbound_takeover_claim(
         self,
@@ -401,6 +406,27 @@ class CloudEdgeClient:
                         "generation": request.generation,
                         "nonce": request.nonce,
                         "expiresAtUnixMs": round(request.expires_at * 1000),
+                        # 展示用上下文（WIL-137）：可空；含 PII，云端只经
+                        # claim 后的数据通道下发，不得进 APNs / 审计日志。
+                        "context": (
+                            request.context.as_payload()
+                            if request.context is not None
+                            else None
+                        ),
+                    },
+                    separators=(",", ":"),
+                )
+            )
+        while update := self.service.next_inbound_takeover_context_update():
+            send(
+                json.dumps(
+                    {
+                        "v": 1,
+                        "type": "inbound.offer.context",
+                        "offerId": update.offer_id,
+                        "callId": update.call_id,
+                        "generation": update.generation,
+                        "context": update.context.as_payload(),
                     },
                     separators=(",", ":"),
                 )

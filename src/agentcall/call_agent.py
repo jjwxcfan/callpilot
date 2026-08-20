@@ -71,8 +71,11 @@ from .result_verification import (
 from .sim_identity import SimIdentity
 from .sms_email_forwarder import SmsEmailForwarder
 from .summarizer import judge_wrap_up, summarize_call
+from .takeover_context import build_context as build_takeover_context
+from .takeover_context import summarize_call_context
 from .takeover_coordinator import (
     ClaimFence,
+    InboundTakeoverContextUpdate,
     InboundTakeoverCoordinator,
     InboundTakeoverOfferRequest,
     InboundTakeoverRevoke,
@@ -338,6 +341,13 @@ class CallSession:
             maxsize=1
         )
         self._takeover_revoke_queue: Queue[InboundTakeoverRevoke] = Queue(maxsize=1)
+        # 接管上下文后补（WIL-137）：offer 发出后摘要才产出身份/来意，经此队列
+        # 推给云端更新已存 offer。只保留最新一条——旧的展示信息没有保留价值。
+        self._takeover_context_queue: Queue[InboundTakeoverContextUpdate] = Queue(
+            maxsize=1
+        )
+        # 本通转写的只读引用，供接管上下文摘要使用（详见 _handle_call）。
+        self._live_transcripts: list[tuple[str, str]] = []
         self._takeover_session_queue: Queue[InboundTakeoverSession] = Queue(maxsize=1)
         self._takeover_hold_generation: int | None = None
         self._takeover_hold_done = False
@@ -494,6 +504,9 @@ class CallSession:
         self._initialize_takeover_context(direction)
         self._initialize_triage_context(direction, record)
         transcripts: list[tuple[str, str]] = []
+        # 接管上下文摘要（WIL-137）在工具线程里跑，需要读本通转写；只读引用，
+        # 不改内容。会话结束时置空，避免跨通读到上一通的对话。
+        self._live_transcripts = transcripts
 
         def mark(event_type: str, **fields) -> float:
             """记录一个会话节点事件，附带相对会话开始的耗时（毫秒）。"""
@@ -3137,6 +3150,8 @@ class CallSession:
         with self._takeover_lock:
             self._takeover_offer_queue = Queue(maxsize=1)
             self._takeover_revoke_queue = Queue(maxsize=1)
+            # 上一通迟到的上下文摘要不能漏进这一通（含上一通的 PII）。
+            self._takeover_context_queue = Queue(maxsize=1)
             self._takeover_session_queue = Queue(maxsize=1)
             self._takeover_request = None
             self._takeover_hold_generation = None
@@ -3230,6 +3245,12 @@ class CallSession:
                     "message": "当前通话状态不允许真人接管",
                 }
             created_at = time.time()
+            # 展示用上下文（WIL-137）：号码此刻就有，身份/来意可能还没问出来，
+            # 先带号码发出去（机主至少知道谁在打），随后由后台摘要后补。
+            initial_context = build_takeover_context(
+                peer_number=self.current_caller,
+                updated_at_ms=round(created_at * 1000),
+            )
             request = InboundTakeoverOfferRequest(
                 offer_id=f"offer_{secrets.token_urlsafe(18)}",
                 nonce=secrets.token_urlsafe(24),
@@ -3237,6 +3258,7 @@ class CallSession:
                 generation=coordinator.generation,
                 created_at=created_at,
                 expires_at=created_at + _INBOUND_TAKEOVER_OFFER_TTL_SECONDS,
+                context=None if initial_context.is_empty() else initial_context,
             )
             self._takeover_request = request
             self._takeover_hold_generation = generation
@@ -3272,11 +3294,75 @@ class CallSession:
                 "generation": request.generation,
             }
         )
+        self._start_takeover_context_summary(request)
         return {
             "success": True,
             "code": "TAKEOVER_REQUESTED",
             "message": "真人接管请求已发出",
         }
+
+    def _start_takeover_context_summary(
+        self, request: InboundTakeoverOfferRequest
+    ) -> None:
+        """后台补齐接管上下文的身份与来意（WIL-137）。
+
+        offer 已经发出去了——摘要只是让机主界面从「号码」变成「谁+什么事」，
+        绝不能反过来拖慢或影响接管本身，故放后台线程、失败静默回落。
+        """
+        turns = list(self._live_transcripts)
+        if not turns:
+            return
+
+        def worker() -> None:
+            claimed_name, purpose = summarize_call_context(turns)
+            if not claimed_name and not purpose:
+                return
+            base = request.context or build_takeover_context(peer_number=None)
+            updated = base.merged_with(
+                claimed_name=claimed_name,
+                purpose=purpose,
+                updated_at_ms=round(time.time() * 1000),
+            )
+            update = InboundTakeoverContextUpdate(
+                offer_id=request.offer_id,
+                call_id=request.call_id,
+                generation=request.generation,
+                context=updated,
+            )
+            with self._takeover_lock:
+                queue = self._takeover_context_queue
+            # 只留最新一条：展示信息过期即无价值，宁可丢旧的也不阻塞。
+            try:
+                queue.put_nowait(update)
+            except Full:
+                try:
+                    queue.get_nowait()
+                except Empty:
+                    pass
+                try:
+                    queue.put_nowait(update)
+                except Full:
+                    pass
+            # 日志只记「有没有补到」，绝不记内容（PII 边界）。
+            logger.info(
+                "接管上下文已补充: has_name=%s has_purpose=%s",
+                bool(claimed_name),
+                bool(purpose),
+            )
+
+        threading.Thread(
+            target=worker, name="takeover-context-summary", daemon=True
+        ).start()
+
+    def next_takeover_context_update(
+        self, timeout: float = 0.0
+    ) -> InboundTakeoverContextUpdate | None:
+        with self._takeover_lock:
+            queue = self._takeover_context_queue
+        try:
+            return queue.get(timeout=timeout) if timeout > 0 else queue.get_nowait()
+        except Empty:
+            return None
 
     def next_takeover_offer(
         self, timeout: float = 0.0
@@ -3958,6 +4044,11 @@ class CallAgentService:
         self, timeout: float = 0.0
     ) -> InboundTakeoverRevoke | None:
         return self.session.next_takeover_revoke(timeout)
+
+    def next_inbound_takeover_context_update(
+        self, timeout: float = 0.0
+    ) -> InboundTakeoverContextUpdate | None:
+        return self.session.next_takeover_context_update(timeout)
 
     def provide_inbound_takeover_session(
         self, claimed: InboundTakeoverSession

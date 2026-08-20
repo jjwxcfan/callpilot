@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol
 
+from .takeover_context import TakeoverCallContext
+
 if TYPE_CHECKING:
     from .remote_dialer import IssuedLiveKitSession
 
@@ -109,6 +111,9 @@ class InboundTakeoverOfferRequest:
     generation: int
     created_at: float
     expires_at: float
+    # 展示用通话上下文（WIL-137）：可空，且发出后可经 context 更新事件后补。
+    # 含 PII——只走数据通道，不进 APNs、不落日志审计（见 takeover_context）。
+    context: TakeoverCallContext | None = None
 
     def __post_init__(self) -> None:
         _require_identifier(self.offer_id, "offer_id")
@@ -126,6 +131,26 @@ class InboundTakeoverOfferRequest:
             raise ValueError("offer timestamps must be finite")
         if self.expires_at <= self.created_at:
             raise ValueError("expires_at must be later than created_at")
+
+
+@dataclass(frozen=True)
+class InboundTakeoverContextUpdate:
+    """offer 发出后后补的展示上下文（WIL-137）。
+
+    AI 常在 offer 已发出后才问清来电者身份与来意；消费方按
+    ``context.updated_at_ms`` 比较新鲜度后覆盖已存 offer 的上下文。
+    """
+
+    offer_id: str
+    call_id: str
+    generation: int
+    context: TakeoverCallContext
+
+    def __post_init__(self) -> None:
+        _require_identifier(self.offer_id, "offer_id")
+        _require_identifier(self.call_id, "call_id")
+        if self.generation < 0:
+            raise ValueError("generation must be non-negative")
 
 
 @dataclass(frozen=True)
