@@ -140,9 +140,11 @@ _EXTERNAL_TOOL_RESULT_TIMEOUT_SECONDS = 2.0
 _INBOUND_TAKEOVER_OFFER_TTL_SECONDS = 30.0
 # 固定垫话按 AGENT_LANGUAGE 取（WIL-120 二期顺手修：原为写死中文，en 通话下
 # AI 会突然冒中文）。不进模型自由生成——这几句是系统兜底话术，必须可预期。
+# 措辞按实际状态说（#121）：播这句时转接请求已发出（机主手机已收到），
+# 「我确认一下」弱于事实，改为明确的「正在转接」。
 _INBOUND_TAKEOVER_HOLD_TEXT = {
-    "zh": "请稍等，我确认一下，马上帮您转接。",
-    "en": "One moment please, let me check — I'll transfer you right away.",
+    "zh": "正在为您转接本人，请稍等，不要挂断。",
+    "en": "I'm putting you through now — please hold on, don't hang up.",
 }
 _INBOUND_TAKEOVER_MEDIA_TIMEOUT_SECONDS = 15.0
 _INBOUND_TRIAGE_CLARIFY_TEXT = {
@@ -895,6 +897,15 @@ class CallSession:
         if not should_speak:
             return
         try:
+            # 真机 2026-08-19（#121）：OpenAI 突发投递的旧话轮（「他现在不方便
+            # 接…我复述一下」）可能还有数秒积压在桥里慢慢播——请求路径清的
+            # 应用层队列够不到这层，caller 会在 push 已到机主手机后仍听到
+            # 「不方便接」。垫话开播前丢弃桥内未播积压（与 barge-in 同机制），
+            # 让「正在转接」立即接上。
+            if hasattr(bridge, "discard_pending_output"):
+                dropped = bridge.discard_pending_output()
+                if dropped:
+                    logger.info("接管垫话前丢弃桥内旧音频 %d 字节", dropped)
             await agent.say(_INBOUND_TAKEOVER_HOLD_TEXT[agent_language()])
             # Flush the one permitted hold line before closing the AI gate; the
             # regular loop deliberately drops queued AI audio after this point.

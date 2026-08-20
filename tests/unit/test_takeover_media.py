@@ -153,7 +153,7 @@ def test_takeover_hold_is_one_deterministic_line_before_agent_gate(monkeypatch) 
 
     asyncio.run(session._speak_takeover_hold_if_needed(agent, bridge, 7))
 
-    assert agent.said == ["请稍等，我确认一下，马上帮您转接。"]
+    assert agent.said == ["正在为您转接本人，请稍等，不要挂断。"]
     assert bridge.downlink
     assert session._agent_effect_allowed(7) is False
 
