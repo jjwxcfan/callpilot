@@ -132,6 +132,11 @@ HALF_DUPLEX_HANGOVER_SECONDS = 0.5
 # （仅作缺省值；每通会话开始时从 config.HANGUP_TOOL_DELAY_SECONDS 重新读取。）
 HANGUP_TOOL_DELAY_SECONDS = 4.5
 
+# 通话后短信补发（#127）：挂断后先静置这么久再补发——SIM7600 关闭语音通道
+# （CPCMREG 收尾）后模组需要片刻回到可发短信的空闲态；随后失败再重试一次的间隔。
+PENDING_SMS_FLUSH_DELAY_SECONDS = 2.0
+PENDING_SMS_RETRY_DELAY_SECONDS = 3.0
+
 # Profile-gated fallback: wait briefly for a genuine tool call after the Agent
 # says it is pressing a key. The recent-send window closes transcript/tool races.
 DTMF_SPOKEN_FOLLOWUP_DELAY_SECONDS = 3.0
@@ -237,6 +242,16 @@ class CallSession:
         self._turn_audio_started_at = 0.0
         self._record: CallRecord | None = None
         self._summary_thread: threading.Thread | None = None
+        # 通话后短信补发队列（#127）：通话中 AT+CMGS 必被 SIM7600 拒，send_sms
+        # 工具发送失败时经 queue_sms 回调入这里，通话收尾后由后台线程补发。
+        # 纯内存、按通话生命周期清理（收尾补发后即空）；服务重启丢失可接受——
+        # 队列只在「通话进行中→挂断后几秒」这个窗口内有内容，不做持久化。
+        self._pending_sms: list[tuple[str, str]] = []
+        self._pending_sms_lock = threading.Lock()
+        self._pending_sms_thread: threading.Thread | None = None
+        # 补发节奏（实例属性便于单测归零，缺省取模块常量）。
+        self._pending_sms_flush_delay = PENDING_SMS_FLUSH_DELAY_SECONDS
+        self._pending_sms_retry_delay = PENDING_SMS_RETRY_DELAY_SECONDS
         # 延迟挂断（hangup 工具）状态：CallSession 跨通复用，上一通排下的
         # Timer 必须可取消；世代号兜住已越过 cancel、正在执行的回调，
         # 避免它 stop() 误伤下一通会话。
@@ -440,6 +455,10 @@ class CallSession:
 
     async def _handle_call(self) -> None:
         self._clear_outgoing_audio()
+        # 防串通兜底：上一通的待发短信在其收尾 finally 里已弹空，这里再清一次，
+        # 确保任何残留都不会算到这一通头上。
+        with self._pending_sms_lock:
+            self._pending_sms.clear()
         self._load_session_config()
 
         session_t0 = time.monotonic()
@@ -646,6 +665,9 @@ class CallSession:
             self._end_takeover_context("CALL_ENDED")
             mark("ended", status=status)
             self._finalize_record(record, status, transcripts, direction, number)
+            # 通话中失败入队的短信（#127）在这里补发：_shutdown_agent 已挂断
+            # 物理通话，模组即将回到空闲态。后台线程执行，任何异常不炸收尾。
+            self._flush_pending_sms()
 
     async def _connect_outbound(self, mark: Callable[..., float]) -> bool:
         """外呼：拨号并等待接通；未接通时发结束事件、挂断并返回 False。"""
@@ -1341,6 +1363,80 @@ class CallSession:
             logger.warning("创建通话记录失败: %s", exc)
             return None
 
+    def _queue_pending_sms(self, number: str, content: str) -> None:
+        """把一条通话中发不出去的短信入待发队列（#127，CallTools 回调）。
+
+        白名单 / 频控校验在 CallTools 侧、入队之前已经做完——不合规的请求
+        根本走不到这里；补发时不再重复校验（频控额度在首次尝试时已占用）。
+        """
+        with self._pending_sms_lock:
+            self._pending_sms.append((number, content))
+            depth = len(self._pending_sms)
+        logger.info("短信入通话后补发队列（当前 %d 条） -> %s", depth, number)
+
+    def _flush_pending_sms(self) -> None:
+        """通话收尾：把待发队列交给后台线程补发（不阻塞收尾、异常不外抛）。
+
+        队列按通话生命周期清理：这里一次性弹空，补发结果只落日志与 sms_out
+        事件。补发线程与下一通通话可能并发——modem.send_sms 自带串口锁，
+        真撞上通话中也只是再次失败，重试一次后放弃并留日志，不递归入队。
+        """
+        try:
+            with self._pending_sms_lock:
+                pending = list(self._pending_sms)
+                self._pending_sms.clear()
+            if not pending:
+                return
+            thread = threading.Thread(
+                target=self._pending_sms_worker,
+                args=(pending,),
+                daemon=True,
+                name="pending-sms-flush",
+            )
+            self._pending_sms_thread = thread
+            thread.start()
+        except Exception:  # noqa: BLE001
+            logger.exception("启动短信补发线程失败（不影响通话收尾）")
+
+    def _pending_sms_worker(self, pending: list[tuple[str, str]]) -> None:
+        """后台补发：静置→逐条发送，失败重试一次；终态发 sms_out 事件。"""
+        if self._pending_sms_flush_delay > 0:
+            time.sleep(self._pending_sms_flush_delay)
+        for number, content in pending:
+            ok = False
+            for attempt in (1, 2):
+                try:
+                    ok = bool(self.modem.send_sms(number, content))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "通话后补发短信异常（第 %d 次）-> %s: %s",
+                        attempt,
+                        number,
+                        exc,
+                    )
+                    ok = False
+                if ok:
+                    break
+                if attempt == 1 and self._pending_sms_retry_delay > 0:
+                    time.sleep(self._pending_sms_retry_delay)
+            if ok:
+                logger.info("通话后补发短信成功 -> %s", number)
+            else:
+                logger.warning("通话后补发短信失败（重试一次后放弃） -> %s", number)
+            # 终态才发 sms_out（sent/failed）：入队时不发，避免同一条短信在
+            # 消息同步里出现两条记录。失败也发事件，面板可见（#127 验收）。
+            try:
+                self._publish(
+                    {
+                        "type": "sms_out",
+                        "number": number,
+                        "text": content,
+                        "status": "sent" if ok else "failed",
+                    }
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("补发结果事件发布失败")
+
     def _finalize_record(
         self,
         record: CallRecord | None,
@@ -1623,6 +1719,7 @@ class CallSession:
             send_dtmf=self._send_dtmf_from_tool,
             effect_guard=lambda: self._agent_effect_allowed(generation),
             direction=direction,
+            queue_sms=self._queue_pending_sms,
         )
         registry = tools.register()
         if (
