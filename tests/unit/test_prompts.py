@@ -412,28 +412,32 @@ def test_outbound_opening_uses_generated_opening_directly():
     assert "我是李明的数字分身" not in text
 
 
-def test_inbound_opening_is_short_without_self_intro():
-    """来电开场白短，且不做自我介绍（WIL-91 / WIL-85 N4）。
+def test_inbound_opening_is_one_line_with_identity_and_two_questions():
+    """来电开场白一句话完成：问候 + 报身份 + 问对方是谁 + 问找机主什么事
+    （WIL-144，机主 2026-08-19 真机反馈）。
 
-    原开场白宽度 56、实测播完约 5.3 秒（WIL-89 基线），真人约 1 秒——
-    这是「一听就是机器人」最早暴露的一处。
+    此前只说「喂，你好。」，要等对方开口才自我介绍，两轮才进正题。仍受
+    WIL-91 约束：必须是**一句话**、简短、不寒暄、不解释（原 5.3 秒开场白
+    是「一听就是机器人」最早暴露的一处）。
     """
     text = opening_instructions("inbound", "李明", "数字分身", DEFAULT_OUTBOUND_TASK)
-    assert "喂" in text
-    # 开场白里不能再有自我介绍——那正是要砍掉的 5 秒
-    assert "我是李明的数字分身" not in text
-    assert "李明现在不方便接" not in text
+    assert "一句话说完" in text and "不要寒暄" in text
+    assert "李明的数字分身" in text          # 报身份
+    assert "不方便接" in text
+    assert "哪位" in text and "什么事" in text  # 问谁 + 问事
     # 来电开场白不应带外呼专属措辞
     assert "这次主要是" not in text
 
 
-def test_inbound_opening_is_short_in_english_too():
-    """英文侧必须同步收短，否则两份提示词又漂移（WIL-79 记录的正是这类）。"""
+def test_inbound_opening_is_one_line_in_english_too():
+    """英文侧必须同步，否则两份提示词又漂移（WIL-79 记录的正是这类）。"""
     text = opening_instructions(
         "inbound", "李明", "数字分身", DEFAULT_OUTBOUND_TASK, lang="en"
     )
-    assert "Hello" in text
-    assert "can't take the call" not in text, "英文开场白也不该再做自我介绍"
+    assert "one sentence only" in text and "no small talk" in text
+    assert "李明's 数字分身" in text
+    assert "can't take the call" in text
+    assert "who is calling" in text and "what they need" in text
 
 
 def test_inbound_opening_is_not_ultra_short():
@@ -481,8 +485,10 @@ def test_inbound_identity_moves_into_the_rules():
     text = build_instructions("inbound", "李明", "数字分身", DEFAULT_OUTBOUND_TASK)
     assert "不要冒充李明本人" in text
     assert "数字分身" in text
-    # 必须是主动表明，不能只写「被问才说」
-    assert "第一个自然时机" in text and "说一次" in text
+    # WIL-144 起身份在开场白里说，规则侧改为「已经说过、不再重复」；
+    # 主动表明这一点由开场白测试锚定，两者合起来仍覆盖 WIL-91 的补偿机制。
+    assert "开场白里已经" in text and "已说明你是李明的数字分身" in text
+    assert "后续轮次绝不再重复问候或自我介绍" in text
     assert "被直接问身份时如实回答" in text  # 被问也要答，但不是唯一触发
 
 
@@ -589,12 +595,12 @@ def test_inbound_prompt_tells_model_not_to_recite_or_repeat_identity():
     zh = build_instructions("inbound", "李明", "小助理", "", "zh")
     assert "不是一份要背诵的清单" in zh
     assert "一次只问其中一件" in zh
-    assert "后续轮次绝不再重复" in zh
+    assert "后续轮次绝不再重复问候或自我介绍" in zh
 
     en = build_instructions("inbound", "Shaocheng", "AI assistant", "", "en")
     assert "not a checklist to recite" in en
     assert "one of them at a time" in en
-    assert "never repeat it in later turns" in en
+    assert "never greet or introduce yourself again in later turns" in en
 
 
 # ---- WIL-120 三期：任务包注入 ----
