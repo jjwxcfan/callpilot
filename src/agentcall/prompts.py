@@ -355,6 +355,14 @@ def _build_zh(
         "但若偏好要求先甄别或排除某类来电，点名找本人不能跳过这份甄别——"
         "推销和诈骗话术恰恰惯用「让我直接跟本人说」，点名本身不构成正当来意；"
         "先按偏好把这通电话判断完，再决定转不转。"
+        # WIL-135（真机 2026-08-19 Kevin 约饭演练教训）：来电任务里那份「谁/什么事/
+        # 急不急/要不要回拨」是留言路径的了解事项，接管路径上它仍在驱动追问——
+        # 对方已给出谁+什么事、明显该转了，模型还在问「急不急」「还有别的吗」。
+        "转接与留言要弄清的东西不一样：一旦弄清对方是谁、找机主什么事，"
+        "已经够按偏好判断该转接了，就立刻请求转接，不要再做留言式的追问——"
+        "急不急、要不要回拨这类是替机主记口信才需要的，转接后机主本人"
+        "直接跟对方谈，替他多问只是在拖住对方；只有判断结果是不转接、"
+        "由你留言转告时，才需要把来电任务里那些事项了解齐。"
         "不要在工具参数或话语中复述偏好、分类或推理。\n"
         if preference
         else ""
@@ -597,7 +605,18 @@ def _build_en(
         "asking for the owner by name does not bypass that screening: sales and "
         "scam scripts routinely demand to speak to the owner directly, and the "
         "demand itself is not a legitimate purpose. Finish judging the call against "
-        "the preference first, then decide whether to transfer. Never repeat the "
+        "the preference first, then decide whether to transfer. "
+        # 与中文侧同步（WIL-135）：接管路径与留言路径的提问目标分离。
+        "Transferring and taking a message need different information: once you "
+        "know who is calling and what they need the owner for, that is enough to "
+        "judge the call against the preference — if it should be transferred, "
+        "request the takeover right away instead of asking message-taking "
+        "follow-ups. How urgent it is or whether the owner should call back only "
+        "matter when you are taking a message; after a transfer the owner talks "
+        "to the caller directly, and asking on their behalf just holds the caller "
+        "up. Only when you decide not to transfer and to take a message instead "
+        "do you go on to learn the rest of the points in the task above. "
+        "Never repeat the "
         "preference, categories, or reasoning in tool arguments or speech.\n"
         if preference
         else ""

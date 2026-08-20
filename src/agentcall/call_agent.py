@@ -12,9 +12,10 @@ import secrets
 import threading
 import time
 from array import array
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from queue import Empty, Full, Queue
-from typing import Callable
+from typing import Any, Callable
 
 from . import call_playbooks, config, platforms
 from .agents.base import VoiceAgent
@@ -132,6 +133,29 @@ HALF_DUPLEX_HANGOVER_SECONDS = 0.5
 # （仅作缺省值；每通会话开始时从 config.HANGUP_TOOL_DELAY_SECONDS 重新读取。）
 HANGUP_TOOL_DELAY_SECONDS = 4.5
 
+# 通话后短信补发（#127）：挂断后先静置这么久再补发——SIM7600 关闭语音通道
+# （CPCMREG 收尾）后模组需要片刻回到可发短信的空闲态；随后失败再重试一次的间隔。
+PENDING_SMS_FLUSH_DELAY_SECONDS = 2.0
+PENDING_SMS_RETRY_DELAY_SECONDS = 3.0
+# 一条待发短信最多经历几轮收尾补发：背靠背来电时本轮补发会落进下一通通话中
+# （CMGS 再次被拒），失败条目转入下一次通话收尾再试，防止口信静默丢失；
+# 上限防真送不出去（欠费/无网）的条目无限轮回。
+PENDING_SMS_MAX_FLUSH_ROUNDS = 3
+
+
+@dataclass
+class _PendingSms:
+    """通话后补发队列的一条待发短信（#127）。
+
+    ``owner_relay``：是否给机主的转告口信——终态失败时要经 system 事件给机主
+    兜底通知。``rounds``：已消耗的收尾补发轮数（见 PENDING_SMS_MAX_FLUSH_ROUNDS）。
+    """
+
+    number: str
+    content: str
+    owner_relay: bool = False
+    rounds: int = 0
+
 # Profile-gated fallback: wait briefly for a genuine tool call after the Agent
 # says it is pressing a key. The recent-send window closes transcript/tool races.
 DTMF_SPOKEN_FOLLOWUP_DELAY_SECONDS = 3.0
@@ -140,9 +164,11 @@ _EXTERNAL_TOOL_RESULT_TIMEOUT_SECONDS = 2.0
 _INBOUND_TAKEOVER_OFFER_TTL_SECONDS = 30.0
 # 固定垫话按 AGENT_LANGUAGE 取（WIL-120 二期顺手修：原为写死中文，en 通话下
 # AI 会突然冒中文）。不进模型自由生成——这几句是系统兜底话术，必须可预期。
+# 措辞按实际状态说（#121）：播这句时转接请求已发出（机主手机已收到），
+# 「我确认一下」弱于事实，改为明确的「正在转接」。
 _INBOUND_TAKEOVER_HOLD_TEXT = {
-    "zh": "请稍等，我确认一下，马上帮您转接。",
-    "en": "One moment please, let me check — I'll transfer you right away.",
+    "zh": "正在为您转接本人，请稍等，不要挂断。",
+    "en": "I'm putting you through now — please hold on, don't hang up.",
 }
 _INBOUND_TAKEOVER_MEDIA_TIMEOUT_SECONDS = 15.0
 _INBOUND_TRIAGE_CLARIFY_TEXT = {
@@ -235,6 +261,21 @@ class CallSession:
         self._turn_audio_started_at = 0.0
         self._record: CallRecord | None = None
         self._summary_thread: threading.Thread | None = None
+        # 通话后短信补发队列（#127）：通话中 AT+CMGS 必被 SIM7600 拒，send_sms
+        # 工具发送失败时经 queue_sms 回调入这里，通话收尾后由后台线程补发。
+        # 纯内存、不做持久化，服务重启丢失可接受——队列通常只在「通话进行中→
+        # 挂断后几秒」窗口内有内容；例外是背靠背来电下补发再次撞上通话，
+        # 条目带轮数转入下一次通话收尾续试（上限 PENDING_SMS_MAX_FLUSH_ROUNDS）。
+        self._pending_sms: list[_PendingSms] = []
+        self._pending_sms_lock = threading.Lock()
+        self._pending_sms_thread: threading.Thread | None = None
+        # 收尾 flush 弹空队列后，迟到的入队（工具线程 0.6s 快速失败晚于收尾）
+        # 不能留在队列里等死——置 False 期间入队直接起一次性补发线程。
+        self._pending_sms_accepting = True
+        # 补发节奏与轮数上限（实例属性便于单测归零/收紧，缺省取模块常量）。
+        self._pending_sms_flush_delay = PENDING_SMS_FLUSH_DELAY_SECONDS
+        self._pending_sms_retry_delay = PENDING_SMS_RETRY_DELAY_SECONDS
+        self._pending_sms_max_rounds = PENDING_SMS_MAX_FLUSH_ROUNDS
         # 延迟挂断（hangup 工具）状态：CallSession 跨通复用，上一通排下的
         # Timer 必须可取消；世代号兜住已越过 cancel、正在执行的回调，
         # 避免它 stop() 误伤下一通会话。
@@ -438,6 +479,11 @@ class CallSession:
 
     async def _handle_call(self) -> None:
         self._clear_outgoing_audio()
+        # 待发短信队列重新开门：本通产生的失败条目正常入队等收尾补发。
+        # 注意**不清空**——上一轮补发撞上本通通话而转入的条目要留到本通收尾续试
+        # （背靠背来电场景，见 _pending_sms_worker 的轮转逻辑）。
+        with self._pending_sms_lock:
+            self._pending_sms_accepting = True
         self._load_session_config()
 
         session_t0 = time.monotonic()
@@ -644,6 +690,9 @@ class CallSession:
             self._end_takeover_context("CALL_ENDED")
             mark("ended", status=status)
             self._finalize_record(record, status, transcripts, direction, number)
+            # 通话中失败入队的短信（#127）在这里补发：_shutdown_agent 已挂断
+            # 物理通话，模组即将回到空闲态。后台线程执行，任何异常不炸收尾。
+            self._flush_pending_sms()
 
     async def _connect_outbound(self, mark: Callable[..., float]) -> bool:
         """外呼：拨号并等待接通；未接通时发结束事件、挂断并返回 False。"""
@@ -895,6 +944,15 @@ class CallSession:
         if not should_speak:
             return
         try:
+            # 真机 2026-08-19（#121）：OpenAI 突发投递的旧话轮（「他现在不方便
+            # 接…我复述一下」）可能还有数秒积压在桥里慢慢播——请求路径清的
+            # 应用层队列够不到这层，caller 会在 push 已到机主手机后仍听到
+            # 「不方便接」。垫话开播前丢弃桥内未播积压（与 barge-in 同机制），
+            # 让「正在转接」立即接上。
+            if hasattr(bridge, "discard_pending_output"):
+                dropped = bridge.discard_pending_output()
+                if dropped:
+                    logger.info("接管垫话前丢弃桥内旧音频 %d 字节", dropped)
             await agent.say(_INBOUND_TAKEOVER_HOLD_TEXT[agent_language()])
             # Flush the one permitted hold line before closing the AI gate; the
             # regular loop deliberately drops queued AI audio after this point.
@@ -1330,6 +1388,154 @@ class CallSession:
             logger.warning("创建通话记录失败: %s", exc)
             return None
 
+    def _queue_pending_sms(
+        self, number: str, content: str, owner_relay: bool = False
+    ) -> None:
+        """把一条通话中发不出去的短信入待发队列（#127，CallTools 回调）。
+
+        白名单 / 频控校验在 CallTools 侧、入队之前已经做完——不合规的请求
+        根本走不到这里；补发时不再重复校验（频控额度在首次尝试时已占用）。
+
+        竞态兜底：工具 dispatch 跑在工具线程，「通话中发送 0.6s 快速失败→
+        入队」可能晚于收尾 flush 弹空队列。此时（accepting=False）不能把
+        条目留在队列里等死（下一通遥遥无期而模型已回 queued）——直接起
+        一次性补发线程立即送这一条。
+        """
+        entry = _PendingSms(number=number, content=content, owner_relay=owner_relay)
+        with self._pending_sms_lock:
+            if self._pending_sms_accepting:
+                self._pending_sms.append(entry)
+                depth = len(self._pending_sms)
+            else:
+                depth = -1
+        if depth >= 0:
+            logger.info("短信入通话后补发队列（当前 %d 条） -> %s", depth, number)
+            return
+        logger.info("短信入队晚于通话收尾，立即起线程补发 -> %s", number)
+        self._start_pending_sms_thread([entry])
+
+    def _flush_pending_sms(self) -> None:
+        """通话收尾：把待发队列交给后台线程补发（不阻塞收尾、异常不外抛）。
+
+        弹空的同时关闭入队（accepting=False）：此后迟到的入队走立即补发路径。
+        补发线程与下一通通话可能并发——modem.send_sms 自带串口锁；真撞上
+        通话中会再次被拒，条目转入下一次通话收尾续试（见 worker 轮转逻辑）。
+        """
+        try:
+            with self._pending_sms_lock:
+                pending = list(self._pending_sms)
+                self._pending_sms.clear()
+                self._pending_sms_accepting = False
+            if not pending:
+                return
+            self._start_pending_sms_thread(pending)
+        except Exception:  # noqa: BLE001
+            logger.exception("启动短信补发线程失败（不影响通话收尾）")
+
+    def _start_pending_sms_thread(self, pending: list[_PendingSms]) -> None:
+        thread = threading.Thread(
+            target=self._pending_sms_worker,
+            args=(pending,),
+            daemon=True,
+            name="pending-sms-flush",
+        )
+        self._pending_sms_thread = thread
+        thread.start()
+
+    def _pending_sms_worker(self, pending: list[_PendingSms]) -> None:
+        """后台补发：静置→逐条发送，失败重试一次。
+
+        本轮失败（含检测到又在通话中而跳过发送）不等于终态：条目带轮数
+        直接塞回队列，转入**下一次**通话收尾续试——背靠背来电下本轮补发
+        大概率整个落在下一通通话中，当场放弃就是口信永久丢失（评审必修 1）。
+        轮数到顶才判终态失败：日志 + sms_out failed 事件；owner 转告口信
+        另发 system 事件兜底通知机主（评审必修 2）。
+        """
+        if self._pending_sms_flush_delay > 0:
+            time.sleep(self._pending_sms_flush_delay)
+        for entry in pending:
+            ok = False
+            skipped_in_call = False
+            try:
+                skipped_in_call = bool(self.modem.is_call_connected())
+            except Exception:  # noqa: BLE001
+                skipped_in_call = False
+            if skipped_in_call:
+                # 又在通话中：CMGS 必被拒，发了也白发，直接转下一轮。
+                logger.info(
+                    "补发时模组又在通话中，短信转入下一次通话收尾 -> %s",
+                    entry.number,
+                )
+            else:
+                for attempt in (1, 2):
+                    try:
+                        ok = bool(self.modem.send_sms(entry.number, entry.content))
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "通话后补发短信异常（第 %d 次）-> %s: %s",
+                            attempt,
+                            entry.number,
+                            exc,
+                        )
+                        ok = False
+                    if ok:
+                        break
+                    if attempt == 1 and self._pending_sms_retry_delay > 0:
+                        time.sleep(self._pending_sms_retry_delay)
+            if ok:
+                logger.info("通话后补发短信成功 -> %s", entry.number)
+                self._publish_pending_sms_result(entry, ok=True)
+                continue
+            entry.rounds += 1
+            if entry.rounds < self._pending_sms_max_rounds:
+                # 非终态：塞回队列等下一次通话收尾。直接 append（不走
+                # _queue_pending_sms），避免 accepting=False 时递归起线程。
+                with self._pending_sms_lock:
+                    self._pending_sms.append(entry)
+                logger.warning(
+                    "通话后补发短信失败，转入下一次通话收尾续试（第 %d/%d 轮） -> %s",
+                    entry.rounds,
+                    self._pending_sms_max_rounds,
+                    entry.number,
+                )
+                continue
+            logger.warning(
+                "通话后补发短信失败（%d 轮用尽，放弃） -> %s",
+                entry.rounds,
+                entry.number,
+            )
+            self._publish_pending_sms_result(entry, ok=False)
+
+    def _publish_pending_sms_result(self, entry: _PendingSms, *, ok: bool) -> None:
+        """补发终态事件：sms_out sent/failed；owner 口信失败加发兜底通知。
+
+        终态才发 sms_out（入队/轮转期间不发），避免同一条短信在消息同步里
+        出现多条记录。失败事件让面板可见（#127 验收）；owner 转告口信失败
+        再经既有 system 事件通道主动告知机主——只说「有口信没送达」，
+        不复述正文，避免 spam 内容借通知触达（评审必修 2）。
+        """
+        try:
+            self._publish(
+                {
+                    "type": "sms_out",
+                    "number": entry.number,
+                    "text": entry.content,
+                    "status": "sent" if ok else "failed",
+                }
+            )
+            if not ok and entry.owner_relay:
+                self._publish(
+                    {
+                        "type": "system",
+                        "text": (
+                            "有一条通话中记下的给机主的口信短信补发失败"
+                            "（已重试多轮），请到消息列表查看内容。"
+                        ),
+                    }
+                )
+        except Exception:  # noqa: BLE001
+            logger.exception("补发结果事件发布失败")
+
     def _finalize_record(
         self,
         record: CallRecord | None,
@@ -1612,8 +1818,14 @@ class CallSession:
             send_dtmf=self._send_dtmf_from_tool,
             effect_guard=lambda: self._agent_effect_allowed(generation),
             direction=direction,
+            queue_sms=self._queue_pending_sms,
         )
         registry = tools.register()
+        # 分诊等待态门禁（#126）：TRIAGE_PENDING 期间对外副作用工具在执行层
+        # 被拒——提示词约束挡不住模型的工具调用惯性（真机 2026-08-19：等待态
+        # send_sms 把 spam 话术原样转发机主）。judge 放行清 _triage_pending
+        # 后自然恢复，无需重建注册表。
+        registry.set_external_effect_gate(self._triage_effect_gate)
         if (
             direction == "inbound"
             and config.get_bool("INBOUND_TAKEOVER_ENABLED")
@@ -1622,8 +1834,34 @@ class CallSession:
             registry.register(
                 REQUEST_OWNER_TAKEOVER_SPEC,
                 lambda _args: self._request_owner_takeover(generation),
+                external_effect=True,
             )
         return registry
+
+    def _triage_effect_gate(self, tool: str) -> dict[str, Any] | None:
+        """对外副作用工具的分诊门禁：等待态拒绝，放行后返回 None 恢复。
+
+        回传明确 code 与一句解释让模型收敛到限制话术，而不是换个工具再试。
+        拦截同时落审计事件——原 triage_restriction_check 只 shadow 记录
+        violation 不拦截，这里是真正的机制层闸门。
+        """
+        if not self._triage_pending:
+            return None
+        record = self._record
+        if record is not None:
+            try:
+                record.log_event("triage_tool_blocked", tool=tool)
+            except Exception:  # noqa: BLE001
+                pass
+        logger.warning("分诊等待态拦截对外副作用工具: tool=%s", tool)
+        return {
+            "success": False,
+            "code": "TRIAGE_PENDING_BLOCKED",
+            "message": (
+                "来电分诊尚未放行，现在不能执行任何对外转达/发送类操作；"
+                "请继续按当前限制话术应对来电者，等待系统放行"
+            ),
+        }
 
     def _start_dtmf_judge(
         self, record: CallRecord | None, *, session_t0: float

@@ -112,6 +112,7 @@ class CallTools:
         send_dtmf: DtmfSender | None = None,
         effect_guard: Callable[[], bool] | None = None,
         direction: str | None = None,
+        queue_sms: Callable[[str, str, bool], None] | None = None,
     ) -> None:
         self._modem = modem
         # 通话方向由 CallSession 显式注入（它本来就算好了传给 _build_tools），
@@ -128,10 +129,25 @@ class CallTools:
         self._send_dtmf_impl = send_dtmf or self._send_dtmf_via_modem
         self._dtmf_fallback_mode = "unknown" if send_dtmf else "qvts"
         self._effect_guard = effect_guard or (lambda: True)
+        # 通话后补发队列的入队回调（#127，由 CallSession 注入），签名
+        # (number, content, owner_relay)：SIM7600 语音通话期间 AT+CMGS 必被
+        # 模组拒（真机 0.6s 快速失败），发送失败时不当场放弃，入队等通话结束
+        # 补发；owner_relay 标记给机主的转告口信，补发终态失败时要给机主
+        # 兜底通知。None = 保持旧行为（直接构造 CallTools 的单测 / 未接线的
+        # 调用方照旧上报失败）。
+        self._queue_sms = queue_sms
 
     def register(self) -> ToolRegistry:
+        # external_effect 标记 = 该工具对通话之外的世界产生副作用（把内容送达
+        # 第三方 / 打扰机主），分诊等待态等门禁据此拦截（#126）。挂断与 DTMF
+        # 只作用于当前通话本身，查验证码/等短信是纯读，都不打标记——等待态
+        # 也要能正常挂断、按 IVR 键。
         registry = ToolRegistry()
-        registry.register(SEND_SMS_SPEC, self._timed("send_sms", self._send_sms))
+        registry.register(
+            SEND_SMS_SPEC,
+            self._timed("send_sms", self._send_sms),
+            external_effect=True,
+        )
         registry.register(HANGUP_SPEC, self._timed("hangup_call", self._hangup))
         if config.get_bool("TOOL_QUERY_CODE_ENABLED"):
             registry.register(
@@ -145,7 +161,11 @@ class CallTools:
         if self._direction == "outbound":
             # 机主确认环（WIL-120 二期）：外呼专用。inbound 的对应机制是
             # takeover（把电话整个交给机主），语义不同，不共用。
-            registry.register(ASK_OWNER_SPEC, self._timed("ask_owner", self._ask_owner))
+            registry.register(
+                ASK_OWNER_SPEC,
+                self._timed("ask_owner", self._ask_owner),
+                external_effect=True,
+            )
         return registry
 
     def _timed(
@@ -344,6 +364,11 @@ class CallTools:
             ok = self._modem.send_sms(number, content)
         except Exception as exc:  # noqa: BLE001
             logger.warning("工具发送短信失败: %s", exc)
+            queued = self._queue_for_retry(
+                number, content, owner_token=owner_token, owner_relay=owner_relay
+            )
+            if queued is not None:
+                return queued
             self._audit_tool(
                 "send_sms",
                 args={"to": number, "content_length": len(content)},
@@ -359,6 +384,12 @@ class CallTools:
                     "status": "sent",
                 }
             )
+        else:
+            queued = self._queue_for_retry(
+                number, content, owner_token=owner_token, owner_relay=owner_relay
+            )
+            if queued is not None:
+                return queued
         result = {
             "success": ok,
             # owner 标记发送时回传标记而不是真实号码：工具结果会回流进模型
@@ -373,6 +404,44 @@ class CallTools:
             result={"success": bool(ok)},
         )
         return result
+
+    def _queue_for_retry(
+        self, number: str, content: str, *, owner_token: bool, owner_relay: bool
+    ) -> dict | None:
+        """发送失败的入队兜底（#127）：入待发队列并回传 queued 成功语义。
+
+        SIM7600 语音通话中 AT+CMGS 必被模组拒（真机 0.6s 快速失败）——通话中
+        「转告机主」的合法场景全都踩这个坑。这里不当场认输：白名单/频控已在
+        上方校验通过（不合规根本走不到发送这一步，也就不会入队），入队后由
+        CallSession 在通话收尾处补发。对模型回报 success+queued，让它对通话
+        对方说「会转告」而不是「没发出去」。
+
+        返回 None 表示没有队列可用（未注入回调 / 入队本身炸了），调用方
+        沿旧的失败路径上报。此处不发 sms_out 事件——事件在补发出结果后
+        由 CallSession 以 sent/failed 终态发一次，避免同一条短信在
+        content_sync 的消息列表里出现「queued + sent」两条。
+        """
+        if self._queue_sms is None:
+            return None
+        try:
+            self._queue_sms(number, content, owner_relay)
+        except Exception:  # noqa: BLE001
+            logger.exception("短信入待发队列失败，按发送失败上报: %s", number)
+            return None
+        logger.info("通话中短信发送失败，已入待发队列等通话结束补发 -> %s", number)
+        self._audit_tool(
+            "send_sms",
+            args={"to": number, "content_length": len(content)},
+            result={"success": True, "queued": True},
+        )
+        return {
+            "success": True,
+            "queued": True,
+            # 同上：owner 标记不回传真实号码，避免号码回流进模型上下文。
+            "to": "owner" if owner_token else number,
+            "content": content,
+            "message": "通话占用信道，短信已排队，通话结束后会自动送达",
+        }
 
     def _hangup(self, args: dict) -> dict:
         """工具处理：Agent 请求挂断当前通话。

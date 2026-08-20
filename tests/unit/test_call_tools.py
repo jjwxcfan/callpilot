@@ -41,6 +41,7 @@ def make_tools(
     send_dtmf=None,
     effect_guard=None,
     direction=None,
+    queue_sms=None,
 ) -> tuple[CallTools, FakeModem, list]:
     modem = modem or FakeModem()
     hangups: list[bool] = []
@@ -54,6 +55,7 @@ def make_tools(
         send_dtmf=send_dtmf,
         effect_guard=effect_guard,
         direction=direction,
+        queue_sms=queue_sms,
     )
     return tools, modem, hangups
 
@@ -408,6 +410,153 @@ def test_send_sms_exception_reported_as_failure():
     result = tools._send_sms({"content": "hi"})
     assert result["success"] is False
     assert "串口断开" in result["message"]
+
+
+# ---- send_sms 通话后补发队列（#127）----
+
+def test_send_sms_failure_enqueues_and_reports_queued():
+    """通话中 CMGS 被模组拒（发送返回 False）：入队并回传 queued 成功语义。"""
+    modem = FakeModem()
+    modem.sms_should_succeed = False
+    queued: list[tuple[str, str]] = []
+    record = SpyRecord()
+    tools, _, _ = make_tools(
+        modem=modem,
+        caller="+16505550100",
+        record=record,
+        queue_sms=lambda n, c, o: queued.append((n, c, o)),
+    )
+
+    result = tools._send_sms({"content": "call me back"})
+
+    assert result["success"] is True
+    assert result["queued"] is True
+    assert queued == [("+16505550100", "call me back", False)]
+    # 审计事件带 queued 标记，且只有一条。
+    audits = [f for t, f in record.events if t == "tool_call"]
+    assert audits == [
+        {
+            "tool": "send_sms",
+            "args": {"to": "+16505550100", "content_length": len("call me back")},
+            "result": {"success": True, "queued": True},
+        }
+    ]
+
+
+def test_send_sms_exception_also_enqueues():
+    """发送抛异常（串口毛刺等）与返回 False 同等对待：入队不认输。"""
+    modem = FakeModem()
+    modem.send_sms = lambda number, text: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        RuntimeError("CMS ERROR")
+    )
+    queued: list[tuple[str, str]] = []
+    tools, _, _ = make_tools(
+        modem=modem,
+        caller="+16505550100",
+        queue_sms=lambda n, c, o: queued.append((n, c, o)),
+    )
+
+    result = tools._send_sms({"content": "hi"})
+
+    assert result["success"] is True
+    assert result["queued"] is True
+    assert queued == [("+16505550100", "hi", False)]
+
+
+def test_send_sms_queued_does_not_publish_sms_out():
+    """入队时不发 sms_out 事件——终态（sent/failed）由补发线程发一次。"""
+    hub = make_hub()
+    modem = FakeModem()
+    modem.sms_should_succeed = False
+    tools, _, _ = make_tools(
+        modem=modem, hub=hub, caller="+16505550100", queue_sms=lambda n, c, o: None
+    )
+
+    tools._send_sms({"content": "hi"})
+
+    assert [e for e in hub.history() if e.get("type") == "sms_out"] == []
+
+
+def test_send_sms_owner_token_queued_result_hides_real_number(monkeypatch):
+    """owner 标记入队时同样只回传 owner，不把真实号码送回模型上下文。"""
+    monkeypatch.setenv("OWNER_PHONE", "+16505550111")
+    modem = FakeModem()
+    modem.sms_should_succeed = False
+    queued: list[tuple[str, str]] = []
+    tools, _, _ = make_tools(
+        modem=modem,
+        caller="+16505550100",
+        queue_sms=lambda n, c, o: queued.append((n, c, o)),
+    )
+
+    result = tools._send_sms({"to": "owner", "content": "please call back"})
+
+    assert result["queued"] is True
+    assert result["to"] == "owner"
+    assert queued[0][0] == "+16505550111"
+    assert queued[0][2] is True  # owner 转告口信标记，终态失败要兜底通知机主
+
+
+def test_send_sms_target_not_allowed_never_enqueues():
+    """白名单拦截在入队之前：不合规直接拒，绝不落进补发队列。"""
+    queued: list[tuple[str, str]] = []
+    modem = FakeModem()
+    modem.sms_should_succeed = False
+    tools, _, _ = make_tools(
+        modem=modem,
+        caller="+16505550100",
+        sms_gate=lambda n: False,
+        queue_sms=lambda n, c, o: queued.append((n, c, o)),
+    )
+
+    result = tools._send_sms({"to": "+16505550122", "content": "hi"})
+
+    assert result["success"] is False
+    assert queued == []
+    assert modem.calls == []  # 拦截路径不得触达 AT
+
+
+def test_send_sms_rate_limited_never_enqueues(monkeypatch):
+    """频控拦截同样在入队之前：超额请求不得借队列绕过频控。"""
+    monkeypatch.setenv("SMS_RATE_LIMIT_PER_HOUR", "1")
+    from agentcall import rate_limit
+
+    rate_limit.reset_sms_rate_limit_state()
+    queued: list[tuple[str, str]] = []
+    modem = FakeModem()
+    modem.sms_should_succeed = False
+    tools, _, _ = make_tools(
+        modem=modem,
+        caller="+16505550100",
+        queue_sms=lambda n, c, o: queued.append((n, c, o)),
+    )
+
+    first = tools._send_sms({"content": "hi"})  # 失败→入队，占用唯一额度
+    second = tools._send_sms({"content": "again"})
+
+    assert first["queued"] is True
+    assert second["success"] is False
+    assert "频控" in second["message"]
+    assert queued == [("+16505550100", "hi", False)]
+    rate_limit.reset_sms_rate_limit_state()
+
+
+def test_send_sms_queue_callback_failure_falls_back_to_error():
+    """入队本身炸了（极端情况）：退回旧的失败上报，不给模型假承诺。"""
+    modem = FakeModem()
+    modem.sms_should_succeed = False
+
+    def broken_queue(number: str, content: str, owner_relay: bool) -> None:
+        raise RuntimeError("queue broken")
+
+    tools, _, _ = make_tools(
+        modem=modem, caller="+16505550100", queue_sms=broken_queue
+    )
+
+    result = tools._send_sms({"content": "hi"})
+
+    assert result["success"] is False
+    assert "queued" not in result
 
 
 # ---- hangup_call ----
