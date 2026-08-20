@@ -112,7 +112,7 @@ class CallTools:
         send_dtmf: DtmfSender | None = None,
         effect_guard: Callable[[], bool] | None = None,
         direction: str | None = None,
-        queue_sms: Callable[[str, str], None] | None = None,
+        queue_sms: Callable[[str, str, bool], None] | None = None,
     ) -> None:
         self._modem = modem
         # 通话方向由 CallSession 显式注入（它本来就算好了传给 _build_tools），
@@ -129,10 +129,12 @@ class CallTools:
         self._send_dtmf_impl = send_dtmf or self._send_dtmf_via_modem
         self._dtmf_fallback_mode = "unknown" if send_dtmf else "qvts"
         self._effect_guard = effect_guard or (lambda: True)
-        # 通话后补发队列的入队回调（#127，由 CallSession 注入）：
-        # SIM7600 语音通话期间 AT+CMGS 必被模组拒（真机 0.6s 快速失败），
-        # 发送失败时不当场放弃，入队等通话结束补发。None = 保持旧行为
-        # （直接构造 CallTools 的单测 / 未接线的调用方照旧上报失败）。
+        # 通话后补发队列的入队回调（#127，由 CallSession 注入），签名
+        # (number, content, owner_relay)：SIM7600 语音通话期间 AT+CMGS 必被
+        # 模组拒（真机 0.6s 快速失败），发送失败时不当场放弃，入队等通话结束
+        # 补发；owner_relay 标记给机主的转告口信，补发终态失败时要给机主
+        # 兜底通知。None = 保持旧行为（直接构造 CallTools 的单测 / 未接线的
+        # 调用方照旧上报失败）。
         self._queue_sms = queue_sms
 
     def register(self) -> ToolRegistry:
@@ -350,7 +352,9 @@ class CallTools:
             ok = self._modem.send_sms(number, content)
         except Exception as exc:  # noqa: BLE001
             logger.warning("工具发送短信失败: %s", exc)
-            queued = self._queue_for_retry(number, content, owner_token)
+            queued = self._queue_for_retry(
+                number, content, owner_token=owner_token, owner_relay=owner_relay
+            )
             if queued is not None:
                 return queued
             self._audit_tool(
@@ -369,7 +373,9 @@ class CallTools:
                 }
             )
         else:
-            queued = self._queue_for_retry(number, content, owner_token)
+            queued = self._queue_for_retry(
+                number, content, owner_token=owner_token, owner_relay=owner_relay
+            )
             if queued is not None:
                 return queued
         result = {
@@ -388,7 +394,7 @@ class CallTools:
         return result
 
     def _queue_for_retry(
-        self, number: str, content: str, owner_token: bool
+        self, number: str, content: str, *, owner_token: bool, owner_relay: bool
     ) -> dict | None:
         """发送失败的入队兜底（#127）：入待发队列并回传 queued 成功语义。
 
@@ -406,7 +412,7 @@ class CallTools:
         if self._queue_sms is None:
             return None
         try:
-            self._queue_sms(number, content)
+            self._queue_sms(number, content, owner_relay)
         except Exception:  # noqa: BLE001
             logger.exception("短信入待发队列失败，按发送失败上报: %s", number)
             return None

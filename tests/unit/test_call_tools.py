@@ -424,14 +424,14 @@ def test_send_sms_failure_enqueues_and_reports_queued():
         modem=modem,
         caller="+16505550100",
         record=record,
-        queue_sms=lambda n, c: queued.append((n, c)),
+        queue_sms=lambda n, c, o: queued.append((n, c, o)),
     )
 
     result = tools._send_sms({"content": "call me back"})
 
     assert result["success"] is True
     assert result["queued"] is True
-    assert queued == [("+16505550100", "call me back")]
+    assert queued == [("+16505550100", "call me back", False)]
     # 审计事件带 queued 标记，且只有一条。
     audits = [f for t, f in record.events if t == "tool_call"]
     assert audits == [
@@ -453,14 +453,14 @@ def test_send_sms_exception_also_enqueues():
     tools, _, _ = make_tools(
         modem=modem,
         caller="+16505550100",
-        queue_sms=lambda n, c: queued.append((n, c)),
+        queue_sms=lambda n, c, o: queued.append((n, c, o)),
     )
 
     result = tools._send_sms({"content": "hi"})
 
     assert result["success"] is True
     assert result["queued"] is True
-    assert queued == [("+16505550100", "hi")]
+    assert queued == [("+16505550100", "hi", False)]
 
 
 def test_send_sms_queued_does_not_publish_sms_out():
@@ -469,7 +469,7 @@ def test_send_sms_queued_does_not_publish_sms_out():
     modem = FakeModem()
     modem.sms_should_succeed = False
     tools, _, _ = make_tools(
-        modem=modem, hub=hub, caller="+16505550100", queue_sms=lambda n, c: None
+        modem=modem, hub=hub, caller="+16505550100", queue_sms=lambda n, c, o: None
     )
 
     tools._send_sms({"content": "hi"})
@@ -486,7 +486,7 @@ def test_send_sms_owner_token_queued_result_hides_real_number(monkeypatch):
     tools, _, _ = make_tools(
         modem=modem,
         caller="+16505550100",
-        queue_sms=lambda n, c: queued.append((n, c)),
+        queue_sms=lambda n, c, o: queued.append((n, c, o)),
     )
 
     result = tools._send_sms({"to": "owner", "content": "please call back"})
@@ -494,6 +494,7 @@ def test_send_sms_owner_token_queued_result_hides_real_number(monkeypatch):
     assert result["queued"] is True
     assert result["to"] == "owner"
     assert queued[0][0] == "+16505550111"
+    assert queued[0][2] is True  # owner 转告口信标记，终态失败要兜底通知机主
 
 
 def test_send_sms_target_not_allowed_never_enqueues():
@@ -505,7 +506,7 @@ def test_send_sms_target_not_allowed_never_enqueues():
         modem=modem,
         caller="+16505550100",
         sms_gate=lambda n: False,
-        queue_sms=lambda n, c: queued.append((n, c)),
+        queue_sms=lambda n, c, o: queued.append((n, c, o)),
     )
 
     result = tools._send_sms({"to": "+16505550122", "content": "hi"})
@@ -527,7 +528,7 @@ def test_send_sms_rate_limited_never_enqueues(monkeypatch):
     tools, _, _ = make_tools(
         modem=modem,
         caller="+16505550100",
-        queue_sms=lambda n, c: queued.append((n, c)),
+        queue_sms=lambda n, c, o: queued.append((n, c, o)),
     )
 
     first = tools._send_sms({"content": "hi"})  # 失败→入队，占用唯一额度
@@ -536,7 +537,7 @@ def test_send_sms_rate_limited_never_enqueues(monkeypatch):
     assert first["queued"] is True
     assert second["success"] is False
     assert "频控" in second["message"]
-    assert queued == [("+16505550100", "hi")]
+    assert queued == [("+16505550100", "hi", False)]
     rate_limit.reset_sms_rate_limit_state()
 
 
@@ -545,7 +546,7 @@ def test_send_sms_queue_callback_failure_falls_back_to_error():
     modem = FakeModem()
     modem.sms_should_succeed = False
 
-    def broken_queue(number: str, content: str) -> None:
+    def broken_queue(number: str, content: str, owner_relay: bool) -> None:
         raise RuntimeError("queue broken")
 
     tools, _, _ = make_tools(
