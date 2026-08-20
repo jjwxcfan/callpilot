@@ -1292,6 +1292,7 @@ def test_say_and_wait_waits_for_own_response_done():
     """say 是 fire-and-forget，垫话/拒绝语必须等本轮 response.done 再收闸；
     say_and_wait 以「created 序号前进且 active 归零」为完成条件。"""
     agent = _make_agent()
+    agent._ws = object()
     sent: list[str] = []
 
     async def fake_say(instructions: str) -> None:
@@ -1319,6 +1320,7 @@ def test_say_and_wait_waits_for_own_response_done():
 def test_say_and_wait_cancels_active_response_first():
     """旧轮次仍在生成时先 cancel，免得旧话轮和固定话术抢播。"""
     agent = _make_agent()
+    agent._ws = object()
     agent._response_active = True
     cancelled: list[bool] = []
 
@@ -1338,8 +1340,9 @@ def test_say_and_wait_cancels_active_response_first():
 
 
 def test_say_and_wait_times_out_without_response():
-    """轮次迟迟不完成（断线等）不挂死编排：超时返回 False 继续后续动作。"""
+    """轮次迟迟不完成时不挂死编排：超时返回 False 继续后续动作。"""
     agent = _make_agent()
+    agent._ws = object()  # 连接在位，只是响应迟迟不来
 
     async def fake_say(instructions: str) -> None:
         pass
@@ -1347,3 +1350,36 @@ def test_say_and_wait_times_out_without_response():
     agent.say = fake_say  # type: ignore[method-assign]
 
     assert asyncio.run(agent.say_and_wait("test line", timeout=0.6)) is False
+
+
+def test_say_and_wait_requires_completed_response_not_just_created():
+    """完成条件是「created 前进且 active 归零」两者缺一不可——只 created
+    （音频还在投递）就返回会让调用方提前关闸，话术后半段被丢（评审变异
+    发现该半条件此前无测试锁定）。"""
+    agent = _make_agent()
+    agent._ws = object()
+
+    async def fake_say(instructions: str) -> None:
+        pass
+
+    agent.say = fake_say  # type: ignore[method-assign]
+
+    async def run() -> bool:
+        agent._response_created_seq += 1
+        agent._response_active = True  # 轮次已开始但音频仍在投递
+        return await agent.say_and_wait("test line", timeout=0.6)
+
+    assert asyncio.run(run()) is False
+
+
+def test_say_and_wait_short_circuits_when_disconnected():
+    """断线窗口 say 是静默 no-op，直接返回 False，不白等超时（期间主循环
+    冻结，采集管道会被塞满）。"""
+    agent = _make_agent()
+    assert agent._ws is None
+
+    import time as _time
+
+    t0 = _time.monotonic()
+    assert asyncio.run(agent.say_and_wait("test line", timeout=5.0)) is False
+    assert _time.monotonic() - t0 < 0.5

@@ -493,6 +493,11 @@ class OpenAIVoiceAgent(VoiceAgent):
         （真机 2026-08-19，#125）。若当前有旧轮次在生成，先 cancel 掐掉，
         免得旧话轮和固定话术抢播。返回是否在时限内等到完成。
         """
+        if self._ws is None:
+            # 断线窗口内 say 是静默 no-op，没有任何事件能推进 seq——
+            # 不进入等待循环白吃满超时（评审发现：期间主循环冻结，
+            # ffmpeg 采集管道 ~4s 即满）。
+            return False
         if self._response_active:
             await self.cancel_response()
         baseline = self._response_created_seq
