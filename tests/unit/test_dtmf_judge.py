@@ -61,7 +61,9 @@ class SpyRecord:
             self.events.append((event_type, fields))
 
 
-def wait_until(predicate, timeout: float = 2.0) -> None:
+def wait_until(predicate, timeout: float = 10.0) -> None:
+    # 等「已触发的事」的正向等待：放宽超时只降 flaky，不削弱断言。
+    # GH Actions macos runner 实测 2s 级别的窗口会随机不够用。
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
@@ -532,12 +534,24 @@ def test_blocked_judge_does_not_block_submit_or_stop_and_stale_result_is_dropped
     judge.start()
     started = time.monotonic()
     judge.submit_remote_transcript("请按一", t_ms=10.0)
-    assert time.monotonic() - started < 0.05
-    assert entered.wait(timeout=1)
+    submit_elapsed = time.monotonic() - started
+    assert entered.wait(timeout=5)
 
     stopped_at = time.monotonic()
     judge.stop(join_timeout=0.05)
-    assert time.monotonic() - stopped_at < 0.2
+    stop_elapsed = time.monotonic() - stopped_at
+    # 确定性信号（不依赖壁钟）：stop 返回时被卡住的模型调用必须仍在飞行——
+    # blocked_call 只会在 release.set() 或 10s 兜底后返回。若 stop 等了模型，
+    # 返回时该线程必已结束，此断言即失败。
+    assert any(
+        thread.name == "dtmf-judge-model-call" and thread.is_alive()
+        for thread in threading.enumerate()
+    ), "stop 返回时模型调用应仍被卡住；否则说明 stop 等了模型"
+    # 壁钟只做粗判别：阻塞型回归会耗掉 ≥3s（模型超时）或 10s（release 兜底），
+    # 上界 2s 足以区分，且给 CI 慢机留足余量——原 0.05/0.2s 阈值在 GH Actions
+    # macos runner 上实测 0.21s 随机挂掉（runs 32309610880 / 32312644738）。
+    assert submit_elapsed < 2.0, "submit 不应等被卡住的模型调用"
+    assert stop_elapsed < 2.0, "stop 不应等被卡住的模型调用"
     release.set()
     wait_for_model_threads()
 

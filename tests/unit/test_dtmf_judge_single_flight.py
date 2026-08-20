@@ -130,7 +130,11 @@ def test_slot_exhaustion_is_not_labelled_as_a_model_timeout():
 
     def blocking(messages, model, timeout):
         entered.release()
-        release.wait(2.0)
+        # 兜底超时必须远大于主线程「占满槽位 + overflow 判定」的耗时：
+        # 曾是 2s，慢 runner 上会提前返回把槽位还回去，overflow 反而拿到
+        # 槽位、测试反向误挂。正常路径由下方 release.set() 立即唤醒，
+        # 这个值只在测试自身出错时才会等满。
+        release.wait(30.0)
         return '{"action":"wait","reason_code":"ok"}', None
 
     # 占满所有全局槽位（每个判官实例内部各自 single-flight，故要多个实例）。
@@ -142,14 +146,17 @@ def test_slot_exhaustion_is_not_labelled_as_a_model_timeout():
     for thread in threads:
         thread.start()
     for _ in judges:
-        assert entered.acquire(timeout=2.0), "所有槽位应已占满"
+        # 正向等待（等 4+4 个线程全部起步），放宽只降 flaky 不削弱断言：
+        # 2s 在 GH Actions macos runner 上实测随机不够
+        # （runs 32309610880 / 32312644738）。
+        assert entered.acquire(timeout=10.0), "所有槽位应已占满"
 
     overflow = make_judge(lambda m, model, t: ("unused", None))
     _raw, err = overflow._invoke_model([{"role": "user", "content": "y"}])
 
     release.set()
     for thread in threads:
-        thread.join(3.0)
+        thread.join(10.0)
 
     assert err == "model_saturated", f"槽位耗尽应报 model_saturated，实际 {err!r}"
     assert err != "timeout"
