@@ -24,6 +24,7 @@ import tty
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TextIO
 
 import usb.backend.libusb1
 import usb.core
@@ -86,25 +87,50 @@ def is_hung_stat(stat: str) -> bool:
     return stat.strip()[:1] in {"U", "D"}
 
 
-def classify_lock_holder(pid: int | None, stat: str | None) -> str:
-    """纯判定：持锁进程处于什么状态（离线可测，issue #124）。
+def classify_lock_holder(pid: int | None, alive: bool | None, stat: str | None) -> str:
+    """纯判定：持锁进程一次采样处于什么状态（离线可测，issue #124）。
 
-    - "unknown"：锁文件里没有可解析的 PID——信息不足，保守不抢锁；
-    - "missing"：进程不存在但 flock 仍被持有（异常态）——可安全抢锁；
-    - "hung"：进程挂死在不可中断内核等待，kill -9 也无效——按剧本抢锁；
+    - "unknown"：锁文件里没有可解析的 PID，或探测本身失败（alive/stat 拿不到）
+      ——信息不足，保守不抢锁。ps 超时/失败≠进程不存在：高负载下把健康持有者
+      判成 missing 会误抢活锁，故 stat 缺失但进程存在时一律 unknown；
+    - "missing"：os.kill(pid, 0) 确认进程不存在但 flock 仍被持有（异常态）——可抢；
+    - "hung"：进程挂死在不可中断内核等待（U/D），kill -9 也无效——按剧本抢锁
+      （单次采样只是候选，确认需 judge_lock_holder 连续两次）；
     - "healthy"：进程存在且未挂死——维持拒绝，绝不抢健康实例的锁。
     """
     if pid is None:
         return "unknown"
-    if stat is None:
+    if alive is False:
         return "missing"
+    if alive is None or stat is None:
+        return "unknown"
     if is_hung_stat(stat):
         return "hung"
     return "healthy"
 
 
+def process_alive(pid: int) -> bool | None:
+    """os.kill(pid, 0) 探活：True 存在 / False 不存在（ESRCH）/ None 探测失败。
+
+    与 ps 的区别：ps 超时或失败时无法区分「进程不存在」和「探测手段坏了」，
+    kill(pid, 0) 是内核直答，EPERM 也说明进程存在。
+    """
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+
+
 def process_stat(pid: int) -> str | None:
-    """取进程的 ps STAT 字段；进程不存在（或 ps 不可用）返回 None。"""
+    """取进程的 ps STAT 字段；拿不到（进程不存在/ps 失败）返回 None。
+
+    None 不代表进程不存在——「不存在 vs 探测失败」由 process_alive 区分。
+    """
     try:
         out = subprocess.run(
             ["ps", "-o", "stat=", "-p", str(pid)],
@@ -116,15 +142,158 @@ def process_stat(pid: int) -> str | None:
     return stat or None
 
 
-def acquire_instance_lock(lock_path: Path | None = None, max_attempts: int = 2) -> object:
+def judge_lock_holder(
+    pid: int | None,
+    stat_fn: Callable[[int], str | None] | None = None,
+    alive_fn: Callable[[int], bool | None] | None = None,
+    sleep_fn: Callable[[float], None] | None = None,
+    confirm_interval: float = 1.0,
+) -> str:
+    """两段式挂死判定：连续两次采样（间隔 ~1s）都 U/D 才算 "hung"。
+
+    健康进程做普通磁盘 I/O 也会瞬时进入不可中断态，单次 ps 采样会误判；
+    真正的拔插挂死是持续性的（重启系统前不消失），两次采样零漏报。
+    第二次采样为其他结果时按第二次算（healthy=瞬态、missing=已消失、
+    unknown=保守不抢）。fn 参数默认晚绑定模块全局，便于单测注入。
+    """
+    stat_fn = process_stat if stat_fn is None else stat_fn
+    alive_fn = process_alive if alive_fn is None else alive_fn
+    sleep_fn = time.sleep if sleep_fn is None else sleep_fn
+    if pid is None:
+        return "unknown"
+    first = classify_lock_holder(pid, alive_fn(pid), stat_fn(pid))
+    if first != "hung":
+        return first
+    sleep_fn(confirm_interval)
+    return classify_lock_holder(pid, alive_fn(pid), stat_fn(pid))
+
+
+# ---- 删锁的竞态防护（评审必修，issue #124）----
+#
+# 「删锁重建」天然带三类交错风险：
+#   a) 基于陈旧判定 unlink——B 对自己打开的旧文件判定 hung 后去删路径，但路径
+#      上可能已是救援者 A 刚重建并持锁的活文件，B 会删掉 A 的活锁；
+#   b) flock 后一次性 inode 校验防不住「校验通过后被 unlink」的交错，可能双桥
+#      并立双双 claim USB；
+#   c) 同一 inode 被新实例重新 flock（missing 异常态下 flock 本就空闲）——
+#      inode 比对不变，但持有者已经换人，按陈旧内容判定会误删活锁。
+# 封死方案：一把独立的 rescue 锁（<lock>.rescue）串行化所有「判定→删锁→重建」
+# 与正常拿锁的「写 PID 提交」（_commit_lock）：
+#   - 救援者在 rescue 锁内重读锁文件、重新判定持有者，再比对「路径当前 inode
+#     == 自己判定过的那个 fd 的 inode」，全部通过才 unlink（防 a/c）；
+#   - 正常 acquirer flock 到手后，进 rescue 锁内校验 inode 并写 PID 提交
+#     （防 b：救援者与提交互斥，锁文件内容对救援者要么是旧持有者、要么是已
+#     提交的新 PID，不存在「flock 已易主但内容还是陈旧 PID」的可见中间态；
+#     未提交就被抢走的 acquirer 会在校验时发现并重试，绝无双锁并立）。
+# rescue 锁持有者都是活进程且锁内只做 /tmp 元数据操作与进程探测（不碰 USB
+# fd），不会成为新的挂死点；救援者取 rescue 锁用 LOCK_NB，拿不到（另一救援者
+# 正在处理）就退让重判。
+
+
+def rescue_lock_path(path: Path) -> Path:
+    """串行化救援/提交操作的旁路锁文件路径（<lock>.rescue）。"""
+    return path.with_name(path.name + ".rescue")
+
+
+def unlink_judged_lock(
+    path: Path,
+    judged_file: TextIO,
+    judge_fn: Callable[[int | None], str] | None = None,
+) -> bool:
+    """串行化删锁（不重建）：rescue 锁内重读重判，确认持有者挂死/不存在且
+    路径仍指向 judged_file 的 inode 才删除。外层看门狗用。
+
+    返回是否删了；False = 持有者其实健康 / 路径已被换新 / rescue 锁被占，
+    一律不动。与 _takeover_lock 各自独立取 rescue 锁，两者不得嵌套调用
+    （flock 对同进程的两个 open file description 同样互斥，嵌套会自锁）。
+    """
+    judge = judge_lock_holder if judge_fn is None else judge_fn
+    with rescue_lock_path(path).open("a+") as rescue_lock:
+        try:
+            fcntl.flock(rescue_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False  # 另一救援者正在处理，退让
+        try:
+            if os.stat(path).st_ino != os.fstat(judged_file.fileno()).st_ino:
+                return False  # 只删自己判定过的那个 inode（防交错 a）
+        except FileNotFoundError:
+            return False
+        judged_file.seek(0)
+        pid = parse_lock_holder_pid(judged_file.read())
+        if pid is None or judge(pid) not in ("hung", "missing"):
+            return False  # rescue 锁内重判（防交错 c：同 inode 已换健康持有者）
+        path.unlink()
+        return True
+
+
+def _takeover_lock(path: Path, judged_file: TextIO) -> tuple[str, TextIO | None]:
+    """救援式拿锁：rescue 锁内完成「比对判定过的 inode → 重读重判 → unlink →
+    重建 → flock → 写 PID」全程，其他救援者随后看到的必然是带本进程 PID 的
+    健康新锁。
+
+    返回 (verdict, new_lock)：verdict 为 judge_lock_holder 的四态，外加
+    "busy"（rescue 锁被占）与 "stale"（路径已被换新 / 与并发 acquirer 撞车）；
+    new_lock 仅在成功接管时非 None，其余情况交回外层按新现状重新判定
+    （重判会看到健康持有者并拒绝，绝不误删活锁）。
+    """
+    with rescue_lock_path(path).open("a+") as rescue_lock:
+        try:
+            fcntl.flock(rescue_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return "busy", None
+        try:
+            if os.stat(path).st_ino != os.fstat(judged_file.fileno()).st_ino:
+                return "stale", None  # 只删自己判定过的那个 inode（防交错 a）
+        except FileNotFoundError:
+            return "stale", None
+        judged_file.seek(0)
+        verdict = judge_lock_holder(parse_lock_holder_pid(judged_file.read()))
+        if verdict not in ("hung", "missing"):
+            return verdict, None  # rescue 锁内重判（防交错 c）
+        path.unlink()
+        new_file = path.open("a+")
+        try:
+            fcntl.flock(new_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            # 正常 acquirer 与本进程同时 open 了刚重建的文件且先 flock：让它赢。
+            new_file.close()
+            return "stale", None
+        new_file.truncate(0)
+        new_file.write(str(os.getpid()))
+        new_file.flush()
+        return verdict, new_file
+
+
+def _commit_lock(path: Path, lock_file: TextIO) -> bool:
+    """正常拿锁的提交：rescue 锁内校验 inode 未被换、写入本进程 PID。
+
+    与救援者互斥（防交错 b）：救援者判定时看到的锁文件要么还没易主（陈旧
+    PID，抢走也只会让未提交的本进程校验失败重试），要么已带本进程 PID
+    （判 healthy 而放行）。返回 False = 脚下的文件已被救援者换掉，本把作废。
+    此处 rescue 锁用阻塞取锁：救援者持锁时长有界（两次采样 ~1s + ps 超时上限），
+    且救援者绝不阻塞等 rescue 锁，无死锁回路。
+    """
+    with rescue_lock_path(path).open("a+") as rescue_lock:
+        fcntl.flock(rescue_lock, fcntl.LOCK_EX)
+        try:
+            if os.stat(path).st_ino != os.fstat(lock_file.fileno()).st_ino:
+                return False
+        except FileNotFoundError:
+            return False
+        lock_file.truncate(0)
+        lock_file.write(str(os.getpid()))
+        lock_file.flush()
+        return True
+
+
+def acquire_instance_lock(lock_path: Path | None = None, max_attempts: int = 2) -> TextIO:
     """进程唯一锁：防止两个桥实例争抢 USB claim 导致双双不可用。
 
     返回持有的文件对象（进程退出自动释放）；已有健康实例时报错。
 
-    issue #124：持锁进程若已 U 态挂死或不存在，flock 永不释放——此时删除
-    锁文件后重试 acquire 一次（flock 绑定 inode，新文件即新锁）。竞态安全：
-    两个新桥同时走删锁路径时，重试仍经 flock 天然互斥；另加 inode 校验，
-    防「A 刚 flock 成功、B 又 unlink 重建」导致两把锁各持不同 inode 并立。
+    issue #124：持锁进程若确认 U 态挂死（judge_lock_holder 连续两次采样）
+    或已不存在，flock 永不释放——此时走 _takeover_lock 删锁重建（flock 绑定
+    inode，新文件即新锁），重试一次。竞态安全见「删锁的竞态防护」注释块。
     """
     path = LOCK_PATH if lock_path is None else lock_path
     for attempt in range(1, max_attempts + 1):
@@ -132,35 +301,34 @@ def acquire_instance_lock(lock_path: Path | None = None, max_attempts: int = 2) 
         try:
             fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            lock_file.seek(0)
-            holder_text = lock_file.read().strip()
-            lock_file.close()
-            pid = parse_lock_holder_pid(holder_text)
-            verdict = classify_lock_holder(pid, process_stat(pid) if pid is not None else None)
-            if verdict in ("hung", "missing") and attempt < max_attempts:
-                logger.warning(
-                    "实例锁被 %s 状态的进程占用 (pid=%s)：判定为拔插挂死残留，"
-                    "删除锁文件后重建（僵尸进程只引用旧设备实例，无双桥争抢）",
-                    verdict, pid,
-                )
-                path.unlink(missing_ok=True)
-                continue
-            raise RuntimeError(
-                f"另一个 ec20_usb_pty 实例正在运行 (pid={holder_text or '未知'}, 状态={verdict})；"
-                "同一时刻只能有一个桥占用 EC20 USB 接口。"
-            ) from None
-        # flock 到手后校验 inode：若另一救援者在本进程 open 之后 unlink 并重建了
-        # 锁文件，路径上已是新 inode，手里这把锁形同虚设——放弃本把重试。
-        try:
-            if os.stat(path).st_ino == os.fstat(lock_file.fileno()).st_ino:
-                lock_file.truncate(0)
-                lock_file.write(str(os.getpid()))
-                lock_file.flush()
-                return lock_file
-        except FileNotFoundError:
-            pass
-        lock_file.close()
-    raise RuntimeError("实例锁竞争异常（多个救援进程同时重建锁文件），请稍后重试。")
+            try:
+                lock_file.seek(0)
+                holder_text = lock_file.read().strip()
+                if attempt < max_attempts:
+                    verdict, taken = _takeover_lock(path, lock_file)
+                    if taken is not None:
+                        logger.warning(
+                            "实例锁曾被 %s 状态的进程占用 (pid=%s)：判定为拔插挂死残留，"
+                            "已删锁重建接管（僵尸进程只引用旧设备实例，无双桥争抢）",
+                            verdict, holder_text or "未知",
+                        )
+                        return taken
+                    if verdict in ("busy", "stale"):
+                        continue  # 别的救援者正在/已经处理：重开重判，绝不删别人的活锁
+                else:
+                    verdict = judge_lock_holder(parse_lock_holder_pid(holder_text))
+                raise RuntimeError(
+                    f"另一个 ec20_usb_pty 实例正在运行 (pid={holder_text or '未知'}, 状态={verdict})；"
+                    "同一时刻只能有一个桥占用 EC20 USB 接口。"
+                ) from None
+            finally:
+                lock_file.close()
+        # flock 到手 ≠ 拿锁完成：还须在 rescue 锁内提交（校验 inode + 写 PID），
+        # 防「flock 后被救援者按陈旧判定换掉脚下文件」的交错（详见 _commit_lock）。
+        if _commit_lock(path, lock_file):
+            return lock_file
+        lock_file.close()  # 脚下文件已被救援者换新：重开重判
+    raise RuntimeError("实例锁竞争异常（多个救援进程反复重建锁文件），请稍后重试。")
 
 
 # ---- 桥内看门狗（issue #124）----
@@ -436,6 +604,7 @@ def find_at_port_dynamic(
             time.sleep(1.0)
             continue
         for port in ports.values():
+            HEARTBEAT.feed()  # 逐口探测一轮可达 20s+，口间也喂一次狗
             try:
                 if "OK" in at_on_interface(dev, port, "AT", wait=0.4, rounds=8):
                     return dev, port

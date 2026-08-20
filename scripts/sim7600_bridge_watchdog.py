@@ -9,19 +9,26 @@ U 态。最恶劣形态（真机 2026-08-19）：主线程卡死在 os.close() �
 U 态挂死同样自杀无效，必须由本脚本这样的**外部**守护按真机验证过的救援剧本
 处理：
 
-1. 对桥进程 kill -9 尝试——对 U 态无效但无害（SIGKILL 排队，进程一旦离开
-   不可中断等待即生效，覆盖「卡在 bulk I/O、再次拔插可解」的形态）；
-2. 若锁文件持有者确认 U 态挂死（或已不存在）→ 删除锁文件
-   （flock 绑定 inode，删文件后新桥拿新锁；僵尸进程只引用旧设备实例，
-   不会再碰新插回的设备，无双桥争抢）；
-3. 拉起新桥（新桥的 acquire_instance_lock 自带同款僵尸检测，双保险）。
+1. **只对确认挂死的桥进程** kill -9 尝试（连续两次采样都 U/D 才算挂死，
+   防止健康进程瞬时磁盘 I/O 被误判）——对 U 态无效但无害（SIGKILL 排队，
+   进程一旦离开不可中断等待即生效，覆盖「卡在 bulk I/O、再次拔插可解」的
+   形态）。健康桥进程绝不碰：「永久 U 僵尸（重启系统前不消失）+ 健康新桥
+   + 设备拔走」是救援后的常态组合，健康桥可能正跑组合切换恢复（3×20s
+   settle），无差别 SIGKILL 会把它反复腰斩、永不收敛；
+2. 若锁文件持有者确认挂死/不存在 → 串行化删锁（ec20_usb_pty.
+   unlink_judged_lock：rescue 锁内重读重判 + 只删自己判定过的那个 inode，
+   防止把并发新桥刚建好的活锁删掉；flock 绑定 inode，删文件后新桥拿新锁；
+   僵尸进程只引用旧设备实例，不会再碰新插回的设备，无双桥争抢）；
+3. 无健康桥进程残留时才拉起新桥（有健康桥在场说明它正自行等待/重连，
+   重复拉桥只会被实例锁拒绝，徒增噪音）。新桥的 acquire_instance_lock
+   自带同款僵尸检测与竞态防护，双保险。
 
 判定条件（decide_action，纯函数、离线可测）
 ------------------------------------------
 - PTY symlink 在位 → 一切正常，什么都不做；
 - PTY 缺失未超阈值 → 等（桥启动中/设备刚拔，给它时间）；
 - 超阈值且无桥进程 → 直接拉起新桥（launchd 崩溃风暴、手工误杀等兜底）；
-- 超阈值且有桥进程且至少一个 U 态挂死 → 走救援剧本；
+- 超阈值且有桥进程且至少一个确认挂死 → 走救援剧本（只处置挂死的那些）；
 - 超阈值且桥进程都健康 → 不动：健康桥等待设备重插时 PTY 同样缺失（S 态），
   误杀会打断桥自身的等待-重连循环。桥进程健康但停摆的形态由桥内看门狗
   自杀解决，不归本脚本管。
@@ -74,9 +81,8 @@ if str(_REPO_ROOT) not in sys.path:
 
 from scripts.ec20_usb_pty import (  # noqa: E402  # 需先补 sys.path
     LOCK_PATH,
-    is_hung_stat,
-    parse_lock_holder_pid,
-    process_stat,
+    judge_lock_holder,
+    unlink_judged_lock,
 )
 
 logger = logging.getLogger("sim7600_bridge_watchdog")
@@ -115,52 +121,52 @@ def decide_action(
 
 def clear_stale_lock(
     lock_path: Path,
-    stat_fn: Callable[[int], str | None] = process_stat,
+    judge_fn: Callable[[int | None], str] | None = None,
 ) -> bool:
-    """锁文件持有者已挂死/不存在则删锁；返回是否删了。
+    """锁文件持有者确认挂死/不存在则删锁；返回是否删了。
 
-    内容解析不出 PID 时保守不动（新桥的 acquire_instance_lock 同样不会抢
-    unknown 状态的锁，两边口径一致）。
+    真正的重判与删除在 ec20_usb_pty.unlink_judged_lock 里、rescue 锁串行化
+    之下完成（只删本函数判定过的那个 inode），防止把并发新桥刚建好的活锁
+    删掉。内容解析不出 PID 时保守不动（新桥的 acquire_instance_lock 同样
+    不会抢 unknown 状态的锁，两边口径一致）。
     """
-    if not lock_path.exists():
+    try:
+        judged = lock_path.open("r")
+    except FileNotFoundError:
         return False
-    pid = parse_lock_holder_pid(lock_path.read_text(errors="ignore"))
-    if pid is None:
-        return False
-    stat = stat_fn(pid)
-    if stat is None or is_hung_stat(stat):
-        logger.warning(
-            "锁文件持有者 pid=%s 状态=%s（挂死/不存在），删除 %s 让新桥拿新锁",
-            pid, stat or "不存在", lock_path,
-        )
-        lock_path.unlink(missing_ok=True)
-        return True
-    return False
+    with judged:
+        removed = unlink_judged_lock(lock_path, judged, judge_fn=judge_fn)
+    if removed:
+        logger.warning("锁文件持有者确认挂死/不存在，已删除 %s 让新桥拿新锁", lock_path)
+    return removed
 
 
 def rescue(
-    pids: Sequence[int],
+    hung_pids: Sequence[int],
     lock_path: Path,
     kill_fn: Callable[[int, int], None] = os.kill,
-    stat_fn: Callable[[int], str | None] = process_stat,
+    judge_fn: Callable[[int | None], str] | None = None,
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> None:
-    """救援剧本第 1、2 步：kill -9 尝试 + 持锁进程确认挂死则删锁。
+    """救援剧本第 1、2 步：只对确认挂死的 pid kill -9 + 持锁者确认挂死则删锁。
 
-    kill -9 对 U 态挂死无效但无害（SIGKILL 排队，离开不可中断等待即生效）；
-    删锁后僵尸进程留置无害——它卡死在旧设备实例上，不会再碰新设备。
+    评审必修：绝不无差别杀所有匹配进程——「永久 U 僵尸 + 健康新桥」是救援后
+    的常态组合，健康桥（可能正跑 3×20s 的组合切换恢复）被误杀会永不收敛，
+    调用方只把确认挂死的 pid 传进来。kill -9 对 U 态挂死无效但无害（SIGKILL
+    排队，离开不可中断等待即生效）；删锁后僵尸进程留置无害——它卡死在旧设备
+    实例上，不会再碰新设备。
     """
-    for pid in pids:
+    judge = judge_lock_holder if judge_fn is None else judge_fn
+    for pid in hung_pids:
         try:
             kill_fn(pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
     sleep_fn(1.0)  # 给可中断的进程一点退出时间
-    survivors = {pid: stat_fn(pid) for pid in pids}
-    hung = [pid for pid, stat in survivors.items() if stat is not None and is_hung_stat(stat)]
-    if hung:
-        logger.warning("进程 %s kill -9 后仍 U 态挂死（预期内，需重启系统才消失），走删锁路径", hung)
-    clear_stale_lock(lock_path, stat_fn=stat_fn)
+    survivors = [pid for pid in hung_pids if judge(pid) == "hung"]
+    if survivors:
+        logger.warning("进程 %s kill -9 后仍 U 态挂死（预期内，需重启系统才消失），走删锁路径", survivors)
+    clear_stale_lock(lock_path, judge_fn=judge_fn)
 
 
 def find_bridge_pids(pattern: str) -> list[int]:
@@ -220,16 +226,25 @@ def run_once(
     missing_seconds = 0.0 if missing_since is None else now - missing_since
 
     pids = find_bridge_pids(pattern)
-    hung_flags = [(stat := process_stat(pid)) is not None and is_hung_stat(stat) for pid in pids]
+    # 两段式判定（连续两次采样都 U/D 才算挂死）：健康进程瞬时磁盘 I/O 也会
+    # 短暂进入不可中断态，单次采样会误判误杀。
+    hung_flags = [judge_lock_holder(pid) == "hung" for pid in pids]
     action = decide_action(pids, hung_flags, pty_ok, missing_seconds, threshold)
 
     if action == "rescue":
+        hung_pids = [pid for pid, hung in zip(pids, hung_flags) if hung]
+        healthy_pids = [pid for pid, hung in zip(pids, hung_flags) if not hung]
         logger.error(
-            "桥进程 %s 存在但 %s 缺失 %.0fs 且检测到 U 态挂死，执行救援（kill -9 + 删锁 + 起新桥）",
-            pids, pty_path, missing_seconds,
+            "桥进程挂死 %s（%s 缺失 %.0fs），执行救援（只 kill -9 挂死进程 + 串行化删锁）",
+            hung_pids, pty_path, missing_seconds,
         )
-        rescue(pids, lock_path)
-        start_bridge(bridge_cmd, bridge_log)
+        rescue(hung_pids, lock_path)
+        if healthy_pids:
+            # 评审必修：健康桥绝不误杀、也不重复拉桥——它正自行等待/重连
+            # （可能在跑组合切换恢复），拉新桥只会被实例锁拒绝，徒增噪音。
+            logger.warning("健康桥进程 %s 仍在（自行等待/重连中），僵尸已处置，不重复拉桥", healthy_pids)
+        else:
+            start_bridge(bridge_cmd, bridge_log)
         missing_since = time.monotonic()  # 重置计时，给新桥启动时间
     elif action == "start":
         logger.error("无桥进程且 %s 缺失 %.0fs，拉起新桥", pty_path, missing_seconds)
