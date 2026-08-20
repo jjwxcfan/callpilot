@@ -141,3 +141,28 @@ def test_gate_result_is_json_serializable() -> None:
 
     json.dumps(result, ensure_ascii=False)
     assert "分诊" in result["message"]
+
+
+def test_all_outward_side_effect_tools_are_marked() -> None:
+    """机制层性质声明的完整性（评审缺口）：ask_owner 等对外副作用工具的
+    external_effect 标记缺失时测试要红——门禁按标记生效，漏标即漏拦。"""
+    from fakes import FakeModem
+
+    from agentcall.agents.tools import ASK_OWNER_SPEC, SEND_SMS_SPEC
+    from agentcall.call_tools import CallTools
+
+    tools = CallTools(
+        FakeModem(),  # type: ignore[arg-type]
+        hub=None,
+        get_caller=lambda: None,
+        get_record=lambda: None,
+        schedule_hangup=lambda: None,
+        direction="outbound",
+    )
+    registry = tools.register()
+    marked = registry.external_effect_tool_names()
+    # request_owner_takeover 的生产注册点在 call_agent._build_tools，其打标
+    # 由 test_inbound_triage_wiring 侧的门禁行为测试覆盖；这里审计 CallTools
+    # 注册点的完整性。
+    for spec in (SEND_SMS_SPEC, ASK_OWNER_SPEC):
+        assert spec["function"]["name"] in marked

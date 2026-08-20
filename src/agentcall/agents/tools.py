@@ -318,6 +318,14 @@ class ToolRegistry:
     def specs(self) -> list[dict[str, Any]]:
         return [spec for spec, _handler, _external in self._tools.values()]
 
+    def external_effect_tool_names(self) -> frozenset[str]:
+        """带对外副作用标记的工具名（测试审计打标完整性用）。"""
+        return frozenset(
+            name
+            for name, (_spec, _handler, external) in self._tools.items()
+            if external
+        )
+
     def has_tools(self) -> bool:
         return bool(self._tools)
 
