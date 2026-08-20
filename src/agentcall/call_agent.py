@@ -14,7 +14,7 @@ import time
 from array import array
 from datetime import UTC, datetime
 from queue import Empty, Full, Queue
-from typing import Callable
+from typing import Any, Callable
 
 from . import call_playbooks, config, platforms
 from .agents.base import VoiceAgent
@@ -1625,6 +1625,11 @@ class CallSession:
             direction=direction,
         )
         registry = tools.register()
+        # 分诊等待态门禁（#126）：TRIAGE_PENDING 期间对外副作用工具在执行层
+        # 被拒——提示词约束挡不住模型的工具调用惯性（真机 2026-08-19：等待态
+        # send_sms 把 spam 话术原样转发机主）。judge 放行清 _triage_pending
+        # 后自然恢复，无需重建注册表。
+        registry.set_external_effect_gate(self._triage_effect_gate)
         if (
             direction == "inbound"
             and config.get_bool("INBOUND_TAKEOVER_ENABLED")
@@ -1633,8 +1638,34 @@ class CallSession:
             registry.register(
                 REQUEST_OWNER_TAKEOVER_SPEC,
                 lambda _args: self._request_owner_takeover(generation),
+                external_effect=True,
             )
         return registry
+
+    def _triage_effect_gate(self, tool: str) -> dict[str, Any] | None:
+        """对外副作用工具的分诊门禁：等待态拒绝，放行后返回 None 恢复。
+
+        回传明确 code 与一句解释让模型收敛到限制话术，而不是换个工具再试。
+        拦截同时落审计事件——原 triage_restriction_check 只 shadow 记录
+        violation 不拦截，这里是真正的机制层闸门。
+        """
+        if not self._triage_pending:
+            return None
+        record = self._record
+        if record is not None:
+            try:
+                record.log_event("triage_tool_blocked", tool=tool)
+            except Exception:  # noqa: BLE001
+                pass
+        logger.warning("分诊等待态拦截对外副作用工具: tool=%s", tool)
+        return {
+            "success": False,
+            "code": "TRIAGE_PENDING_BLOCKED",
+            "message": (
+                "来电分诊尚未放行，现在不能执行任何对外转达/发送类操作；"
+                "请继续按当前限制话术应对来电者，等待系统放行"
+            ),
+        }
 
     def _start_dtmf_judge(
         self, record: CallRecord | None, *, session_t0: float
