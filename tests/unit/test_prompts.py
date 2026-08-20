@@ -243,6 +243,44 @@ def test_takeover_explicit_ask_does_not_bypass_preference_screening():
     assert "明确要求找机主本人" not in tool_desc
 
 
+def test_takeover_path_needs_only_who_and_what_before_transfer():
+    """WIL-135 / issue #117 回归：来电者已给出「谁 + 什么事」、明显该转接时，
+    模型仍按留言清单追问「急不急」「还有别的吗」才转。接管路径与留言路径的
+    提问目标必须分离：弄清谁 + 什么事即够判断转接，留言式追问只属于留言路径。"""
+    zh = build_instructions(
+        "inbound",
+        "李明",
+        "数字分身",
+        "",
+        takeover_preference="真心找机主的转接；推销骚扰不转。",
+    )
+    en = build_instructions(
+        "inbound",
+        "Alex",
+        "AI assistant",
+        "",
+        "en",
+        takeover_preference="Transfer genuine calls; screen out sales calls.",
+    )
+
+    # 弄清「谁 + 什么事」即够判断、该转就立刻转，不再留言式追问
+    assert "一旦弄清对方是谁、找机主什么事" in zh
+    assert "立刻请求转接" in zh
+    assert "不要再做留言式的追问" in zh
+    # 留言清单只在决定不转接、留言转告时才回归
+    assert "只有判断结果是不转接" in zh
+    assert "know who is calling and what they need the owner for" in en
+    assert "request the takeover right away" in en
+    assert "instead of asking message-taking" in en
+    assert "Only when you decide not to transfer" in en
+
+    # 无偏好（未启用接管）时不渲染这段路径分离措辞
+    zh_plain = build_instructions("inbound", "李明", "数字分身", "")
+    en_plain = build_instructions("inbound", "Alex", "AI assistant", "", "en")
+    assert "不要再做留言式的追问" not in zh_plain
+    assert "message-taking" not in en_plain
+
+
 def test_inbound_triage_pending_restricts_realtime_without_owner_preference():
     zh = build_instructions(
         "inbound",
