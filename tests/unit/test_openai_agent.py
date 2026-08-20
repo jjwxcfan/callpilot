@@ -1281,3 +1281,69 @@ def test_deaf_watchdog_event_resets_warned_flag(monkeypatch):
             await agent.stop()
 
     asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# say_and_wait：编排话术等待音频投递完成（#125）
+# ---------------------------------------------------------------------------
+
+
+def test_say_and_wait_waits_for_own_response_done():
+    """say 是 fire-and-forget，垫话/拒绝语必须等本轮 response.done 再收闸；
+    say_and_wait 以「created 序号前进且 active 归零」为完成条件。"""
+    agent = _make_agent()
+    sent: list[str] = []
+
+    async def fake_say(instructions: str) -> None:
+        sent.append(instructions)
+
+    agent.say = fake_say  # type: ignore[method-assign]
+
+    async def run() -> bool:
+        async def finish_response() -> None:
+            await asyncio.sleep(0.1)
+            agent._response_created_seq += 1
+            agent._response_active = True
+            await asyncio.sleep(0.1)
+            agent._response_active = False
+
+        task = asyncio.create_task(finish_response())
+        ok = await agent.say_and_wait("正在为您转接", timeout=3.0)
+        await task
+        return ok
+
+    assert asyncio.run(run()) is True
+    assert sent == ["正在为您转接"]
+
+
+def test_say_and_wait_cancels_active_response_first():
+    """旧轮次仍在生成时先 cancel，免得旧话轮和固定话术抢播。"""
+    agent = _make_agent()
+    agent._response_active = True
+    cancelled: list[bool] = []
+
+    async def fake_cancel() -> bool:
+        cancelled.append(True)
+        agent._response_active = False
+        return True
+
+    async def fake_say(instructions: str) -> None:
+        agent._response_created_seq += 1
+
+    agent.cancel_response = fake_cancel  # type: ignore[method-assign]
+    agent.say = fake_say  # type: ignore[method-assign]
+
+    assert asyncio.run(agent.say_and_wait("test line", timeout=1.0)) is True
+    assert cancelled == [True]
+
+
+def test_say_and_wait_times_out_without_response():
+    """轮次迟迟不完成（断线等）不挂死编排：超时返回 False 继续后续动作。"""
+    agent = _make_agent()
+
+    async def fake_say(instructions: str) -> None:
+        pass
+
+    agent.say = fake_say  # type: ignore[method-assign]
+
+    assert asyncio.run(agent.say_and_wait("test line", timeout=0.6)) is False

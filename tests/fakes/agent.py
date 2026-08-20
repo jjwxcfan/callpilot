@@ -19,6 +19,9 @@ class FakeAgent(VoiceAgent):
         self.stopped = False
         self.received_audio: list[bytes] = []
         self.said: list[str] = []
+        # 经 say_and_wait（等待音频投递完成）说出的话术，测试断言编排层
+        # 用的是等待版而不是 fire-and-forget 的 say。
+        self.waited_say: list[str] = []
         self._on_audio_out: Callable[[bytes], None] | None = None
 
     async def start(self, on_audio_out: Callable[[bytes], None]) -> None:
@@ -33,6 +36,12 @@ class FakeAgent(VoiceAgent):
         self._emit_transcript("agent", instructions)
         if self._on_audio_out:
             self._on_audio_out(self.reply_pcm)
+
+    async def say_and_wait(self, instructions: str, timeout: float = 6.0) -> bool:
+        """同步版 say：Fake 的音频本来就同步吐完，等待语义天然满足。"""
+        self.waited_say.append(instructions)
+        await self.say(instructions)
+        return True
 
     async def stop(self) -> None:
         self.stopped = True
