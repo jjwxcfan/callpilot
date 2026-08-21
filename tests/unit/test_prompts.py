@@ -300,9 +300,12 @@ def test_inbound_triage_pending_restricts_realtime_without_owner_preference():
 
     assert "分诊等待态" in zh
     assert "不得承诺回电" in zh
-    assert "最多追问一个中性短问题" in zh
+    assert "最多再用一个中性短问题追问缺的那部分" in zh
+    # WIL-144：开场白已问过谁+什么事，等待态不得原样重问（#128 叠问）
+    assert "不要把同一个问题重问一遍" in zh
     assert "TRIAGE_PENDING" in en
-    assert "at most one short neutral question" in en
+    assert "ask at most one short neutral question about the missing part" in en
+    assert "never repeat the same question" in en
 
 
 def test_takeover_preference_is_inbound_only():
@@ -425,6 +428,14 @@ def test_inbound_opening_is_one_line_with_identity_and_two_questions():
     assert "李明的数字分身" in text          # 报身份
     assert "不方便接" in text
     assert "哪位" in text and "什么事" in text  # 问谁 + 问事
+    # 反义防护：上面全是子串匹配，加一句「不要说…」就能整体绕过（独立评审
+    # 用变异实验证明过）。要素前不得出现否定词。
+    for element in ("李明的数字分身", "哪位", "什么事"):
+        head = text[: text.index(element)]
+        assert not head.rstrip().endswith(("不要", "不用", "别")), (
+            f"「{element}」前出现否定词，开场白语义被反转"
+        )
+    assert "不要说" not in text and "也不要问" not in text
     # 来电开场白不应带外呼专属措辞
     assert "这次主要是" not in text
 
@@ -440,21 +451,25 @@ def test_inbound_opening_is_one_line_in_english_too():
     assert "who is calling" in text and "what they need" in text
 
 
-def test_inbound_opening_is_not_ultra_short():
-    """不能缩到只剩两个字（WIL-99）。
+def test_inbound_opening_states_an_explicit_length_cap():
+    """开场白指令必须自带字数上限（WIL-91）。
 
-    2026-08-06 真机：开场白只说「喂？」时下行峰值仅 36（正常语音约 2 万），
-    是直流拖尾而非语音，对端听到一秒多静默——比原来的长开场白更糟。
-    极短话语 realtime 模型渲染不出来。
+    WIL-89 实测：旧开场白 display_width 54、播完 5.325 秒，真人约 1 秒——
+    「一听就是机器人」最早暴露的一处。而仓库反复记录过「措辞层压不住长度」
+    （config.py 的 WIL-83/112 注释、roadmap「提示词层面压不住」），外呼那句
+    因此写死了「别超过 25 字」。来电这句要素更多（问候+身份+两问），没有
+    显式上限时模型自然产出会外推到 6 秒量级，比 WIL-91 当初要砍的还长。
+
+    下限（WIL-99「喂？」渲染不出音频）由要素本身兜住：四个要素凑不出两个字。
     """
-    for lang, floor in (("zh", 4), ("en", 12)):
-        text = opening_instructions(
-            "inbound", "李明", "数字分身", DEFAULT_OUTBOUND_TASK, lang=lang
-        )
-        spoken = text.split("：")[-1] if lang == "zh" else text.split(": ")[-1]
-        assert len(spoken.strip()) >= floor, (
-            f"[{lang}] 开场白「{spoken}」太短，模型可能渲染不出音频（WIL-99）"
-        )
+    zh = opening_instructions("inbound", "李明", "数字分身", DEFAULT_OUTBOUND_TASK)
+    en = opening_instructions(
+        "inbound", "李明", "数字分身", DEFAULT_OUTBOUND_TASK, lang="en"
+    )
+    assert "别超过 30 字" in zh
+    assert "no more than 25 words" in en
+    # 「一句话说完」是上限的另一半：多句会把时长翻倍
+    assert "一句话说完" in zh and "one sentence only" in en
 
 
 def test_inbound_rules_do_not_quote_the_greeting():
@@ -489,6 +504,10 @@ def test_inbound_identity_moves_into_the_rules():
     # 主动表明这一点由开场白测试锚定，两者合起来仍覆盖 WIL-91 的补偿机制。
     assert "开场白里已经" in text and "已说明你是李明的数字分身" in text
     assert "后续轮次绝不再重复问候或自我介绍" in text
+    # 开场白可能因断线（say 失败只记警告）或 barge-in 打断而没说出口——
+    # 那时若照「已经说过」办，对方可能整通都以为在跟机主本人讲话，
+    # 所以规则侧必须留一条补说通道（独立评审指出的兜底缺口）。
+    assert "没说出口" in text and "补说一次" in text
     assert "被直接问身份时如实回答" in text  # 被问也要答，但不是唯一触发
 
 
@@ -594,12 +613,12 @@ def test_inbound_prompt_tells_model_not_to_recite_or_repeat_identity():
 
     zh = build_instructions("inbound", "李明", "小助理", "", "zh")
     assert "不是一份要背诵的清单" in zh
-    assert "一次只问其中一件" in zh
+    assert "其余各点一次只问一件" in zh
     assert "后续轮次绝不再重复问候或自我介绍" in zh
 
     en = build_instructions("inbound", "Shaocheng", "AI assistant", "", "en")
     assert "not a checklist to recite" in en
-    assert "one of them at a time" in en
+    assert "cover the rest one at a time" in en
     assert "never greet or introduce yourself again in later turns" in en
 
 
