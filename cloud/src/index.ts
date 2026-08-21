@@ -98,6 +98,12 @@ async function route(request: Request, env: Env, requestId: string): Promise<Res
   if (path === "/v1/inbound-offers/claim" && request.method === "POST") {
     return claimInboundOffer(request, env);
   }
+  const offerContextId = path.match(
+    /^\/v1\/inbound-offers\/(offer_[A-Za-z0-9_-]{12,80})\/context$/
+  )?.[1];
+  if (offerContextId && request.method === "GET") {
+    return readTakeoverContext(request, env, offerContextId);
+  }
   if (path === "/v1/messages" && request.method === "GET") {
     return relayContentRead(request, env, "messages.list", undefined);
   }
@@ -534,6 +540,74 @@ async function getCall(request: Request, env: Env, callId: string): Promise<Resp
   return json(payload);
 }
 
+// Who is calling and why, for the incoming-call screen (WIL-137). Deliberately
+// NOT behind CONTENT_READ_ENABLED: the takeover flow already hands this device
+// the live audio of the call, so a second gate on the caller's number protects
+// nothing and would only degrade silently to FEATURE_DISABLED for owners who run
+// takeover with content sync off. It follows the other takeover endpoints
+// (listInboundOffers / claimInboundOffer), which require device auth and nothing
+// more. Per ADR-003 the body is relayed straight through — never stored, audited,
+// or logged.
+async function readTakeoverContext(
+  request: Request,
+  env: Env,
+  offerId: string
+): Promise<Response> {
+  const device = await authenticateDevice(request, env);
+  await enforceRateLimit(env, request, "takeover.context", 120, 60_000);
+
+  // Ownership check before the relay: a paired device must not be able to fish
+  // for another Edge's offers by guessing ids. Unknown or foreign offers are
+  // indistinguishable from the outside — both 404.
+  const offer = await env.DB.prepare(
+    "SELECT edge_id FROM inbound_offers WHERE offer_id = ?1"
+  ).bind(offerId).first<{ edge_id: string }>();
+  if (!offer || offer.edge_id !== device.edge_id) {
+    throw new HttpError("NOT_FOUND", "The offer was not found", 404);
+  }
+
+  const now = Date.now();
+  const relayRequest: DataRequest = {
+    v: 1,
+    type: "data.request",
+    requestId: randomId("request", 12),
+    deviceId: device.device_id,
+    resource: "takeover.context",
+    params: { offerId },
+    issuedAtUnixMs: now,
+    expiresAtUnixMs: now + contentRelayTimeoutMs(env)
+  };
+  const relayed = await edgeRoom(env, device.edge_id).fetch("https://edge-room/content-relay", {
+    method: "POST",
+    body: JSON.stringify(relayRequest)
+  });
+  if (!relayed.ok) throw contentHttpError(await safeInternalRelayError(relayed));
+
+  const rawResponse = await relayed.text();
+  if (serializedByteLength(rawResponse) > CONTENT_WIRE_LIMIT_BYTES) {
+    throw new HttpError("PAYLOAD_TOO_LARGE", "The content item exceeds the protocol limit", 413);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawResponse);
+  } catch {
+    throw new HttpError("INTERNAL_ERROR", "The request could not be completed", 500);
+  }
+  const response = dataResponseSchema.safeParse(parsed);
+  if (!response.success || !responseMatchesRequest(response.data, relayRequest)) {
+    throw new HttpError("INTERNAL_ERROR", "The request could not be completed", 500);
+  }
+  if (response.data.status === "error") throw contentHttpError(response.data.error.code);
+
+  // The credential may have been revoked while Edge was reading; never hand back
+  // a body without a fresh check (same rule as the content read path).
+  const currentDevice = await authenticateDevice(request, env);
+  if (currentDevice.device_id !== device.device_id || currentDevice.edge_id !== device.edge_id) {
+    throw new HttpError("UNAUTHORIZED", "Credential is missing, invalid, or revoked", 401);
+  }
+  return json(response.data.body);
+}
+
 async function relayContentRead(
   request: Request,
   env: Env,
@@ -651,6 +725,12 @@ async function requireContentCapability(
   device: DeviceRecord,
   resource: ContentResource
 ): Promise<void> {
+  // takeover.context is not a content resource and has no capability of its own;
+  // routing it here would silently demand call_records:read and gate the
+  // incoming-call screen behind content sync. Fail loudly instead.
+  if (resource === "takeover.context") {
+    throw new HttpError("INTERNAL_ERROR", "The request could not be completed", 500);
+  }
   const required = resource === "messages.list" ? "messages:read" : "call_records:read";
   if (!(await contentCapabilities(env, device.edge_id)).includes(required)) {
     throw new HttpError("FORBIDDEN", "The device cannot read this resource", 403);

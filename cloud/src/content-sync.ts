@@ -21,7 +21,8 @@ export const contentResourceSchema = z.enum([
   "messages.list",
   "call_records.list",
   "call_records.get",
-  "call_timeline.list"
+  "call_timeline.list",
+  "takeover.context"
 ]);
 export type ContentResource = z.infer<typeof contentResourceSchema>;
 
@@ -191,6 +192,16 @@ export const dataRequestSchema = z.discriminatedUnion("resource", [
     params: z.object({ callId: safeOpaque("call"), limit: listParams.shape.limit, cursor }).strict(),
     issuedAtUnixMs: unixMillis,
     expiresAtUnixMs: unixMillis
+  }).strict(),
+  z.object({
+    v: z.literal(1),
+    type: z.literal("data.request"),
+    requestId: safeOpaque("request"),
+    deviceId: safeOpaque("device"),
+    resource: z.literal("takeover.context"),
+    params: z.object({ offerId: safeOpaque("offer") }).strict(),
+    issuedAtUnixMs: unixMillis,
+    expiresAtUnixMs: unixMillis
   }).strict()
 ]).refine((request) => (
   request.expiresAtUnixMs > request.issuedAtUnixMs
@@ -213,6 +224,28 @@ export const contentErrorCodeSchema = z.enum([
 ]);
 export type ContentErrorCode = z.infer<typeof contentErrorCodeSchema>;
 
+// Takeover context (WIL-137): who is calling and why, shown on the incoming-call
+// screen. ADR-003 keeps full numbers and model-derived text out of Cloud storage,
+// so this rides the transient relay like message bodies do — Edge is the source of
+// truth, the Worker passes it through and persists nothing.
+// Every key is always present; unknown fields are null (the caller may have said
+// nothing). claimedName is what the caller claimed, never verified — the name
+// carries that meaning so the UI cannot present it as established identity.
+export const takeoverContextSchema = z.object({
+  v: z.literal(1),
+  peerNumber: z.string().min(1).max(32).nullable(),
+  claimedName: z.string().min(1).max(60).nullable(),
+  purpose: z.string().min(1).max(120).nullable(),
+  updatedAtUnixMs: unixMillis
+}).strict();
+
+// One shape whether or not context exists: `{context: <object|null>}`. A bare
+// object when present and a wrapper when absent would force two parse paths,
+// and the branch nobody writes reads absent context as "no context".
+export const takeoverContextBodySchema = z.object({
+  context: takeoverContextSchema.nullable()
+}).strict();
+
 const responseBase = {
   v: z.literal(1),
   type: z.literal("data.response"),
@@ -224,6 +257,7 @@ export const dataResponseSchema = z.union([
   z.object({ ...responseBase, resource: z.literal("call_records.list"), status: z.literal("ok"), body: callRecordsPageSchema }).strict(),
   z.object({ ...responseBase, resource: z.literal("call_records.get"), status: z.literal("ok"), body: callRecordDetailSchema }).strict(),
   z.object({ ...responseBase, resource: z.literal("call_timeline.list"), status: z.literal("ok"), body: callTimelinePageSchema }).strict(),
+  z.object({ ...responseBase, resource: z.literal("takeover.context"), status: z.literal("ok"), body: takeoverContextBodySchema }).strict(),
   z.object({
     ...responseBase,
     resource: contentResourceSchema,
@@ -254,5 +288,9 @@ export function responseMatchesRequest(response: DataResponse, request: DataRequ
       return response.resource === "call_timeline.list" && response.body.items.length <= request.params.limit;
     case "call_records.get":
       return response.resource === "call_records.get" && response.body.record.callId === request.params.callId;
+    case "takeover.context":
+      // Nothing in the body echoes the offerId, so pairing rests on requestId
+      // (checked above) plus the DO's own single-flight relay bookkeeping.
+      return response.resource === "takeover.context";
   }
 }
