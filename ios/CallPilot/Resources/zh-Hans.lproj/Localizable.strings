@@ -40,6 +40,7 @@
 "incoming.description" = "AI 正在处理一通需要你本人接听的来电。接听后将在这台 iPhone 上继续通话。";
 "incoming.decline" = "拒绝";
 "incoming.answer" = "接听";
+"incoming.context.unverified" = "以上身份由对方自述，未经核实";
 "incoming.decline_footer" = "拒绝后，AI 会继续处理这通电话。";
 
 "call.remote_sim_notice" = "正在通过远端 SIM 通话";
@@ -201,3 +202,4 @@
 "settings.unpair.confirm_title" = "解除与电脑端的配对？";
 "settings.unpair.confirm_message" = "解除后将清除本机内容，需要重新输入配对码才能使用远程线路。";
 "callkit.incoming.name" = "AI 来电转接";
+"callkit.incoming.claimed_name" = "自称 %@";

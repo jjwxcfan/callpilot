@@ -678,7 +678,8 @@ final class HostedCloudClientTests: XCTestCase {
     }
 }
 
-private final class MockURLProtocol: URLProtocol {
+/// 共享测试桩:HostedCloudClientTests 与 TakeoverContextClientTests 共用。
+final class MockURLProtocol: URLProtocol {
     nonisolated(unsafe) static var requestHandler: (
         (URLRequest) throws -> (HTTPURLResponse, Data)
     )?
