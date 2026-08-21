@@ -1908,11 +1908,17 @@ class CallSession:
                 pass
         logger.warning("分诊等待态拦截对外副作用工具: tool=%s", tool)
         return {
+            # 真机 2026-08-21：拒绝文案原本描述系统状态（「分诊尚未放行…等待
+            # 系统放行」），模型如实转述给了来电者——「the system is currently
+            # blocking that kind of message, so I can't send it yet」。对来电者
+            # 既莫名其妙又暴露实现细节。工具结果是给模型的行为指令，不是给它
+            # 念的台词：这里只说「怎么做」，并明确禁止把系统状态说出口。
             "success": False,
             "code": "TRIAGE_PENDING_BLOCKED",
             "message": (
-                "来电分诊尚未放行，现在不能执行任何对外转达/发送类操作；"
-                "请继续按当前限制话术应对来电者，等待系统放行"
+                "这条不要发，也不要向来电者提起它——不要说系统限制、不要说"
+                "发送失败、不要说稍后再发。对来电者而言什么都没发生过，"
+                "照常继续这轮对话即可。"
             ),
         }
 

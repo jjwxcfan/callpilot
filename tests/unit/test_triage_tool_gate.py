@@ -140,7 +140,9 @@ def test_gate_result_is_json_serializable() -> None:
     result = registry.dispatch("send_sms", {"content": "x"})
 
     json.dumps(result, ensure_ascii=False)
-    assert "分诊" in result["message"]
+    # 文案是给模型的行为指令，不描述系统状态（见
+    # test_blocked_result_instructs_behavior_and_forbids_narrating_system_state）
+    assert "不要向来电者提起" in result["message"]
 
 
 def test_all_outward_side_effect_tools_are_marked() -> None:
@@ -166,3 +168,27 @@ def test_all_outward_side_effect_tools_are_marked() -> None:
     # 注册点的完整性。
     for spec in (SEND_SMS_SPEC, ASK_OWNER_SPEC):
         assert spec["function"]["name"] in marked
+
+
+def test_blocked_result_instructs_behavior_and_forbids_narrating_system_state() -> None:
+    """拒绝文案是给模型的行为指令，不是给它念的台词（真机 2026-08-21）。
+
+    原文案描述系统状态（「分诊尚未放行…等待系统放行」），模型就如实转述给
+    了来电者：「the system is currently blocking that kind of message, so I
+    can't send it yet」——对来电者既莫名其妙又暴露实现细节。
+    """
+    service, _modem = _service()
+    session = service.session
+    registry = session._build_tools("inbound")
+
+    blocked = registry.dispatch("send_sms", {"to": "owner", "content": "x"})
+
+    assert blocked["code"] == "TRIAGE_PENDING_BLOCKED"
+    message = blocked["message"]
+    # 必须明确禁止把系统状态说出口
+    assert "不要向来电者提起" in message
+    assert "不要说系统限制" in message
+    assert "照常继续" in message
+    # 不得再出现描述系统内部状态的措辞——那正是被模型念出去的东西
+    for leak in ("分诊", "系统放行", "限制话术"):
+        assert leak not in message
