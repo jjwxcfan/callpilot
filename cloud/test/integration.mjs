@@ -359,6 +359,66 @@ try {
   assert.match(claimCommand.session.browserIdentity, /^web_/);
   assert.match(claimCommand.session.token, /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/);
 
+  // ---- Takeover context relay (WIL-137) ----
+  // Exercised through the real HTTP route, not the handler: a resource that is
+  // wired everywhere except the route table passes every unit test and is dead
+  // code in production (exactly how the Edge-side whitelist gap hid).
+  const contextCommandPromise = nextMessage(socket);
+  const contextFetch = fetch(`${base}/v1/inbound-offers/${offerId}/context`, {
+    headers: { Cookie: cookie }
+  });
+  const contextCommand = await contextCommandPromise;
+  assert.equal(contextCommand.type, "data.request");
+  assert.equal(contextCommand.resource, "takeover.context");
+  assert.match(contextCommand.requestId, /^request_/);
+  assert.deepEqual(contextCommand.params, { offerId });
+  const relayedContext = {
+    v: 1,
+    peerNumber: "+15105550123",
+    claimedName: "Kevin",
+    purpose: "asks about Saturday dinner",
+    updatedAtUnixMs: Date.now()
+  };
+  socket.send(JSON.stringify({
+    v: 1,
+    type: "data.response",
+    requestId: contextCommand.requestId,
+    resource: "takeover.context",
+    status: "ok",
+    body: { context: relayedContext }
+  }));
+  const contextResponse = await contextFetch;
+  assert.equal(contextResponse.status, 200);
+  assert.deepEqual(await contextResponse.json(), { context: relayedContext });
+
+  // A caller who said nothing yields the same shape with a null context.
+  const emptyCommandPromise = nextMessage(socket);
+  const emptyFetch = fetch(`${base}/v1/inbound-offers/${offerId}/context`, {
+    headers: { Cookie: cookie }
+  });
+  const emptyCommand = await emptyCommandPromise;
+  socket.send(JSON.stringify({
+    v: 1,
+    type: "data.response",
+    requestId: emptyCommand.requestId,
+    resource: "takeover.context",
+    status: "ok",
+    body: { context: null }
+  }));
+  assert.deepEqual(await (await emptyFetch).json(), { context: null });
+
+  // Ownership: an offer id this device's Edge does not own is a 404, and the
+  // request must never reach the Edge — assert no command was relayed.
+  let strayCommand = null;
+  const strayWatch = nextMessage(socket).then((message) => { strayCommand = message; });
+  const foreignOffer = await fetch(
+    `${base}/v1/inbound-offers/offer_notmineabcdef/context`,
+    { headers: { Cookie: cookie } }
+  );
+  assert.equal(foreignOffer.status, 404);
+  await Promise.race([strayWatch, delay(300)]);
+  assert.equal(strayCommand, null, "a foreign offer id must not be relayed to the Edge");
+
   // First-claim-wins: the second claim must lose deterministically.
   const doubleClaim = await fetch(`${base}/v1/inbound-offers/claim`, {
     method: "POST",
