@@ -49,6 +49,14 @@ _SYSTEM_PROMPT = """你是来电分诊判官，不负责和来电者对话。
 （如具体的私人事务、可核对的既有业务往来），应维持原判。
 transfer 只用于你已能判定 personal 或 service 性质的来电；
 性质仍是 unknown 时先 clarify，不要 transfer。
+但 clarify 不能无限循环——真机 2026-08-21：转写把机主名字听错，来电者三次
+明确要求转接都被判 unknown，通话变成一堵墙。两条纠偏：
+- 转写来自电话线路，人名和词句常被听错。输入里给了机主姓名，凡音近或
+  从上下文看显然指机主本人的说法，都当作在找机主，不要因为名字对不上就
+  认定语无伦次；
+- 来电者已经反复、明确地要求转接本人，而整通对话至今没有任何推销、诈骗
+  或骚扰特征——这本身就是正当来意的证据，应判为 personal 并 transfer，
+  不要继续 clarify。
 明确营销且机主偏好拒绝时应 reject。
 输出字段必须且只能是 category、action、confidence、reason_code、turn_id、call_generation。
 confidence 是 0 到 1 的有限数；reason_code 是简短小写 snake_case，不含通话原文。
@@ -103,10 +111,17 @@ class TriageVerdictConsumer:
     """Deterministic irreversible-action policy over model verdicts."""
 
     def __init__(
-        self, *, transfer_threshold: float = 0.7, reject_threshold: float = 0.85
+        self,
+        *,
+        transfer_threshold: float = 0.7,
+        reject_threshold: float = 0.85,
+        max_clarify_streak: int = 3,
     ) -> None:
         self._transfer_threshold = transfer_threshold
         self._reject_threshold = reject_threshold
+        # 连续 clarify 的容忍上限：超过即认为判官卡在 unknown 上，放行给 AI。
+        self._max_clarify_streak = max(1, max_clarify_streak)
+        self._clarify_streak = 0
         self._last_turn_id = 0
         self._reject_candidate: tuple[TriageCategory, int] | None = None
         self._terminal = False
@@ -145,6 +160,7 @@ class TriageVerdictConsumer:
                 )
             self._terminal = True
             self._reject_candidate = None
+            self._clarify_streak = 0
             return TriageConsumption("transfer", verdict, "threshold_met")
 
         if verdict.action == "reject" and verdict.confidence >= self._reject_threshold:
@@ -160,8 +176,25 @@ class TriageVerdictConsumer:
             # clarify 是「待定再问一句」而非改判，不重置拒绝确认——新提示词
             # 引导判官对加压话术输出 unknown/clarify，若这里清候选，transfer
             # 关掉的「摇摆重置」通道就原样搬进 clarify（独立评审发现）。
+            #
+            # 但 clarify 不能无限循环（真机 2026-08-21）：转写把机主名字听错，
+            # 判官连续判 unknown/clarify，来电者三次要求转接都没反应，AI 又被
+            # 锁在限制话术里只会说「我没法转接也没法转告」——对来电者就是一
+            # 堵墙。连续 clarify 到上限且**没有待确认的拒绝**（即全程没出现
+            # 推销/诈骗迹象）时放行给 AI 正常接待：这不把电话递给机主，不构
+            # 成 spam 触达，只是让 AI 别再复读限制话术。
+            self._clarify_streak += 1
+            if (
+                self._reject_candidate is None
+                and self._clarify_streak >= self._max_clarify_streak
+            ):
+                self._clarify_streak = 0
+                return TriageConsumption(
+                    "continue_ai", verdict, "clarify_deadlock_released"
+                )
             return TriageConsumption("clarify", verdict, "judge_requested")
         self._reject_candidate = None
+        self._clarify_streak = 0
         if verdict.action == "continue_ai":
             return TriageConsumption("continue_ai", verdict, "judge_decided")
         return TriageConsumption("observe", verdict, "below_threshold")
@@ -221,14 +254,22 @@ def build_triage_messages(
     *,
     turn_id: int,
     call_generation: int,
+    owner: str = "",
 ) -> list[dict[str, str]]:
-    """Build a bounded judge input; owner preference is never sent to Realtime."""
+    """Build a bounded judge input; owner preference is never sent to Realtime.
+
+    ``owner`` 是机主称谓：电话线路的转写常把人名听错（真机 2026-08-21 把
+    「Shaocheng」听成「ChatGPT」），判官不知道机主叫什么就会把「我找 X」
+    当成语无伦次而一直判 unknown。姓名本来就在实时会话的提示词里，交给
+    同一家的文本模型不扩大暴露面。
+    """
     bounded_turns = [
         {"role": role, "text": text.strip()[:1000]}
         for role, text in turns[-_MAX_TURNS:]
         if role in {"user", "agent"} and text.strip()
     ]
     payload = {
+        "owner_name": (owner or "").strip()[:64],
         "owner_preference": (preference or "").strip()[:2000],
         "turns": bounded_turns,
         "turn_id": turn_id,
@@ -244,6 +285,7 @@ def judge_transcript(
     turns: list[tuple[str, str]],
     preference: str,
     *,
+    owner: str = "",
     turn_id: int | None = None,
     call_generation: int = 0,
     timeout_seconds: float = 3.0,
@@ -259,6 +301,7 @@ def judge_transcript(
         preference,
         turn_id=resolved_turn_id,
         call_generation=call_generation,
+        owner=owner,
     )
     call = model_call or _default_model_call
     text, error = call(messages, timeout_seconds)
@@ -280,6 +323,7 @@ class InboundTriageJudge:
         *,
         call_generation: int,
         preference: str,
+        owner: str = "",
         on_verdict: VerdictCallback,
         on_error: ErrorCallback | None = None,
         model_call: ModelCall | None = None,
@@ -288,6 +332,7 @@ class InboundTriageJudge:
     ) -> None:
         self._call_generation = call_generation
         self._preference = preference
+        self._owner = owner
         self._on_verdict = on_verdict
         self._on_error = on_error
         self._model_call = model_call or _default_model_call
@@ -399,6 +444,7 @@ class InboundTriageJudge:
                 box["verdict"] = judge_transcript(
                     turns,
                     self._preference,
+                    owner=self._owner,
                     turn_id=turn_id,
                     call_generation=self._call_generation,
                     timeout_seconds=self._timeout_seconds,

@@ -2050,6 +2050,9 @@ class CallSession:
         judge = InboundTriageJudge(
             call_generation=self._session_generation,
             preference=config.get_str("INBOUND_TAKEOVER_PREFERENCE"),
+            # 判官不知道机主叫什么就会把「我找 X」当语无伦次（真机 2026-08-21
+            # 转写把机主名字听成了别的词），一直判 unknown 而不转接。
+            owner=owner_name(agent_language()),
             on_verdict=on_verdict,
             on_error=on_error,
         )
