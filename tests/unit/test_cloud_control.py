@@ -883,3 +883,47 @@ def test_takeover_context_relay_is_not_gated_by_content_read_flag() -> None:
 
     assert sent[0]["status"] == "ok"
     assert sent[0]["body"]["context"]["peerNumber"] == "+15105550123"
+
+
+def test_takeover_context_request_is_logged_without_content(caplog) -> None:
+    """联调可观测性：只记「收到请求 + 命中与否」，绝不记字段内容（PII 边界）。
+
+    2026-08-21 首次三层联调时，正是靠「Edge 侧一条请求都没有」定位到手机装的
+    是旧 build——没有这条日志就只能在三层之间反复猜断点。
+    """
+    service = _Service()
+    service.takeover_contexts["offer_takeover_abcdefghijkl"] = {
+        "v": 1,
+        "peerNumber": "+15105550123",
+        "claimedName": "Kevin",
+        "purpose": "约机主周六吃饭",
+        "updatedAtUnixMs": 112000,
+    }
+    client = _takeover_context_client(service)
+
+    with caplog.at_level("INFO"):
+        client.handle_message(
+            json.dumps(
+                _data_request(
+                    requestId="request_takeover_eeeeeeeeeeee",
+                    resource="takeover.context",
+                    params={"offerId": "offer_takeover_abcdefghijkl"},
+                )
+            ),
+            lambda raw: None,
+        )
+        client.handle_message(
+            json.dumps(
+                _data_request(
+                    requestId="request_takeover_ffffffffffff",
+                    resource="takeover.context",
+                    params={"offerId": "offer_takeover_zzzzzzzzzzzz"},
+                )
+            ),
+            lambda raw: None,
+        )
+
+    assert "hit=True" in caplog.text and "hit=False" in caplog.text
+    # 内容一个字都不能进日志
+    for secret in ("Kevin", "约机主周六吃饭", "+15105550123"):
+        assert secret not in caplog.text
