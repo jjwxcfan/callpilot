@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import threading
+import time
 
 from fakes import FakeModem
 
@@ -127,6 +129,9 @@ def test_tool_request_is_opaque_bounded_and_double_gated(monkeypatch) -> None:
     # 改为带数字边界的完整手机号模式:任何独立 11 位号都不得进 repr。
     assert re.search(r"(?<!\d)1[3-9]\d{9}(?!\d)", serialized) is None
     assert "快递" not in serialized
+    # 这里没有来电号码（未设 current_caller），故上下文为空。号码在已知时
+    # 也只留在 Edge、由设备按需拉取（ADR-003：不上 Cloud），见
+    # test_takeover_context_snapshot_carries_caller_number；机主偏好永不出会话。
     assert service.session.takeover_state is TakeoverState.TAKEOVER_PREPARING
 
     repeated = registry.dispatch("request_owner_takeover", {})
@@ -240,3 +245,163 @@ def test_service_force_takeover_hook_supports_active_outbound_smoke() -> None:
     assert request is not None
     assert request.generation == 11
     assert session.takeover_state is TakeoverState.TAKEOVER_PREPARING
+
+
+def test_takeover_context_snapshot_carries_caller_number(monkeypatch) -> None:
+    """接管上下文按 offerId 现答现回（WIL-137）：号码在请求发出时就有，
+    先落地成快照，机主设备按需拉取。
+
+    ADR-003：完整号码不上 Cloud——所以上下文留在 Edge，不塞进 offer 消息。
+    """
+    monkeypatch.setenv("INBOUND_TAKEOVER_ENABLED", "true")
+    monkeypatch.setenv("INBOUND_TAKEOVER_PREFERENCE", "快递也转给我。")
+    service = _service()
+    _prepare_inbound(service)
+    service.session.current_caller = "+15105550123"
+    registry = service.session._build_tools("inbound")
+
+    assert registry.dispatch("request_owner_takeover", {})["success"] is True
+    request = service.next_inbound_takeover_offer()
+    assert request is not None
+    # offer 消息本身不带上下文（上云路径）
+    assert not hasattr(request, "context")
+    assert "快递" not in repr(request)
+
+    snapshot = service.takeover_context_snapshot(request.offer_id)
+    assert snapshot is not None
+    assert snapshot["peerNumber"] == "+15105550123"
+    assert snapshot["claimedName"] is None  # 还没问出来，可空
+    assert snapshot["purpose"] is None
+    assert snapshot["updatedAtUnixMs"] > 0
+    # 别的 offerId 读不到——防止设备拿任意 id 钓上下文
+    assert service.takeover_context_snapshot("offer_someone_elses_id") is None
+    assert service.takeover_context_snapshot("") is None
+
+
+def test_context_summary_backfills_name_and_purpose(monkeypatch) -> None:
+    """身份/来意往往在 offer 发出后才问清（WIL-137「可后补」）：后台摘要产出后
+    更新快照，号码保持不变、时间戳前进。"""
+    monkeypatch.setenv("INBOUND_TAKEOVER_ENABLED", "true")
+    service = _service()
+    _prepare_inbound(service)
+    session = service.session
+    session.current_caller = "+15105550123"
+    session._live_transcripts = [("user", "我是 Kevin，想约机主周六吃饭")]
+    monkeypatch.setattr(
+        "agentcall.call_agent.summarize_call_context",
+        lambda turns, **kwargs: ("Kevin", "约机主周六吃饭"),
+    )
+    registry = session._build_tools("inbound")
+
+    assert registry.dispatch("request_owner_takeover", {})["success"] is True
+    offer = service.next_inbound_takeover_offer()
+    assert offer is not None
+    initial = service.takeover_context_snapshot(offer.offer_id)
+    assert initial is not None
+
+    deadline = time.monotonic() + 3.0
+    filled = None
+    while time.monotonic() < deadline:
+        snapshot = service.takeover_context_snapshot(offer.offer_id)
+        if snapshot and snapshot["claimedName"]:
+            filled = snapshot
+            break
+        time.sleep(0.02)
+
+    assert filled is not None
+    assert filled["claimedName"] == "Kevin"
+    assert filled["purpose"] == "约机主周六吃饭"
+    assert filled["peerNumber"] == "+15105550123"
+    assert filled["updatedAtUnixMs"] >= initial["updatedAtUnixMs"]
+
+
+def test_context_summary_never_leaks_across_calls(monkeypatch) -> None:
+    """摘要在飞时换了一通电话：迟到的结果必须丢弃，绝不能覆盖到**新通话**上
+    （上一通的来电者姓名串进这一通是隐私事故）。
+
+    断言落在「新 offer 的快照里没有上一通的姓名」——只断言旧 offerId 读不到
+    是不够的：跨通重置本身就会让那个断言成立，与 worker 里的 offer_id 守卫
+    无关（独立评审用变异实验证明过那种写法是永真的）。
+    """
+    monkeypatch.setenv("INBOUND_TAKEOVER_ENABLED", "true")
+    service = _service()
+    _prepare_inbound(service)
+    session = service.session
+    session.current_caller = "+15105550123"
+    session._live_transcripts = [("user", "我是 Kevin")]
+    released = threading.Event()
+
+    def slow_summary(turns, **kwargs):
+        released.wait(3.0)
+        return "Kevin", "约周六吃饭"
+
+    monkeypatch.setattr(
+        "agentcall.call_agent.summarize_call_context", slow_summary
+    )
+    registry = session._build_tools("inbound")
+    assert registry.dispatch("request_owner_takeover", {})["success"] is True
+    old_offer = service.next_inbound_takeover_offer()
+    assert old_offer is not None
+
+    # 上一通的摘要还堵在模型调用里，新一通电话已经开始并自己发了 offer
+    session._initialize_takeover_context("inbound")
+    session.current_caller = "+16505550777"
+    session._live_transcripts = []
+    new_registry = session._build_tools("inbound")
+    assert new_registry.dispatch("request_owner_takeover", {})["success"] is True
+    new_offer = service.next_inbound_takeover_offer()
+    assert new_offer is not None and new_offer.offer_id != old_offer.offer_id
+
+    released.set()  # 上一通的摘要现在返回
+    time.sleep(0.4)
+
+    assert service.takeover_context_snapshot(old_offer.offer_id) is None
+    fresh = service.takeover_context_snapshot(new_offer.offer_id)
+    assert fresh is not None
+    assert fresh["peerNumber"] == "+16505550777"
+    assert fresh["claimedName"] is None, "上一通的姓名不得串进新通话"
+    assert fresh["purpose"] is None
+
+
+def test_context_is_unreadable_after_call_ends(monkeypatch) -> None:
+    """通话结束即作废：offer 已 revoke，持有旧 offerId 的设备不该还能读到
+    号码与来意（此前只在下一通开始时才清，中间可能隔几小时）。"""
+    monkeypatch.setenv("INBOUND_TAKEOVER_ENABLED", "true")
+    service = _service()
+    _prepare_inbound(service)
+    session = service.session
+    session.current_caller = "+15105550123"
+    registry = session._build_tools("inbound")
+
+    assert registry.dispatch("request_owner_takeover", {})["success"] is True
+    offer = service.next_inbound_takeover_offer()
+    assert offer is not None
+    assert service.takeover_context_snapshot(offer.offer_id) is not None
+
+    session._end_takeover_context("CALL_ENDED")
+
+    assert service.takeover_context_snapshot(offer.offer_id) is None
+
+
+def test_context_summary_silent_when_model_finds_nothing(monkeypatch) -> None:
+    """摘要没提取到任何东西时快照保持原样（只有号码），不写空值。"""
+    monkeypatch.setenv("INBOUND_TAKEOVER_ENABLED", "true")
+    service = _service()
+    _prepare_inbound(service)
+    session = service.session
+    session.current_caller = "+15105550123"
+    session._live_transcripts = [("user", "喂")]
+    monkeypatch.setattr(
+        "agentcall.call_agent.summarize_call_context",
+        lambda turns, **kwargs: (None, None),
+    )
+    registry = session._build_tools("inbound")
+
+    assert registry.dispatch("request_owner_takeover", {})["success"] is True
+    offer = service.next_inbound_takeover_offer()
+    assert offer is not None
+    time.sleep(0.3)
+
+    snapshot = service.takeover_context_snapshot(offer.offer_id)
+    assert snapshot is not None
+    assert snapshot["claimedName"] is None and snapshot["purpose"] is None

@@ -34,6 +34,7 @@ class _Service:
         self.claims: list[dict] = []
         self.offers: list[InboundTakeoverOfferRequest] = []
         self.revokes: list[InboundTakeoverRevoke] = []
+        self.takeover_contexts: dict[str, dict] = {}
 
     def remote_dialer_status(self) -> dict:
         return {"active": False}
@@ -54,6 +55,9 @@ class _Service:
         self, timeout: float = 0.0
     ) -> InboundTakeoverRevoke | None:
         return self.revokes.pop(0) if self.revokes else None
+
+    def takeover_context_snapshot(self, offer_id: str) -> dict | None:
+        return self.takeover_contexts.get(offer_id)
 
     def accept_inbound_takeover_claim(self, **fields) -> TakeoverResult:
         self.claims.append(fields)
@@ -298,6 +302,9 @@ def test_edge_sends_opaque_takeover_offer_then_revoke_with_frozen_schema() -> No
         },
     ]
     assert "preference" not in repr(sent).lower()
+    # ADR-003：完整号码、偏好原文、转写与模型 reasoning 一律不上 Cloud。
+    # 接管上下文（WIL-137）因此不随 offer 推送，改按需 relay，见
+    # test_takeover_context_is_served_on_demand_and_never_pushed。
     assert "number" not in repr(sent).lower()
 
 
@@ -756,3 +763,123 @@ def test_cloud_api_redacts_structured_http_failure(monkeypatch) -> None:
     with pytest.raises(RuntimeError, match="EDGE_REVOKED") as caught:
         CloudControlApi("https://api.bondings.ai")._request("GET", "/v1/test")
     assert "sensitive detail" not in str(caught.value)
+
+
+def _takeover_context_client(service: _Service, *, content_enabled: bool = False):
+    """接管上下文只依赖 service，不需要 content repository。"""
+    return CloudEdgeClient(
+        "https://api.bondings.ai",
+        service,
+        _Store(),
+        content_repository=None,
+        content_read_enabled=lambda: content_enabled,
+    )
+
+
+def test_takeover_context_is_served_on_demand_and_never_pushed() -> None:
+    """接管上下文按需 relay（WIL-137 + ADR-003）。
+
+    上下文含完整号码与转写派生的来意，ADR-003 明确这类数据不上 Cloud，
+    故不随 inbound.offer 推送、云端也不持久化，改由设备按 offerId 经
+    data.request 拉取，Edge 现答现回。
+
+    **必须走 handle_message 这条生产入口**：resource 白名单与 params 校验在
+    _validate_data_request 里，直接调 _handle_data_request 会绕过它——本功能
+    第一版正是因此在测试全绿的情况下于生产链路上是死代码（独立评审发现）。
+    """
+    service = _Service()
+    service.takeover_contexts["offer_takeover_abcdefghijkl"] = {
+        "v": 1,
+        "peerNumber": "+15105550123",
+        "claimedName": "Kevin",
+        "purpose": "约机主周六吃饭",
+        "updatedAtUnixMs": 112000,
+    }
+    client = _takeover_context_client(service)
+    sent: list[dict] = []
+
+    def ask(offer_id: str, request_id: str) -> dict:
+        client.handle_message(
+            json.dumps(
+                _data_request(
+                    requestId=request_id,
+                    resource="takeover.context",
+                    params={"offerId": offer_id},
+                )
+            ),
+            lambda raw: sent.append(json.loads(raw)),
+        )
+        return sent[-1] if sent else {}
+
+    hit = ask("offer_takeover_abcdefghijkl", "request_takeover_aaaaaaaaaaaa")
+    assert hit["status"] == "ok"
+    assert hit["resource"] == "takeover.context"
+    assert hit["requestId"] == "request_takeover_aaaaaaaaaaaa"  # 原样回显供配对
+    assert hit["body"]["context"]["claimedName"] == "Kevin"
+    assert hit["body"]["context"]["updatedAtUnixMs"] == 112000
+
+    # 无上下文与有上下文是同一层包装，解析方只需取 body.context 判 null
+    miss = ask("offer_takeover_zzzzzzzzzzzz", "request_takeover_bbbbbbbbbbbb")
+    assert miss["status"] == "ok"
+    assert miss["body"] == {"context": None}
+
+
+def test_takeover_context_request_is_rejected_before_reaching_edge() -> None:
+    """畸形请求在解析层就被拒（与其它 resource 同一道闸），不进 Edge 查询路径。
+
+    命令解析失败时整条消息被丢弃、不回响应——所以这里断言的是「没有任何
+    响应发出」且 service 未被触碰。
+    """
+    service = _Service()
+    service.takeover_contexts["offer_takeover_abcdefghijkl"] = {"v": 1}
+    client = _takeover_context_client(service)
+
+    for params in (
+        {"offerId": "not-an-offer-id"},          # 非法 id 形状
+        {"offerId": "call_takeover_abcdefghij"},  # 前缀不是 offer_
+        {"offerId": "offer_takeover_abcdefghijkl", "limit": 25},  # 多余字段
+        {},                                       # 缺 offerId
+    ):
+        sent: list[dict] = []
+        client.handle_message(
+            json.dumps(
+                _data_request(
+                    requestId=f"request_takeover_{abs(hash(str(params))):012d}"[:32],
+                    resource="takeover.context",
+                    params=params,
+                )
+            ),
+            lambda raw: sent.append(json.loads(raw)),
+        )
+        assert sent == [], params
+
+
+def test_takeover_context_relay_is_not_gated_by_content_read_flag() -> None:
+    """接管上下文不受 REMOTE_CONTENT_READ_ENABLED（历史内容只读同步）约束：
+    它不是历史内容，是当前这通电话的接听决策信息，随接管功能一起可用；
+    与 /v1/inbound-offers 等既有接管接口口径一致（都只要求设备鉴权）。"""
+    service = _Service()
+    service.takeover_contexts["offer_takeover_abcdefghijkl"] = {
+        "v": 1,
+        "peerNumber": "+15105550123",
+        "claimedName": None,
+        "purpose": None,
+        "updatedAtUnixMs": 100000,
+    }
+    # 内容只读同步关闭，且没有 content repository
+    client = _takeover_context_client(service, content_enabled=False)
+    sent: list[dict] = []
+
+    client.handle_message(
+        json.dumps(
+            _data_request(
+                requestId="request_takeover_cccccccccccc",
+                resource="takeover.context",
+                params={"offerId": "offer_takeover_abcdefghijkl"},
+            )
+        ),
+        lambda raw: sent.append(json.loads(raw)),
+    )
+
+    assert sent[0]["status"] == "ok"
+    assert sent[0]["body"]["context"]["peerNumber"] == "+15105550123"
