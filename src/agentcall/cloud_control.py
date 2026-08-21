@@ -19,7 +19,6 @@ from .cloud_credentials import CloudCredentialStore, EdgeCredential
 from .content_sync import ContentSyncError
 from .remote_dialer import IssuedLiveKitSession, RemoteDialerInvite
 from .takeover_coordinator import (
-    InboundTakeoverContextUpdate,
     InboundTakeoverOfferRequest,
     InboundTakeoverRevoke,
     TakeoverResult,
@@ -28,6 +27,14 @@ from .takeover_coordinator import (
 logger = logging.getLogger(__name__)
 
 _MAX_JSON_BYTES = 16 * 1024
+# 接管来电上下文（WIL-137）：按需 relay 的 resource 名。
+#
+# 走 data.request 而不是随 inbound.offer 推送，是 ADR-003 的硬约束——
+# 「完整号码、偏好原文、录音、转写和模型 reasoning 不上 Cloud」。上下文含
+# 完整号码与转写派生的来意，只能像短信/通话记录那样由 Edge 持有、云端瞬时
+# 转发不持久化。这一层不受 REMOTE_CONTENT_READ_ENABLED（历史内容只读同步）
+# 约束：它不是历史内容，是当前这通电话的接听决策信息，随接管功能一起可用。
+_TAKEOVER_CONTEXT_RESOURCE = "takeover.context"
 _ID_RE = r"[a-z]+_[A-Za-z0-9_-]{12,80}"
 _USER_AGENT = "CallPilot-Edge/1"
 
@@ -47,9 +54,7 @@ class CloudSessionService(Protocol):
         self, timeout: float = 0.0
     ) -> InboundTakeoverRevoke | None: ...
 
-    def next_inbound_takeover_context_update(
-        self, timeout: float = 0.0
-    ) -> InboundTakeoverContextUpdate | None: ...
+    def takeover_context_snapshot(self, offer_id: str) -> dict[str, Any] | None: ...
 
     def accept_inbound_takeover_claim(
         self,
@@ -312,6 +317,10 @@ class CloudEdgeClient:
             self._seen_data_requests.pop(next(iter(self._seen_data_requests)))
         self._seen_data_requests[request_id] = command["expiresAtUnixMs"]
 
+        if resource == _TAKEOVER_CONTEXT_RESOURCE:
+            self._serve_takeover_context(command, request_id, send)
+            return
+
         repository = self._content_repository
         if repository is None or not self._content_read_enabled():
             self._send_data_error(send, request_id, resource, "FEATURE_DISABLED")
@@ -374,6 +383,46 @@ class CloudEdgeClient:
             if expires_at <= now_ms:
                 self._seen_data_requests.pop(request_id, None)
 
+    def _serve_takeover_context(
+        self,
+        command: dict[str, Any],
+        request_id: str,
+        send: Callable[[str], None],
+    ) -> None:
+        """按 offerId 返回当前接管上下文；云端只转发、不持久化（ADR-003）。"""
+        params = command.get("params")
+        offer_id = params.get("offerId") if isinstance(params, dict) else None
+        if not isinstance(offer_id, str) or not _valid_id(offer_id, "offer"):
+            self._send_data_error(
+                send, request_id, _TAKEOVER_CONTEXT_RESOURCE, "INVALID_REQUEST"
+            )
+            return
+        try:
+            context = self.service.takeover_context_snapshot(offer_id)
+        except Exception as exc:  # noqa: BLE001
+            # 展示信息取不到不该影响接管；错误码不带任何通话内容。
+            logger.info(
+                "接管上下文读取失败: error_type=%s", type(exc).__name__
+            )
+            self._send_data_error(
+                send, request_id, _TAKEOVER_CONTEXT_RESOURCE, "INTERNAL_ERROR"
+            )
+            return
+        send(
+            _compact_json(
+                {
+                    "v": 1,
+                    "type": "data.response",
+                    "requestId": request_id,
+                    "resource": _TAKEOVER_CONTEXT_RESOURCE,
+                    "status": "ok",
+                    # 无上下文时 body.context 为 null——body 本身恒为对象，
+                    # 消费方不必区分「没有 body」与「没有上下文」。
+                    "body": {"context": context},
+                }
+            )
+        )
+
     @staticmethod
     def _send_data_error(
         send: Callable[[str], None],
@@ -406,27 +455,6 @@ class CloudEdgeClient:
                         "generation": request.generation,
                         "nonce": request.nonce,
                         "expiresAtUnixMs": round(request.expires_at * 1000),
-                        # 展示用上下文（WIL-137）：可空；含 PII，云端只经
-                        # claim 后的数据通道下发，不得进 APNs / 审计日志。
-                        "context": (
-                            request.context.as_payload()
-                            if request.context is not None
-                            else None
-                        ),
-                    },
-                    separators=(",", ":"),
-                )
-            )
-        while update := self.service.next_inbound_takeover_context_update():
-            send(
-                json.dumps(
-                    {
-                        "v": 1,
-                        "type": "inbound.offer.context",
-                        "offerId": update.offer_id,
-                        "callId": update.call_id,
-                        "generation": update.generation,
-                        "context": update.context.as_payload(),
                     },
                     separators=(",", ":"),
                 )

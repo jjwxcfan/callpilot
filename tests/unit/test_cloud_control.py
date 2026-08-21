@@ -19,7 +19,6 @@ from agentcall.cloud_credentials import (
 )
 from agentcall.content_sync import ContentSyncError
 from agentcall.takeover_coordinator import (
-    InboundTakeoverContextUpdate,
     InboundTakeoverOfferRequest,
     InboundTakeoverRevoke,
     TakeoverRejection,
@@ -35,7 +34,7 @@ class _Service:
         self.claims: list[dict] = []
         self.offers: list[InboundTakeoverOfferRequest] = []
         self.revokes: list[InboundTakeoverRevoke] = []
-        self.context_updates: list[InboundTakeoverContextUpdate] = []
+        self.takeover_contexts: dict[str, dict] = {}
 
     def remote_dialer_status(self) -> dict:
         return {"active": False}
@@ -57,10 +56,8 @@ class _Service:
     ) -> InboundTakeoverRevoke | None:
         return self.revokes.pop(0) if self.revokes else None
 
-    def next_inbound_takeover_context_update(
-        self, timeout: float = 0.0
-    ) -> InboundTakeoverContextUpdate | None:
-        return self.context_updates.pop(0) if self.context_updates else None
+    def takeover_context_snapshot(self, offer_id: str) -> dict | None:
+        return self.takeover_contexts.get(offer_id)
 
     def accept_inbound_takeover_claim(self, **fields) -> TakeoverResult:
         self.claims.append(fields)
@@ -295,7 +292,6 @@ def test_edge_sends_opaque_takeover_offer_then_revoke_with_frozen_schema() -> No
             "generation": 7,
             "nonce": "takeover-nonce-abcdefghijkl",
             "expiresAtUnixMs": 130000,
-            "context": None,
         },
         {
             "v": 1,
@@ -306,9 +302,10 @@ def test_edge_sends_opaque_takeover_offer_then_revoke_with_frozen_schema() -> No
         },
     ]
     assert "preference" not in repr(sent).lower()
-    # 没有展示上下文时 offer 仍不含任何号码/身份（WIL-137 之前的全量不变量，
-    # 现在收窄为「context 为 null 时」——带上下文的形态见下一个测试）。
-    assert "+1" not in repr(sent)
+    # ADR-003：完整号码、偏好原文、转写与模型 reasoning 一律不上 Cloud。
+    # 接管上下文（WIL-137）因此不随 offer 推送，改按需 relay，见
+    # test_takeover_context_is_served_on_demand_and_never_pushed。
+    assert "number" not in repr(sent).lower()
 
 
 def test_cloud_client_accepts_strict_inbound_claim_and_acks_offer() -> None:
@@ -768,66 +765,88 @@ def test_cloud_api_redacts_structured_http_failure(monkeypatch) -> None:
     assert "sensitive detail" not in str(caught.value)
 
 
-def test_edge_sends_offer_context_and_later_context_update() -> None:
-    """接管展示上下文（WIL-137）：offer 带 context，问清身份后再发 context 更新。
+def test_takeover_context_is_served_on_demand_and_never_pushed() -> None:
+    """接管上下文按需 relay（WIL-137 + ADR-003）。
 
-    形状是 iOS/Worker 的对接契约——字段名与毫秒时间戳固定，空字段显式 null。
+    上下文含完整号码与转写派生的来意——ADR-003 明确这类数据不上 Cloud，
+    故不随 inbound.offer 推送、云端也不持久化，改由设备按 offerId 经
+    data.request 拉取，Edge 现答现回。
     """
-    from agentcall.takeover_context import build_context
-
     service = _Service()
-    service.offers.append(
-        InboundTakeoverOfferRequest(
-            offer_id="offer_takeover_abcdefghijkl",
-            call_id="call_takeover_abcdefghijkl",
-            generation=7,
-            nonce="takeover-nonce-abcdefghijkl",
-            created_at=100.0,
-            expires_at=130.0,
-            # offer 发出时通常只知道号码
-            context=build_context(
-                peer_number="+15105550123", updated_at_ms=100000
-            ),
-        )
-    )
-    service.context_updates.append(
-        InboundTakeoverContextUpdate(
-            offer_id="offer_takeover_abcdefghijkl",
-            call_id="call_takeover_abcdefghijkl",
-            generation=7,
-            context=build_context(
-                peer_number="+15105550123",
-                claimed_name="Kevin",
-                purpose="约机主周六吃饭",
-                updated_at_ms=112000,
-            ),
-        )
-    )
+    service.takeover_contexts["offer_takeover_abcdefghijkl"] = {
+        "v": 1,
+        "peerNumber": "+15105550123",
+        "claimedName": "Kevin",
+        "purpose": "约机主周六吃饭",
+        "updatedAtUnixMs": 112000,
+    }
     client = CloudEdgeClient("https://api.bondings.ai", service, _Store())
     sent: list[dict] = []
 
-    client._drain_takeover_events(lambda raw: sent.append(json.loads(raw)))
+    def request(offer_id: str, request_id: str) -> dict:
+        client._handle_data_request(
+            {
+                "v": 1,
+                "type": "data.request",
+                "requestId": request_id,
+                "resource": "takeover.context",
+                "params": {"offerId": offer_id},
+                "expiresAtUnixMs": round(time.time() * 1000) + 10_000,
+            },
+            lambda raw: sent.append(json.loads(raw)),
+        )
+        return sent[-1]
 
-    assert sent[0]["context"] == {
+    hit = request("offer_takeover_abcdefghijkl", "req_takeover_ctx_aaaaaaaaaaaa")
+    assert hit["status"] == "ok"
+    assert hit["resource"] == "takeover.context"
+    assert hit["body"]["context"]["claimedName"] == "Kevin"
+    assert hit["body"]["context"]["updatedAtUnixMs"] == 112000
+
+    # 无上下文与有上下文是同一层包装，解析方只需取 body.context 判 null
+    miss = request("offer_takeover_zzzzzzzzzzzz", "req_takeover_ctx_bbbbbbbbbbbb")
+    assert miss["status"] == "ok"
+    assert miss["body"] == {"context": None}
+
+    # 非法 offerId 不进 Edge 查询路径
+    bad = request("not-an-offer-id", "req_takeover_ctx_cccccccccccc")
+    assert bad["status"] == "error"
+    assert bad["error"]["code"] == "INVALID_REQUEST"
+
+
+def test_takeover_context_relay_is_not_gated_by_content_read_flag() -> None:
+    """接管上下文不受 REMOTE_CONTENT_READ_ENABLED（历史内容只读同步）约束：
+    它不是历史内容，是当前这通电话的接听决策信息，随接管功能一起可用；
+    与 /v1/inbound-offers 等既有接管接口口径一致（都只要求设备鉴权）。"""
+    service = _Service()
+    service.takeover_contexts["offer_takeover_abcdefghijkl"] = {
         "v": 1,
         "peerNumber": "+15105550123",
         "claimedName": None,
         "purpose": None,
         "updatedAtUnixMs": 100000,
     }
-    assert sent[1] == {
-        "v": 1,
-        "type": "inbound.offer.context",
-        "offerId": "offer_takeover_abcdefghijkl",
-        "callId": "call_takeover_abcdefghijkl",
-        "generation": 7,
-        "context": {
+    # 内容只读同步关闭，且没有 content repository
+    client = CloudEdgeClient(
+        "https://api.bondings.ai",
+        service,
+        _Store(),
+        content_repository=None,
+        content_read_enabled=lambda: False,
+    )
+    sent: list[dict] = []
+
+    client._handle_data_request(
+        {
             "v": 1,
-            "peerNumber": "+15105550123",
-            "claimedName": "Kevin",
-            "purpose": "约机主周六吃饭",
-            "updatedAtUnixMs": 112000,
+            "type": "data.request",
+            "requestId": "req_takeover_ctx_dddddddddddd",
+            "resource": "takeover.context",
+            "params": {"offerId": "offer_takeover_abcdefghijkl"},
+            "expiresAtUnixMs": round(time.time() * 1000) + 10_000,
         },
-    }
-    # 后补的上下文必须比 offer 里的新，消费方据此判断覆盖
-    assert sent[1]["context"]["updatedAtUnixMs"] > sent[0]["context"]["updatedAtUnixMs"]
+        lambda raw: sent.append(json.loads(raw)),
+    )
+
+    assert sent[0]["status"] == "ok"
+    assert sent[0]["body"]["context"]["peerNumber"] == "+15105550123"
