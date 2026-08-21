@@ -329,3 +329,104 @@ def test_continue_ai_still_clears_reject_candidate():
         consumer.consume(again, current_generation=7).reason
         == "reject_confirmation_required"
     )
+
+
+# ---- clarify 死锁兜底（真机 2026-08-21）----
+
+
+def test_clarify_deadlock_releases_to_ai_when_nothing_looks_like_spam():
+    """判官卡在 unknown 上连续 clarify 时放行给 AI，别把通话变成一堵墙。
+
+    真机 2026-08-21：转写把机主名字听成了别的词，判官三轮都判
+    unknown/clarify，来电者三次明确要求转接都没反应，而 AI 被锁在分诊限制
+    话术里只会说「我没法转接也没法转告」。放行只是让 AI 正常接待——
+    不把电话递给机主，不构成 spam 触达。
+    """
+    consumer = TriageVerdictConsumer(max_clarify_streak=3)
+    outcomes = []
+    for turn_id in (1, 2, 3):
+        verdict = parse_triage_verdict(
+            _response(
+                category="unknown", action="clarify", confidence=0.5, turn_id=turn_id
+            )
+        )
+        result = consumer.consume(verdict, current_generation=7)
+        outcomes.append((result.outcome, result.reason))
+
+    assert outcomes[0][0] == "clarify" and outcomes[1][0] == "clarify"
+    assert outcomes[2] == ("continue_ai", "clarify_deadlock_released")
+
+
+def test_clarify_deadlock_never_releases_while_a_reject_is_pending():
+    """有待确认拒绝时绝不放行——那正是 spam 场景，放行等于给推销让路。"""
+    consumer = TriageVerdictConsumer(max_clarify_streak=2)
+    spam = parse_triage_verdict(
+        _response(category="marketing", action="reject", confidence=0.9, turn_id=1)
+    )
+    assert consumer.consume(spam, current_generation=7).outcome == "clarify"
+
+    for turn_id in (2, 3, 4, 5):
+        verdict = parse_triage_verdict(
+            _response(
+                category="unknown", action="clarify", confidence=0.5, turn_id=turn_id
+            )
+        )
+        result = consumer.consume(verdict, current_generation=7)
+        assert result.outcome == "clarify"
+        assert result.reason != "clarify_deadlock_released"
+
+    # 拒绝候选仍在：同类别第二票照常完成拒绝
+    confirm = parse_triage_verdict(
+        _response(category="marketing", action="reject", confidence=0.9, turn_id=6)
+    )
+    assert consumer.consume(confirm, current_generation=7).outcome == "reject"
+
+
+def test_clarify_streak_resets_on_progress():
+    """判官一旦给出实质判决，连击计数归零——不能让跨阶段的零星 clarify 累加
+    成误放行。"""
+    consumer = TriageVerdictConsumer(max_clarify_streak=3)
+    for turn_id in (1, 2):
+        consumer.consume(
+            parse_triage_verdict(
+                _response(
+                    category="unknown", action="clarify", confidence=0.5, turn_id=turn_id
+                )
+            ),
+            current_generation=7,
+        )
+    consumer.consume(
+        parse_triage_verdict(
+            _response(
+                category="service", action="continue_ai", confidence=0.8, turn_id=3
+            )
+        ),
+        current_generation=7,
+    )
+    result = consumer.consume(
+        parse_triage_verdict(
+            _response(category="unknown", action="clarify", confidence=0.5, turn_id=4)
+        ),
+        current_generation=7,
+    )
+    assert result.outcome == "clarify"  # 计数已归零，这只是第 1 次
+
+
+def test_judge_input_carries_owner_name_for_mis_transcribed_requests():
+    """判官必须知道机主叫什么：电话转写常把人名听错（真机把「Shaocheng」
+    听成「ChatGPT」），不知道名字就会把「我找 X」当语无伦次而一直判 unknown。"""
+    from agentcall.triage_judge import _SYSTEM_PROMPT, build_triage_messages
+
+    messages = build_triage_messages(
+        [("user", "I'm ChatGPT's friend, put me through")],
+        "真心找机主的转接",
+        turn_id=1,
+        call_generation=0,
+        owner="李明",
+    )
+    payload = json.loads(messages[1]["content"])
+    assert payload["owner_name"] == "李明"
+    # 提示词要给出两条纠偏：音近容忍 + 反复明确要求转接的升级路径
+    assert "音近" in _SYSTEM_PROMPT
+    assert "反复、明确地要求转接本人" in _SYSTEM_PROMPT
+    assert "不要继续 clarify" in _SYSTEM_PROMPT
