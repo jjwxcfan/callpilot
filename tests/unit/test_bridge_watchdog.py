@@ -480,7 +480,7 @@ def test_run_once_starts_bridge_when_no_process(tmp_path, monkeypatch):
         watchdog, "start_bridge", lambda cmd, log: started.append(list(cmd)) or 4242,
     )
 
-    action, missing_since = watchdog.run_once(
+    action, missing_since, skips = watchdog.run_once(
         tmp_path / "sim7600-at",  # 不存在 = PTY 缺失
         "sim7600_usb_pty", tmp_path / "l.lock", ["bridge-cmd"], None,
         missing_since=0.0, threshold=20.0, now=100.0,
@@ -489,6 +489,7 @@ def test_run_once_starts_bridge_when_no_process(tmp_path, monkeypatch):
     assert action == "start"
     assert started == [["bridge-cmd"]]
     assert missing_since is not None  # 重置计时，给新桥启动时间
+    assert skips == 0                 # 拉了桥 = 连续跳过计数归零
 
 
 def test_run_once_leaves_healthy_waiting_bridge_alone(tmp_path, monkeypatch):
@@ -499,11 +500,12 @@ def test_run_once_leaves_healthy_waiting_bridge_alone(tmp_path, monkeypatch):
         lambda cmd, log: pytest.fail("健康桥等待设备时不得拉起新桥"),
     )
 
-    action, _ = watchdog.run_once(
+    action, _, skips = watchdog.run_once(
         tmp_path / "sim7600-at", "sim7600_usb_pty", tmp_path / "l.lock",
         ["bridge-cmd"], None, missing_since=0.0, threshold=20.0, now=100.0,
     )
     assert action == "none"
+    assert skips == 1  # 记一次「因健康桥跳过」，连续超上限会强行拉桥（issue #139）
 
 
 def test_run_once_rescues_only_hung_and_spares_healthy(tmp_path, monkeypatch):
@@ -521,7 +523,7 @@ def test_run_once_rescues_only_hung_and_spares_healthy(tmp_path, monkeypatch):
         lambda cmd, log: pytest.fail("健康桥仍在时不得重复拉桥"),
     )
 
-    action, missing_since = watchdog.run_once(
+    action, missing_since, skips = watchdog.run_once(
         tmp_path / "sim7600-at", "sim7600_usb_pty", lock,
         ["bridge-cmd"], None, missing_since=0.0, threshold=20.0, now=100.0,
     )
@@ -529,6 +531,7 @@ def test_run_once_rescues_only_hung_and_spares_healthy(tmp_path, monkeypatch):
     assert action == "rescue"
     assert rescued == [[111]]        # 只有确认挂死的 111，健康的 222 不在名单
     assert missing_since is not None
+    assert skips == 1                # 健康桥 222 挡下了拉桥：计入连续跳过
 
 
 def test_run_once_rescues_and_restarts_when_all_hung(tmp_path, monkeypatch):
@@ -543,7 +546,7 @@ def test_run_once_rescues_and_restarts_when_all_hung(tmp_path, monkeypatch):
         watchdog, "start_bridge", lambda cmd, log: started.append(list(cmd)) or 4242,
     )
 
-    action, missing_since = watchdog.run_once(
+    action, missing_since, skips = watchdog.run_once(
         tmp_path / "sim7600-at", "sim7600_usb_pty", lock,
         ["bridge-cmd"], None, missing_since=0.0, threshold=20.0, now=100.0,
     )
@@ -552,6 +555,7 @@ def test_run_once_rescues_and_restarts_when_all_hung(tmp_path, monkeypatch):
     assert rescued == [[111]]
     assert started == [["bridge-cmd"]]
     assert missing_since is not None
+    assert skips == 0
 
 
 def test_run_once_all_clear_resets_timer(tmp_path, monkeypatch):
@@ -560,9 +564,232 @@ def test_run_once_all_clear_resets_timer(tmp_path, monkeypatch):
     monkeypatch.setattr(watchdog, "find_bridge_pids", lambda pattern: [111])
     monkeypatch.setattr(watchdog, "judge_lock_holder", lambda pid: "healthy")
 
-    action, missing_since = watchdog.run_once(
+    action, missing_since, skips = watchdog.run_once(
         pty, "sim7600_usb_pty", tmp_path / "l.lock", ["bridge-cmd"], None,
         missing_since=50.0, threshold=20.0, now=100.0,
     )
     assert action == "none"
     assert missing_since is None
+    assert skips == 0
+
+
+# ---- 外层看门狗：桥进程识别（issue #139 / WIL-145）----
+#
+# 真机 2026-08-20 首次自愈实测的误判现场：pgrep -f sim7600_usb_pty 同时匹配到
+# 僵尸桥 21646 与**启动桥的 shell 包装** 21643（/bin/zsh -c … sim7600_usb_pty.py），
+# 后者被当成「健康桥仍在场」→ 跳过拉桥。下列真实命令行取自本机 ps。
+
+_REAL_BRIDGE_CMD = (
+    "/opt/homebrew/Cellar/python@3.12/3.12.13_4/Frameworks/Python.framework/Versions/"
+    "3.12/Resources/Python.app/Contents/MacOS/Python "
+    "/Users/dev/CallPilot/callpilot/scripts/sim7600_usb_pty.py"
+)
+_REAL_WRAPPER_CMD = (
+    "/bin/zsh -c cd /Users/dev/CallPilot/callpilot && "
+    ".venv/bin/python scripts/sim7600_usb_pty.py >> /tmp/bridge.log 2>&1"
+)
+
+
+def test_classify_bridge_command_accepts_real_interpreter_forms():
+    """解释器直接执行脚本 = 桥本体。
+
+    注意真机解释器是 …/Python.app/Contents/MacOS/Python（**大写 P**）——
+    「命令以 python 开头」的白名单会把真桥判成非桥，故用排除法。
+    """
+    classify = watchdog.classify_bridge_command
+    assert classify(_REAL_BRIDGE_CMD, "sim7600_usb_pty") == "bridge"
+    assert classify("/repo/.venv/bin/python /repo/scripts/sim7600_usb_pty.py", "sim7600_usb_pty") == "bridge"
+    assert classify("/usr/bin/python3.12 scripts/sim7600_usb_pty.py --pty /tmp/x", "sim7600_usb_pty") == "bridge"
+    # env/nohup 只是 exec 直通前缀，剥掉后仍是解释器直接执行脚本
+    assert classify("/usr/bin/env python3 /repo/scripts/sim7600_usb_pty.py", "sim7600_usb_pty") == "bridge"
+    assert classify("nohup /repo/.venv/bin/python /repo/scripts/sim7600_usb_pty.py", "sim7600_usb_pty") == "bridge"
+    assert classify("/usr/bin/env PYTHONPATH=/repo/src python3 /repo/scripts/sim7600_usb_pty.py",
+                    "sim7600_usb_pty") == "bridge"
+    # 打包版（CallPilot.app --bridge，配 --pattern 覆盖）同样是桥本体
+    assert classify("/Applications/CallPilot.app/Contents/MacOS/CallPilot --bridge", "CallPilot --bridge") == "bridge"
+
+
+def test_classify_bridge_command_rejects_shell_wrappers():
+    """issue #139 主修：shell 包装绝不能被当成桥本体。"""
+    classify = watchdog.classify_bridge_command
+    assert classify(_REAL_WRAPPER_CMD, "sim7600_usb_pty") == "wrapper"
+    assert classify("/bin/sh -c exec python scripts/sim7600_usb_pty.py", "sim7600_usb_pty") == "wrapper"
+    assert classify("/bin/bash /repo/scripts/run_sim7600_usb_pty.sh", "sim7600_usb_pty") == "wrapper"
+    assert classify("-zsh -c python scripts/sim7600_usb_pty.py", "sim7600_usb_pty") == "wrapper"  # 登录 shell argv[0]
+    assert classify("nohup /bin/zsh -c python scripts/sim7600_usb_pty.py &", "sim7600_usb_pty") == "wrapper"
+    assert classify("tmux new-session -d python scripts/sim7600_usb_pty.py", "sim7600_usb_pty") == "wrapper"
+    # 任何解释器的 `-c 内联代码` 都不是「直接执行脚本」
+    assert classify("/repo/.venv/bin/python -c import scripts.sim7600_usb_pty as m; m.main()",
+                    "sim7600_usb_pty") == "wrapper"
+
+
+def test_classify_bridge_command_other_when_pattern_absent():
+    assert watchdog.classify_bridge_command("/usr/bin/python3 other.py", "sim7600_usb_pty") == "other"
+    assert watchdog.classify_bridge_command("", "sim7600_usb_pty") == "other"
+
+
+def test_filter_bridge_pids_drops_wrapper_from_real_incident():
+    """真机现场复现：21643(shell 包装) + 21646(桥本体) → 只认 21646。"""
+    rows = [(21643, _REAL_WRAPPER_CMD), (21646, _REAL_BRIDGE_CMD)]
+    assert watchdog.filter_bridge_pids(rows, "sim7600_usb_pty") == [21646]
+
+
+def test_parse_ps_commands():
+    text = f"21643 {_REAL_WRAPPER_CMD}\n 21646 {_REAL_BRIDGE_CMD}\nrubbish line\n"
+    rows = watchdog.parse_ps_commands(text)
+    assert [pid for pid, _ in rows] == [21643, 21646]
+    assert rows[1][1] == _REAL_BRIDGE_CMD
+
+
+def test_find_bridge_pids_excludes_shell_wrapper():
+    pids = watchdog.find_bridge_pids(
+        "sim7600_usb_pty",
+        pgrep_fn=lambda pattern: [21643, 21646],
+        commands_fn=lambda pids: [(21643, _REAL_WRAPPER_CMD), (21646, _REAL_BRIDGE_CMD)],
+    )
+    assert pids == [21646]
+
+
+def test_find_bridge_pids_drops_exited_pid():
+    """pgrep 与 ps 之间进程退出：ps 不列出它 → 自然剔除。"""
+    pids = watchdog.find_bridge_pids(
+        "sim7600_usb_pty",
+        pgrep_fn=lambda pattern: [111, 222],
+        commands_fn=lambda pids: [(222, _REAL_BRIDGE_CMD)],
+    )
+    assert pids == [222]
+
+
+def test_find_bridge_pids_falls_back_when_ps_fails():
+    """ps 探测失败：退回 pgrep 原始结果（宁可多认，别误判成「无桥」重复拉桥）。"""
+    pids = watchdog.find_bridge_pids(
+        "sim7600_usb_pty",
+        pgrep_fn=lambda pattern: [21643, 21646],
+        commands_fn=lambda pids: None,
+    )
+    assert pids == [21643, 21646]
+
+
+def test_find_bridge_pids_skips_ps_when_no_candidates():
+    called: list[int] = []
+    assert watchdog.find_bridge_pids(
+        "sim7600_usb_pty",
+        pgrep_fn=lambda pattern: [],
+        commands_fn=lambda pids: called.append(len(pids)) or [],
+    ) == []
+    assert called == []
+
+
+# ---- 外层看门狗：连续跳过上限兜底（issue #139 第二道保险）----
+
+
+def test_should_force_start_cap():
+    assert watchdog.should_force_start(0, 3) is False
+    assert watchdog.should_force_start(2, 3) is False
+    assert watchdog.should_force_start(3, 3) is True
+    assert watchdog.should_force_start(9, 0) is False   # 0 = 禁用兜底
+
+
+def test_decide_action_forces_start_after_repeated_healthy_skips():
+    """任何未预见的误判形态都不得导致永久不自愈：连续跳过超上限 → 强行拉桥。"""
+    decide = watchdog.decide_action
+    for skips in (0, 1, 2):
+        assert decide([111], [False], pty_ok=False, missing_seconds=25.0, threshold=20.0,
+                      healthy_skips=skips, max_healthy_skips=3) == "none"
+    assert decide([111], [False], pty_ok=False, missing_seconds=25.0, threshold=20.0,
+                  healthy_skips=3, max_healthy_skips=3) == "force_start"
+
+
+def test_decide_action_skip_cap_never_overrides_healthy_pty_ok():
+    """PTY 在位/未超阈值时，跳过计数再高也不该动手。"""
+    assert watchdog.decide_action([111], [False], pty_ok=True, missing_seconds=0.0, threshold=20.0,
+                                  healthy_skips=99, max_healthy_skips=3) == "none"
+    assert watchdog.decide_action([111], [False], pty_ok=False, missing_seconds=5.0, threshold=20.0,
+                                  healthy_skips=99, max_healthy_skips=3) == "none"
+
+
+def test_decide_action_hung_still_rescues_at_cap():
+    assert watchdog.decide_action([111], [True], pty_ok=False, missing_seconds=25.0, threshold=20.0,
+                                  healthy_skips=99, max_healthy_skips=3) == "rescue"
+
+
+def test_run_once_starts_bridge_when_only_shell_wrapper_matches(tmp_path, monkeypatch):
+    """issue #139 端到端回归：pgrep 只匹配到 shell 包装时，必须照常拉桥。"""
+    started: list[list[str]] = []
+    monkeypatch.setattr(watchdog, "pgrep_pids", lambda pattern: [21643])
+    monkeypatch.setattr(watchdog, "process_commands", lambda pids: [(21643, _REAL_WRAPPER_CMD)])
+    monkeypatch.setattr(
+        watchdog, "judge_lock_holder",
+        lambda pid: pytest.fail("shell 包装不该进入挂死判定"),
+    )
+    monkeypatch.setattr(watchdog, "start_bridge", lambda cmd, log: started.append(list(cmd)) or 4242)
+
+    action, _, skips = watchdog.run_once(
+        tmp_path / "sim7600-at", "sim7600_usb_pty", tmp_path / "l.lock",
+        ["bridge-cmd"], None, missing_since=0.0, threshold=20.0, now=100.0,
+    )
+
+    assert (action, started, skips) == ("start", [["bridge-cmd"]], 0)
+
+
+def test_run_once_force_starts_after_skip_cap(tmp_path, monkeypatch):
+    """兜底：连续 3 次因「健康桥仍在场」跳过后，第 4 轮无视健康判定强行拉桥。"""
+    started: list[list[str]] = []
+    monkeypatch.setattr(watchdog, "find_bridge_pids", lambda pattern: [111])
+    monkeypatch.setattr(watchdog, "judge_lock_holder", lambda pid: "healthy")
+    monkeypatch.setattr(watchdog, "start_bridge", lambda cmd, log: started.append(list(cmd)) or 4242)
+
+    skips = 0
+    actions: list[str] = []
+    for _ in range(4):
+        action, _, skips = watchdog.run_once(
+            tmp_path / "sim7600-at", "sim7600_usb_pty", tmp_path / "l.lock",
+            ["bridge-cmd"], None, missing_since=0.0, threshold=20.0, now=100.0,
+            healthy_skips=skips, max_healthy_skips=3,
+        )
+        actions.append(action)
+
+    assert actions == ["none", "none", "none", "force_start"]
+    assert started == [["bridge-cmd"]]   # 只强拉一次
+    assert skips == 0                    # 拉桥后计数归零，不会每轮风暴式强拉
+
+
+def test_run_once_rescue_force_starts_after_skip_cap(tmp_path, monkeypatch):
+    """救援路径的同一条兜底：僵尸+「健康」桥并存且已连续跳过到上限 → 照样拉桥。"""
+    lock = tmp_path / "l.lock"
+    lock.write_text("111")
+    started: list[list[str]] = []
+    monkeypatch.setattr(watchdog, "find_bridge_pids", lambda pattern: [111, 222])
+    monkeypatch.setattr(watchdog, "judge_lock_holder", lambda pid: "hung" if pid == 111 else "healthy")
+    monkeypatch.setattr(watchdog, "rescue", lambda pids, lp, **kw: None)
+    monkeypatch.setattr(watchdog, "start_bridge", lambda cmd, log: started.append(list(cmd)) or 4242)
+
+    action, _, skips = watchdog.run_once(
+        tmp_path / "sim7600-at", "sim7600_usb_pty", lock,
+        ["bridge-cmd"], None, missing_since=0.0, threshold=20.0, now=100.0,
+        healthy_skips=3, max_healthy_skips=3,
+    )
+
+    assert (action, started, skips) == ("rescue", [["bridge-cmd"]], 0)
+
+
+def test_run_once_skip_counter_resets_when_pty_returns(tmp_path, monkeypatch):
+    pty = tmp_path / "sim7600-at"
+    pty.write_text("")  # PTY 恢复在位
+    monkeypatch.setattr(watchdog, "find_bridge_pids", lambda pattern: [111])
+    monkeypatch.setattr(watchdog, "judge_lock_holder", lambda pid: "healthy")
+
+    _, _, skips = watchdog.run_once(
+        pty, "sim7600_usb_pty", tmp_path / "l.lock", ["bridge-cmd"], None,
+        missing_since=50.0, threshold=20.0, now=100.0, healthy_skips=2, max_healthy_skips=3,
+    )
+    assert skips == 0  # 连续性被打断：不能把历史跳过累计到下一次故障
+
+
+def test_classify_bridge_command_honours_regex_pattern():
+    """pattern 与 pgrep -f 同口径当正则用（--pattern 可传正则），非法正则退回子串。"""
+    classify = watchdog.classify_bridge_command
+    assert classify(_REAL_BRIDGE_CMD, r"sim7600_usb_pty\.py$") == "bridge"
+    assert classify(_REAL_WRAPPER_CMD, r"sim7600_usb_pty\.py") == "wrapper"
+    assert classify(_REAL_BRIDGE_CMD, r"ec20_usb_pty\.py") == "other"
+    assert classify("/usr/bin/python3 scripts/sim7600_usb_pty[.py", "sim7600_usb_pty[") == "bridge"
