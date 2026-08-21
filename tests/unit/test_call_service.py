@@ -715,9 +715,11 @@ def test_inbound_call_full_lifecycle(monkeypatch):
     assert "answer" in modem.call_names()  # ATA 接听
     assert agent.started and agent.said  # 开场白已发
     assert "李明的数字分身" in agent._session_instructions
-    # 开场白只说「喂？」（WIL-91）；身份由会话提示词的来电规则兜住，见上一行。
-    assert "喂" in agent.said[0]
-    assert "数字分身" not in agent.said[0], "开场白不该再做自我介绍"
+    # 开场白一句话带出身份+问谁+问事（WIL-144）；身份同时也在会话提示词里，
+    # 见上一行。此前只说「喂？」、身份全靠来电规则兜（WIL-91 旧形态）。
+    assert "一句话说完" in agent.said[0]
+    assert "哪位" in agent.said[0] and "什么事" in agent.said[0]
+    assert "李明的数字分身" in agent.said[0], "开场白要带身份（WIL-144）"
     assert bridge.downlink  # 开场白 PCM 写回模组
     assert agent.stopped and bridge.stopped  # 会话收尾
     assert "hangup" in modem.call_names()  # 物理挂断兜底
