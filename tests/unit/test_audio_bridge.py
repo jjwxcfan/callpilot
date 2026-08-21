@@ -496,3 +496,17 @@ def test_uplink_alignment_ambiguous_evidence_does_not_lock():
     ambiguous = (b"\x10\x10" * 20000)
     _feed(bridge, ambiguous)
     assert bridge._align_locked is False
+
+
+def test_ffmpeg_uac_discard_pending_output_drops_backlog():
+    """#125：uac_ffmpeg 桥此前缺 discard_pending_output，barge-in 与转接/拒绝
+    的丢积压经 hasattr 探测静默不生效——正常积压可达 10-30s，旧话轮照播。"""
+    bridge = make_ffmpeg_bridge()
+    bridge._tx_buffer.extend(b"\x01\x02" * 4000)
+
+    dropped = bridge.discard_pending_output()
+
+    assert dropped == 8000
+    assert len(bridge._tx_buffer) == 0
+    assert bridge._dropped_bytes == 8000
+    assert bridge.discard_pending_output() == 0

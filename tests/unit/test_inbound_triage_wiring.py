@@ -190,3 +190,48 @@ def test_takeover_hold_text_states_transfer_in_progress() -> None:
     assert "正在为您转接" in _INBOUND_TAKEOVER_HOLD_TEXT["zh"]
     assert "putting you through" in _INBOUND_TAKEOVER_HOLD_TEXT["en"]
     assert "确认一下" not in _INBOUND_TAKEOVER_HOLD_TEXT["zh"]
+
+
+def test_reject_discards_bridge_backlog_and_waits_fixed_line(monkeypatch) -> None:
+    """#125：拒绝语与转接垫话同因——应用队列清了、桥里还躺着旧话轮积压；
+    拒绝语要先丢积压、并等音频投递完成再收闸，否则 caller 听到旧话戛然
+    而止后被静默挂断。"""
+    service = _service()
+    session = service.session
+    agent = FakeAgent()
+    bridge = FakeAudioBridge()
+    for turn_id in (1, 2):
+        session._triage_results.put_nowait(
+            _verdict(
+                action="reject", turn_id=turn_id, confidence=0.9, category="marketing"
+            )
+        )
+        bridge.pending_bytes = 48_000  # 每轮前模拟桥内旧话轮积压
+        asyncio.run(session._consume_triage_results(agent, bridge, 4))
+
+    assert bridge.discarded_bytes >= 48_000
+    assert "目前不需要这项服务" in agent.waited_say[-1]
+
+
+def test_clarify_skipped_when_agent_already_responding() -> None:
+    """#128 回归：判决到达前 agent 已开口问同样的问题时，固定澄清语跳过，
+    不再当着 caller 连问两遍；caller 尚未得到回应时照常澄清。"""
+    service = _service()
+    session = service.session
+    agent = FakeAgent()
+    bridge = FakeAudioBridge()
+
+    session._last_transcript_role = "agent"  # agent 已在回应
+    session._triage_results.put_nowait(
+        _verdict(action="clarify", turn_id=1, confidence=0.5, category="unknown")
+    )
+    asyncio.run(session._consume_triage_results(agent, bridge, 4))
+    assert agent.said == []
+    assert session._triage_clarification_spoken is False  # 名额未消耗
+
+    session._last_transcript_role = "user"  # caller 说完还没人回应
+    session._triage_results.put_nowait(
+        _verdict(action="clarify", turn_id=2, confidence=0.5, category="unknown")
+    )
+    asyncio.run(session._consume_triage_results(agent, bridge, 4))
+    assert len(agent.said) == 1 and "具体事情找本人" in agent.said[0]

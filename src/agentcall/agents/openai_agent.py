@@ -157,6 +157,9 @@ class OpenAIVoiceAgent(VoiceAgent):
         # barge-in 用：对端开口时仅在生成中才发 response.cancel，避免无回复时
         # cancel 引来一条无谓的 error 事件。
         self._response_active = False
+        # 累计 response.created 次数：say_and_wait 用它区分「自己触发的轮次
+        # 已开始并结束」与「旧轮次的 done 晚到」。
+        self._response_created_seq = 0
         # 最近一次 VAD 判停时刻（speech_stopped），用于逐轮响应延迟度量；
         # 首个音频增量到达时消费并置回 None。
         self._speech_stopped_at: float | None = None
@@ -480,6 +483,32 @@ class OpenAIVoiceAgent(VoiceAgent):
             # 断线窗口内 say 失败不应炸掉整通电话（开场白路径直接 await）；
             # 重连由接收循环统一负责。
             logger.warning("发送说话指令失败: %s", exc)
+
+    async def say_and_wait(self, instructions: str, timeout: float = 6.0) -> bool:
+        """说一句编排层话术并等该轮次完成（音频增量已全部投递）。
+
+        say() 是 fire-and-forget：response.create 发出即返回，TTS 音频要
+        几百毫秒后才从接收循环回来。垫话/拒绝语这类「说完才能关音频闸门」
+        的场景必须等到本轮 response.done，否则闸门先关、话术音频全被丢弃
+        （真机 2026-08-19，#125）。若当前有旧轮次在生成，先 cancel 掐掉，
+        免得旧话轮和固定话术抢播。返回是否在时限内等到完成。
+        """
+        if self._ws is None:
+            # 断线窗口内 say 是静默 no-op，没有任何事件能推进 seq——
+            # 不进入等待循环白吃满超时（评审发现：期间主循环冻结，
+            # ffmpeg 采集管道 ~4s 即满）。
+            return False
+        if self._response_active:
+            await self.cancel_response()
+        baseline = self._response_created_seq
+        await self.say(instructions)
+        deadline = time.monotonic() + max(0.5, timeout)
+        while time.monotonic() < deadline:
+            if self._response_created_seq > baseline and not self._response_active:
+                return True
+            await asyncio.sleep(0.05)
+        logger.warning("等待编排话术轮次完成超时（%.1fs），继续后续编排", timeout)
+        return False
 
     async def external_tool_result(
         self,
@@ -857,6 +886,7 @@ class OpenAIVoiceAgent(VoiceAgent):
                 )
         elif event_type == "response.created":
             self._response_active = True
+            self._response_created_seq += 1
             self._on_response_created()
         elif event_type == "input_audio_buffer.speech_started":
             # 与 call_agent 的「本地检测到语音起点」对表用（WIL-112 暗区定位）。
