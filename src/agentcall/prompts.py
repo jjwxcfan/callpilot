@@ -422,6 +422,35 @@ def _build_zh(
     )
 
 
+def verbatim_instruction(text: str, lang: str = "zh") -> str:
+    """把编排层的固定话术包成「逐字播报」指令（WIL-143）。
+
+    真机 2026-08-20：对方只说了半句「Hey, this is...」，AI 却在澄清语前面
+    自己加了一句「Oh, I love an idea. Tell me all about it.」——凭空脑补
+    对方有个 idea 并热情附和。原因是 OpenAI 链路的 say() 实为
+    response.create + instructions，模型会把「说这句话」当成写作提纲即兴
+    发挥，而澄清语/拒绝语/转接垫话这三处是系统兜底话术，必须可预期：
+    它们的措辞由编排层负责，模型加戏只会让状态与话术对不上。
+
+    这里刻意把原文放进 per-response instructions（与 WIL-99「系统提示词里
+    不要出现可照抄的开场白原文」不冲突——那条防的是模型把开场白当可复用
+    话术中途复读，而这是一次性的本轮指令，不进会话提示词）。
+    """
+    line = (text or "").strip()
+    if normalize_lang(lang) == "en":
+        return (
+            "Say the following line word for word. Add nothing at all — no "
+            "greeting, no explanation, no reaction to what the caller just "
+            "said, no rephrasing:\n"
+            f"{line}"
+        )
+    return (
+        "逐字说出下面这句话，一个字都不要增删——不要问候、不要解释、"
+        "不要接对方刚才的话、不要换成你自己的说法：\n"
+        f"{line}"
+    )
+
+
 def winddown_instructions(lang: str = "zh") -> str:
     """到达外呼硬时限时的收尾道别指令（让 AI 说一句简短告别就结束）。"""
     if normalize_lang(lang) == "en":

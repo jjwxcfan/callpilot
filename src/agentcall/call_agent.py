@@ -50,6 +50,7 @@ from .prompts import (
     default_outbound_task,
     opening_instructions,
     owner_name,
+    verbatim_instruction,
     winddown_instructions,
 )
 from .rate_limit import acquire_remote_dial_slot
@@ -949,18 +950,29 @@ class CallSession:
             )
         self._turn_trimmed_bytes = 0
 
-    async def _say_orchestrated_line(self, agent: VoiceAgent, text: str) -> None:
-        """播一句编排层话术：能等就等到本轮音频投递完成再返回。
+    async def _say_orchestrated_line(
+        self, agent: VoiceAgent, text: str, *, wait: bool = True
+    ) -> None:
+        """播一句编排层固定话术：逐字播报，能等就等到音频投递完成再返回。
 
-        provider 支持 say_and_wait（目前 openai）时等 response.done——调用方
-        随后关音频闸门才不会把话术增量一并丢掉；不支持的 provider 回退
-        fire-and-forget 的 say，行为与旧版一致。
+        两层保证：
+        - **逐字**（WIL-143）：包成 verbatim 指令再下发。say() 在 OpenAI 链路
+          是 response.create + instructions，不包的话模型会即兴演绎、甚至凭空
+          脑补对方说过的话（真机 2026-08-20：澄清语前自加「Oh, I love an
+          idea. Tell me all about it.」）。这三处是系统兜底话术，措辞归编排层。
+        - **等投递**：provider 支持 say_and_wait（目前 openai）时等
+          response.done，调用方随后关音频闸门才不会把话术增量一并丢掉；
+          不支持的 provider 回退 fire-and-forget。
+
+        ``wait=False`` 用于不后接闸门的场景（如分诊澄清语）：那里没有「说完
+        就关」的需求，不值得让主循环多阻塞一次模型往返。
         """
+        instruction = verbatim_instruction(text, agent_language())
         say_and_wait = getattr(agent, "say_and_wait", None)
-        if say_and_wait is not None:
-            await say_and_wait(text)
+        if wait and say_and_wait is not None:
+            await say_and_wait(instruction)
         else:
-            await agent.say(text)
+            await agent.say(instruction)
 
     async def _speak_takeover_hold_if_needed(
         self, agent: VoiceAgent, bridge: AudioBridge, generation: int
@@ -2089,7 +2101,13 @@ class CallSession:
                     continue
                 self._triage_clarification_spoken = True
                 try:
-                    await agent.say(_INBOUND_TRIAGE_CLARIFY_TEXT[agent_language()])
+                    # 澄清语同样逐字播报（WIL-143），但不等投递：后面没有
+                    # 关闸门的动作，没必要让主循环多阻塞一次模型往返。
+                    await self._say_orchestrated_line(
+                        agent,
+                        _INBOUND_TRIAGE_CLARIFY_TEXT[agent_language()],
+                        wait=False,
+                    )
                     self._drain_agent_audio(bridge)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
