@@ -56,13 +56,18 @@ D:/Callpilot/.venv/Scripts/python.exe scripts/hfp_spike/probe_audio.py list
 配对后先跑一次。**注意**：多数 Windows 只在通话建立（SCO 起来）后端点才可用，
 所以这一步没看到候选是正常的，继续下一步。
 
-然后**手机拨 611，接通后**（免提端点此时才活），在通话中跑：
+然后跑测试命令——**先开脚本，再去手机上拨 611**。脚本会轮询等端点就绪
+（默认等 120s），不用在通话中抢时间敲命令：
 
 ```bash
-D:/Callpilot/.venv/Scripts/python.exe scripts/hfp_spike/probe_audio.py test --seconds 12 --dtmf 1
+D:/Callpilot/.venv/Scripts/python.exe scripts/hfp_spike/probe_audio.py test --wait 120 --seconds 12 --dtmf 1
 ```
 
-它会录 12 秒上行、第 3 秒往下行注入一个 DTMF `1`。
+看到「等待 HFP 端点就绪」后拿起手机拨 611；接通瞬间脚本会自己开始，
+录 12 秒上行、第 3 秒往下行注入一个 DTMF `1`。
+
+> 轮询里每次都会强制 PortAudio 重新枚举设备（`sd._terminate()` / `sd._initialize()`）
+> ——sounddevice 在进程内缓存设备表，不重来就永远看不见 SCO 起来后新出现的端点。
 
 **判据**
 - 上行 `peak > 500` → 录到了对端声音，上行通；

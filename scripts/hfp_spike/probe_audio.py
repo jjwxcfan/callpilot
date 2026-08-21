@@ -151,20 +151,34 @@ def _pick(hits: list[dict], kind: str, prefer_api: str) -> dict | None:
     return usable[0]
 
 
-def cmd_test(args: argparse.Namespace) -> int:
+def _refresh_devices() -> None:
+    """强制 PortAudio 重新枚举设备。
+
+    sounddevice 在进程内缓存设备表，SCO 链路建立后新出现的 HFP 端点不会自己
+    冒出来——轮询等待必须先重来一遍，否则等到天荒地老也看不见。
+    """
     import sounddevice as sd
 
-    keywords = tuple(k.lower() for k in (args.keyword or DEFAULT_KEYWORDS))
+    try:
+        sd._terminate()
+        sd._initialize()
+    except Exception:
+        pass
+
+
+def _resolve_endpoint(
+    keywords: tuple[str, ...], hostapi: str
+) -> tuple[dict, dict, int] | None:
+    """找到成对且能开流的 HFP 输入/输出端点，返回 (rx, tx, rate)；找不到返回 None。"""
+    import sounddevice as sd
+
     hits = _candidates(keywords)
     if not hits:
-        print("!! 没找到 HFP 端点。必须在通话已接通时运行本命令。")
-        return 1
-
-    rx = _pick(hits, "input", args.hostapi)
-    tx = _pick(hits, "output", args.hostapi)
+        return None
+    rx = _pick(hits, "input", hostapi)
+    tx = _pick(hits, "output", hostapi)
     if rx is None or tx is None:
-        print("!! 输入/输出端点不成对: rx={} tx={}".format(rx, tx))
-        return 1
+        return None
 
     # 采样率：先信设备自报，失败再退 8000/16000。这一项的结果决定
     # audio_bridge.MODEM_RATE=8000 写死能不能直接用。
@@ -172,9 +186,6 @@ def cmd_test(args: argparse.Namespace) -> int:
     for r in (int(rx["default_samplerate"]), 8000, 16000):
         if r and r not in rates:
             rates.append(r)
-
-    rate = None
-    last_err = None
     for r in rates:
         try:
             sd.check_input_settings(
@@ -183,13 +194,40 @@ def cmd_test(args: argparse.Namespace) -> int:
             sd.check_output_settings(
                 device=tx["index"], samplerate=r, channels=1, dtype="int16"
             )
-            rate = r
-            break
-        except Exception as exc:
-            last_err = exc
-    if rate is None:
-        print("!! 输入输出找不到共同采样率，最后错误: {}".format(last_err))
+            return rx, tx, r
+        except Exception:
+            continue
+    return None
+
+
+def cmd_test(args: argparse.Namespace) -> int:
+    import sounddevice as sd
+
+    keywords = tuple(k.lower() for k in (args.keyword or DEFAULT_KEYWORDS))
+
+    # 端点只在 SCO 起来（通话接通）时才可开流。轮询等待，让你先开脚本再拨号，
+    # 不用在通话中抢时间敲命令。
+    resolved = _resolve_endpoint(keywords, args.hostapi)
+    if resolved is None and args.wait > 0:
+        print("等待 HFP 端点就绪（最多 {:.0f}s）——现在去手机上拨 611。".format(args.wait))
+        deadline = time.monotonic() + args.wait
+        dots = 0
+        while time.monotonic() < deadline:
+            time.sleep(1.0)
+            _refresh_devices()
+            resolved = _resolve_endpoint(keywords, args.hostapi)
+            if resolved is not None:
+                print("\n端点就绪，开始采集。")
+                break
+            dots += 1
+            print("  ...{}s".format(dots), end="\r", flush=True)
+    if resolved is None:
+        print("\n!! 没找到可开流的 HFP 端点。")
+        print("   - 通话是否真的接通了？端点通常只在 SCO 起来时可用。")
+        print("   - 手机的音频是否路由到了 PC？通话界面里把音频输出选成本机。")
+        print("   - 先跑 `probe_audio.py list` 看设备名，必要时用 --keyword 覆盖。")
         return 1
+    rx, tx, rate = resolved
 
     block = int(rate * 0.02)  # 20ms，与 audio_bridge.MODEM_BLOCK_MS 一致
     print("RX [{}] {}  api={}".format(rx["index"], rx["name"], rx["hostapi"]))
@@ -346,6 +384,8 @@ def main() -> int:
     pt.add_argument("--inject-at", type=float, default=3.0, help="第几秒注入 DTMF")
     pt.add_argument("--dtmf", default="1", help="注入的按键，空串则不注入")
     pt.add_argument("--hostapi", default="WASAPI", help="优先的 host API")
+    pt.add_argument("--wait", type=float, default=120.0,
+                    help="等端点就绪的秒数（先开脚本再拨号，0=不等）")
     pt.set_defaults(func=cmd_test)
 
     args = p.parse_args()
