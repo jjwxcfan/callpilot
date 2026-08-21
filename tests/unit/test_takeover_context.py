@@ -156,3 +156,22 @@ def test_context_is_immutable_value_object():
         assert type(exc).__name__ == "FrozenInstanceError"
     else:  # pragma: no cover - 冻结失效才会走到
         raise AssertionError("上下文必须是不可变值对象")
+
+
+def test_claimed_name_field_contract_forbids_verified_identity_reuse():
+    """``claimed_name`` 按定义是未核实的自报值，契约必须写死这一点。
+
+    iOS 侧对该字段有不可绕过的「自称 / Claims to be」前缀展示规则。若将来
+    的「已核实身份」（通讯录匹配、CNAM）被填进同一字段，UI 要么把已核实的
+    错标成自称，要么有人为显示好看去掉前缀——把「自称」的安全语义抹掉。
+    这条边界只能靠文档与本测试守住，故显式断言它写在模块契约里。
+    """
+    import agentcall.takeover_context as module
+
+    doc = module.__doc__ or ""
+    assert "未经核实" in doc
+    assert "必须新增独立字段" in doc
+    assert "绝不能把核实结果填进" in doc
+    # 字段名本身也是契约的一部分：改名成 name 就失去了「自称」的语义锚点
+    assert "claimed_name" in TakeoverCallContext.__dataclass_fields__
+    assert "name" not in TakeoverCallContext.__dataclass_fields__
