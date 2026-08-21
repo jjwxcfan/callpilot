@@ -426,8 +426,10 @@ def test_inbound_opening_is_one_line_with_identity_and_two_questions():
     text = opening_instructions("inbound", "李明", "数字分身", DEFAULT_OUTBOUND_TASK)
     assert "一句话说完" in text and "不要寒暄" in text
     assert "李明的数字分身" in text          # 报身份
-    assert "不方便接" in text
     assert "哪位" in text and "什么事" in text  # 问谁 + 问事
+    # 机主 2026-08-21 真机反馈：开场白不要交代机主接不了——一上来就说，
+    # 像在替他挡电话；四个要素也会把两个问句挤掉（实测真机就丢了问句）。
+    assert "不方便接" not in text
     # 反义防护：上面全是子串匹配，加一句「不要说…」就能整体绕过（独立评审
     # 用变异实验证明过）。要素前不得出现否定词。
     for element in ("李明的数字分身", "哪位", "什么事"):
@@ -447,8 +449,8 @@ def test_inbound_opening_is_one_line_in_english_too():
     )
     assert "one sentence only" in text and "no small talk" in text
     assert "李明's 数字分身" in text
-    assert "can't take the call" in text
     assert "who is calling" in text and "what they need" in text
+    assert "can't take the call" not in text  # 与中文侧同步
 
 
 def test_inbound_opening_states_an_explicit_length_cap():
@@ -466,8 +468,8 @@ def test_inbound_opening_states_an_explicit_length_cap():
     en = opening_instructions(
         "inbound", "李明", "数字分身", DEFAULT_OUTBOUND_TASK, lang="en"
     )
-    assert "别超过 30 字" in zh
-    assert "no more than 25 words" in en
+    assert "别超过 25 字" in zh
+    assert "no more than 20 words" in en
     # 「一句话说完」是上限的另一半：多句会把时长翻倍
     assert "一句话说完" in zh and "one sentence only" in en
 
@@ -502,7 +504,7 @@ def test_inbound_identity_moves_into_the_rules():
     assert "数字分身" in text
     # WIL-144 起身份在开场白里说，规则侧改为「已经说过、不再重复」；
     # 主动表明这一点由开场白测试锚定，两者合起来仍覆盖 WIL-91 的补偿机制。
-    assert "开场白里已经" in text and "已说明你是李明的数字分身" in text
+    assert "开场白里已经说明你是李明的数字分身" in text
     assert "后续轮次绝不再重复问候或自我介绍" in text
     # 开场白可能因断线（say 失败只记警告）或 barge-in 打断而没说出口——
     # 那时若照「已经说过」办，对方可能整通都以为在跟机主本人讲话，

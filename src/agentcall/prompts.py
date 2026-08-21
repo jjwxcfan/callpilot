@@ -396,8 +396,8 @@ def _build_zh(
         # 描述行为，不给它可照抄的词。
         # WIL-144：身份已并入开场白，这里从「找时机说一次」改为「已经说过、
         # 不再说」——否则模型会在第二轮把自我介绍重讲一遍（真机复现过）。
-        f"1. 不要冒充{owner}本人。开场白里已经问候过、也已说明你是{owner}的"
-        f"{persona}且{owner}现在不方便接——这些对方都已经知道了，"
+        f"1. 不要冒充{owner}本人。开场白里已经说明你是{owner}的{persona}——"
+        f"这一点对方已经知道了，"
         "**后续轮次绝不再重复问候或自我介绍**，重复只会浪费对方时间、"
         "把真正的回答埋在套话后面。"
         # 断线或被打断时开场白可能根本没说出口/只说了半句（say 失败只记警告、"
@@ -501,9 +501,12 @@ def _opening_zh(direction: str, owner: str, persona: str, task: str) -> str:
     # 原文，模型会把它当可复用话术，通话中途再问候一次）。绝不冒充本人不变。
     return (
         f"请直接用中文说一句简短自然的来电接听开场白，一句话说完、"
-        f"**别超过 30 字**、不要寒暄、不要解释："
-        f"先问候，说明你是{owner}的{persona}、{owner}现在不方便接，"
-        f"再问对方是哪位、找{owner}什么事。"
+        f"**别超过 25 字**、不要寒暄、不要解释："
+        f"先说你是{owner}的{persona}，再问对方是哪位、找{owner}什么事。"
+        # 刻意不在开场白里说「{owner}现在不方便接」（机主 2026-08-21 真机
+        # 反馈）：一上来就交代机主不在，像在替他挡电话；而且四个要素塞进
+        # 一句话会把后面两个问题挤掉（真机实测开场白只剩问候+身份+不方便
+        # 接，两个问句丢了）。机主接不接得了，等真要转告或转接时再说自然。
     )
 
 
@@ -697,8 +700,7 @@ def _build_en(
         # 否则模型会把它当成可复用话术，中途再问候一次。
         # 与中文侧同步（WIL-144）：身份已在开场白说过，这里改为不再重复。
         f"1. Never impersonate {owner} in person. The opening line already "
-        f"greeted them and already said you are {owner}'s {persona} and that "
-        f"{owner} can't take the call right now — they know this, so **never "
+        f"said you are {owner}'s {persona} — they know this, so **never "
         "greet or introduce yourself again in later turns**; repeating it "
         "wastes the caller's time and buries your actual answer. "
         # 与中文侧同步：开场白可能因断线或被打断而没说出口，留补说通道。
@@ -738,8 +740,8 @@ def _opening_en(direction: str, owner: str, persona: str, task: str) -> str:
     # 只描述要素不给逐字文案，避免模型把开场原文当可复用话术中途复读。
     return (
         "Say one short, natural line in English to answer this incoming call, "
-        "one sentence only, **no more than 25 words**, no small talk, no "
-        f"explanation: greet them, say you are {owner}'s {persona} and {owner} "
-        "can't take the call right now, then ask who is calling and what they "
-        f"need {owner} for."
+        "one sentence only, **no more than 20 words**, no small talk, no "
+        f"explanation: say you are {owner}'s {persona}, then ask who is "
+        f"calling and what they need {owner} for."
+        # 与中文侧同步：不在开场白里说机主接不了（见中文分支注释）。
     )

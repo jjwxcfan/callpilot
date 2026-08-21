@@ -408,6 +408,12 @@ class CloudEdgeClient:
                 send, request_id, _TAKEOVER_CONTEXT_RESOURCE, "INTERNAL_ERROR"
             )
             return
+        # 只记「收到请求 / 命中与否」，不记任何字段内容（PII 边界）。
+        # 真机联调时这条是定位断点的关键：设备说没显示上下文，先看这里有没有
+        # 请求到达——没有就是 iOS→Worker 段，有而 hit=False 就是 Edge 侧快照
+        # 没建起来（2026-08-21 首次联调正是靠「一条请求都没有」定位到手机装的
+        # 是旧 build）。
+        logger.info("接管上下文被请求: hit=%s", context is not None)
         send(
             _compact_json(
                 {
