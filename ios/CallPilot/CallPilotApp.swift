@@ -2,16 +2,19 @@ import SwiftUI
 
 @main
 struct CallPilotApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
     var body: some Scene {
         WindowGroup {
-            RootView()
+            RootView(model: appDelegate.model)
         }
     }
 }
 
 /// 根展示层:未配对时显示配对页;配对后保持主 Tab 壳常驻,通话与来电作为顶层覆盖。
+/// model 由 AppDelegate 持有(后台冷启动不连接场景,状态中枢不能依赖视图层存在)。
 struct RootView: View {
-    @StateObject private var model = AppModel()
+    @ObservedObject var model: AppModel
 
     var body: some View {
         let presentation = RootPresentation.resolve(

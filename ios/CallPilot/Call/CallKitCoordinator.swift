@@ -2,6 +2,7 @@
 @preconcurrency import CallKit
 import Foundation
 import LiveKit
+import os
 @preconcurrency import PushKit
 
 @MainActor
@@ -22,12 +23,15 @@ final class CallKitCoordinator: NSObject {
 
     private let provider: CXProvider
     private let controller: CXCallController
+    // 签名 profile 判定一次、整个生命周期不变——token 归属环境不随运行时状态漂移。
+    private let apnsEnvironment: ApnsEnvironment
     private var pushRegistry: PKPushRegistry?
     private var calls = CallKitCallRegistry()
     private var pendingAnswers: [UUID: CXAnswerCallAction] = [:]
     private var expirationTasks: [UUID: Task<Void, Never>] = [:]
 
-    override init() {
+    init(apnsEnvironment: ApnsEnvironment = ApnsEnvironmentDetector.detect()) {
+        self.apnsEnvironment = apnsEnvironment
         let configuration = CXProviderConfiguration()
         configuration.supportsVideo = false
         configuration.maximumCallGroups = 1
@@ -210,11 +214,7 @@ extension CallKitCoordinator: PKPushRegistryDelegate {
         let token = pushCredentials.token.map { String(format: "%02x", $0) }.joined()
         Task { @MainActor [weak self] in
             guard let self else { return }
-            #if DEBUG
-            let environment = ApnsEnvironment.sandbox
-            #else
-            let environment = ApnsEnvironment.production
-            #endif
+            let environment = self.apnsEnvironment
             self.currentToken = (token, environment)
             self.delegate?.callKitDidUpdateToken(token, environment: environment)
         }
@@ -337,9 +337,28 @@ private final class PushCompletion: @unchecked Sendable {
 }
 
 enum CallKitAudioSessionBridge {
+    private static let log = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "CallPilot",
+        category: "callkit-audio"
+    )
+
     static func prepareForIncoming() {
+        // LiveKit 官方 CallKit 示例的实测结论(swift-example-collection/callkit):
+        // 会话类别必须在 VoIP push 回调窗口内就设为 playAndRecord,否则麦克风引擎
+        // 无法初始化——等 didActivate 再设已太晚。缺这一步的真机表现(2026-08-20
+        // 锁屏接听实测):入房成功但采集全静音(peak=0)、下行无声。
+        do {
+            try AVAudioSession.sharedInstance()
+                .setCategory(.playAndRecord, mode: .voiceChat, options: [.mixWithOthers])
+        } catch {
+            Self.log.error("prepareForIncoming setCategory failed: \(error.localizedDescription, privacy: .public)")
+        }
         AudioManager.shared.audioSession.isAutomaticConfigurationEnabled = false
-        try? AudioManager.shared.setEngineAvailability(.none)
+        do {
+            try AudioManager.shared.setEngineAvailability(.none)
+        } catch {
+            Self.log.error("prepareForIncoming setEngineAvailability failed: \(error.localizedDescription, privacy: .public)")
+        }
     }
 
     static func didActivate(_ session: AVAudioSession) {
@@ -347,16 +366,26 @@ enum CallKitAudioSessionBridge {
             try session.setCategory(.playAndRecord, mode: .voiceChat, options: [.mixWithOthers])
             try AudioManager.shared.setEngineAvailability(.default)
         } catch {
+            // 静默吞掉等于双向无声还查不到:失败必须可见。
+            Self.log.error("didActivate audio bring-up failed: \(error.localizedDescription, privacy: .public)")
             try? AudioManager.shared.setEngineAvailability(.none)
         }
     }
 
     static func didDeactivate() {
-        try? AudioManager.shared.setEngineAvailability(.none)
+        do {
+            try AudioManager.shared.setEngineAvailability(.none)
+        } catch {
+            Self.log.error("didDeactivate setEngineAvailability failed: \(error.localizedDescription, privacy: .public)")
+        }
     }
 
     static func prepareForStandaloneCall() {
         AudioManager.shared.audioSession.isAutomaticConfigurationEnabled = true
-        try? AudioManager.shared.setEngineAvailability(.default)
+        do {
+            try AudioManager.shared.setEngineAvailability(.default)
+        } catch {
+            Self.log.error("prepareForStandaloneCall setEngineAvailability failed: \(error.localizedDescription, privacy: .public)")
+        }
     }
 }

@@ -160,6 +160,13 @@
 "settings.connection.edge" = "Computer";
 "settings.connection.sim" = "SIM / Modem";
 "settings.connection.refresh" = "Refresh Status";
+"settings.connection.push" = "Call Push";
+"settings.push.unavailable" = "Not Registered";
+"settings.push.registering" = "Registering…";
+"settings.push.registered" = "Registered";
+"settings.push.failed" = "Failed (%@)";
+"settings.push.error.disabled" = "Server Push Disabled";
+"settings.push.error.network" = "Network Error";
 "settings.status.checking" = "Checking";
 "settings.status.unavailable" = "Unavailable";
 "settings.status.online" = "Online";
