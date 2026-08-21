@@ -673,3 +673,40 @@ def test_outbound_voice_menu_role_discipline_present():
     en = build_instructions("outbound", "Alex", "AI assistant", "check plan", "en")
     assert "the roles are flipped" in en
     assert "say only what it can understand" in en
+
+
+def test_verbatim_instruction_wraps_line_without_altering_it():
+    """编排层固定话术必须逐字播报（WIL-143）。
+
+    真机 2026-08-20：对方只说了半句「Hey, this is...」，AI 在澄清语前自加
+    「Oh, I love an idea. Tell me all about it.」——凭空脑补对方有个 idea。
+    根因是 say() 在 OpenAI 链路是 response.create + instructions，模型把
+    「说这句」当写作提纲。包装后原文必须原样出现，且带明确的禁止加戏约束。
+    """
+    from agentcall.prompts import verbatim_instruction
+
+    line = "谢谢您的来电，目前不需要这项服务。再见。"
+    zh = verbatim_instruction(line)
+    assert line in zh                       # 原文一字不改地带进去
+    assert "逐字" in zh and "不要增删" in zh
+    assert "不要接对方刚才的话" in zh        # 正是真机那句加戏的形态
+    assert "不要换成你自己的说法" in zh
+
+    en_line = "Thanks for calling — this service isn't needed right now."
+    en = verbatim_instruction(en_line, "en")
+    assert en_line in en
+    assert "word for word" in en
+    assert "no reaction to what the caller just said" in en
+    assert "no rephrasing" in en
+
+
+def test_verbatim_instruction_is_per_response_not_session_prompt():
+    """与 WIL-99 不冲突的边界：可照抄的原文只出现在本轮指令里，
+    绝不能进会话系统提示词（否则模型会把它当可复用话术中途复读）。"""
+    from agentcall.prompts import build_instructions, verbatim_instruction
+
+    line = "谢谢您的来电，目前不需要这项服务。再见。"
+    system = build_instructions("inbound", "李明", "数字分身", "")
+    assert line not in system
+    assert "逐字说出下面这句话" not in system
+    assert line in verbatim_instruction(line)

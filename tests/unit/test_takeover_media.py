@@ -153,7 +153,11 @@ def test_takeover_hold_is_one_deterministic_line_before_agent_gate(monkeypatch) 
 
     asyncio.run(session._speak_takeover_hold_if_needed(agent, bridge, 7))
 
-    assert agent.said == ["正在为您转接本人，请稍等，不要挂断。"]
+    # 固定话术包成逐字播报指令后下发（WIL-143：不包的话模型会即兴演绎），
+    # 所以断言的是「指令里含且仅含这一句原文 + 逐字约束」。
+    assert len(agent.said) == 1
+    assert "正在为您转接本人，请稍等，不要挂断。" in agent.said[0]
+    assert "逐字说出下面这句话" in agent.said[0]
     assert bridge.downlink
     assert session._agent_effect_allowed(7) is False
 

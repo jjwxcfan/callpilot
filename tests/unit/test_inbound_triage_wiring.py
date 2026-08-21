@@ -235,3 +235,55 @@ def test_clarify_skipped_when_agent_already_responding() -> None:
     )
     asyncio.run(session._consume_triage_results(agent, bridge, 4))
     assert len(agent.said) == 1 and "具体事情找本人" in agent.said[0]
+
+
+def test_fixed_lines_are_sent_as_verbatim_instructions(monkeypatch) -> None:
+    """三处编排话术（澄清/拒绝/转接垫话）都必须走逐字播报（WIL-143）。
+
+    真机 2026-08-20 那句「Oh, I love an idea. Tell me all about it.」就是
+    澄清语没包逐字约束、被模型即兴演绎出来的。
+    """
+    service = _service()
+    session = service.session
+    agent = FakeAgent()
+    bridge = FakeAudioBridge()
+
+    # 澄清语：caller 说完还没人回应 → 播澄清语
+    session._last_transcript_role = "user"
+    session._triage_results.put_nowait(
+        _verdict(action="clarify", turn_id=1, confidence=0.5, category="unknown")
+    )
+    asyncio.run(session._consume_triage_results(agent, bridge, 4))
+    assert "逐字说出下面这句话" in agent.said[-1]
+    assert "具体事情找本人" in agent.said[-1]
+
+    # 拒绝语：两轮同类别 reject 后播固定拒绝语
+    for turn_id in (2, 3):
+        session._last_transcript_role = "user"
+        session._triage_results.put_nowait(
+            _verdict(
+                action="reject", turn_id=turn_id, confidence=0.9, category="marketing"
+            )
+        )
+        asyncio.run(session._consume_triage_results(agent, bridge, 4))
+    assert "逐字说出下面这句话" in agent.said[-1]
+    assert "目前不需要这项服务" in agent.said[-1]
+
+
+def test_clarify_line_does_not_block_main_loop_on_provider_roundtrip() -> None:
+    """澄清语后面没有关闸门的动作，不该为它多阻塞一次模型往返（wait=False）；
+    垫话/拒绝语则相反——说完就收闸，必须等投递完成。"""
+    service = _service()
+    session = service.session
+    agent = FakeAgent()
+    bridge = FakeAudioBridge()
+
+    session._last_transcript_role = "user"
+    session._triage_results.put_nowait(
+        _verdict(action="clarify", turn_id=1, confidence=0.5, category="unknown")
+    )
+    asyncio.run(session._consume_triage_results(agent, bridge, 4))
+
+    # FakeAgent 只在 say_and_wait 路径记 waited_say
+    assert agent.waited_say == []
+    assert agent.said and "具体事情找本人" in agent.said[-1]
