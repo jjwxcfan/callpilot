@@ -171,6 +171,33 @@ final class HostedCloudClient: MessageContentClient, CallRecordContentClient {
         }
     }
 
+    /// 取来电者上下文(WIL-137)。返回 nil = 对端还什么都没说,不是错误。
+    /// 服务端形状恒为 `{"context": <对象|null>}`——一条解析路径。
+    func takeoverContext(offerId: String) async throws -> TakeoverContext? {
+        guard offerId.wholeMatch(of: Self.offerIdRE) != nil else {
+            throw HostedCloudError(statusCode: 0, code: "BAD_OFFER_ID", message: "offer id 格式不合法")
+        }
+        let (payload, _) = try await request("GET", "v1/inbound-offers/\(offerId)/context")
+        guard let object = payload["context"] as? [String: Any] else { return nil }
+        guard let updatedAt = Self.jsonInt64(object["updatedAtUnixMs"]) else { return nil }
+        let context = TakeoverContext(
+            peerNumber: Self.contextText(object["peerNumber"], limit: 32),
+            claimedName: Self.contextText(object["claimedName"], limit: 60),
+            purpose: Self.contextText(object["purpose"], limit: 120),
+            updatedAtUnixMs: updatedAt
+        )
+        return context.isEmpty ? nil : context
+    }
+
+    /// 上下文字段一律按可空处理:非字符串、空串、超长都当作「没说」而不是抛错——
+    /// 一个畸形字段不该让整通来电的接听流程失败。上限与服务端一致,双侧都截。
+    private static func contextText(_ value: Any?, limit: Int) -> String? {
+        guard let text = value as? String else { return nil }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= limit else { return nil }
+        return trimmed
+    }
+
     /// claim 一个 offer,成功即拿到入房凭证(first-claim-wins,输家 409)。
     func claimInboundOffer(offerId: String) async throws -> HostedCallSession {
         guard offerId.wholeMatch(of: Self.offerIdRE) != nil else {

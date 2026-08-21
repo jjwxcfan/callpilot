@@ -40,6 +40,7 @@
 "incoming.description" = "AI is handling an incoming call that needs your attention. Answer to continue the call on this iPhone.";
 "incoming.decline" = "Decline";
 "incoming.answer" = "Answer";
+"incoming.context.unverified" = "Caller-provided details, not verified";
 "incoming.decline_footer" = "If you decline, AI will continue handling the call.";
 
 "call.remote_sim_notice" = "Calling through your remote SIM";
@@ -201,3 +202,4 @@
 "settings.unpair.confirm_title" = "Unpair from the Computer?";
 "settings.unpair.confirm_message" = "This clears local content. You’ll need a new pairing code to use the remote line again.";
 "callkit.incoming.name" = "AI Call Takeover";
+"callkit.incoming.claimed_name" = "Claims to be %@";

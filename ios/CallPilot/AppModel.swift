@@ -9,7 +9,19 @@ import os
 final class AppModel: ObservableObject {
     @Published var pairing: StoredPairing?
     @Published var callState: CallState = .idle
-    @Published var incomingOffer: InboundOffer?
+    /// 换来电即换上下文——统一在 didSet 里挂钩,而不是在八处赋值点各写一遍:
+    /// 漏掉任何一处的表现是「新来电显示上一通的来电者」,静默且极难察觉。
+    @Published var incomingOffer: InboundOffer? {
+        didSet {
+            guard oldValue?.offerId != incomingOffer?.offerId else { return }
+            incomingContext = nil
+            if let offer = incomingOffer {
+                Task { _ = await callKitFetchContext(for: offer) }
+            }
+        }
+    }
+    /// 当前来电的对端上下文(WIL-137)。nil = 对端还没自报,卡片退回通用文案。
+    @Published private(set) var incomingContext: TakeoverContext?
     @Published var lineStatusLabel = L10n.text("line.status.checking")
     @Published var pairingError: String?
     @Published var lineReady = false
@@ -30,6 +42,7 @@ final class AppModel: ObservableObject {
     private let callHistoryStore = FileCallHistoryCacheStore()
     private var deviceStatusMachine = DeviceStatusStateMachine()
     private var voipTokenMachine = VoipTokenRegistrationMachine()
+    private var contextFetches: [String: Task<TakeoverContext?, Never>] = [:]
     private let callKit: CallKitCoordinator
     // 只记错误码,绝不记 token 值。
     private static let voipLog = Logger(
@@ -400,6 +413,24 @@ extension AppModel: CallKitCoordinatorDelegate {
         guard callKitCanAcceptIncomingCall,
               !dismissedOffers.contains(offer.offerId) else { return }
         incomingOffer = offer
+    }
+
+    func callKitFetchContext(for offer: InboundOffer) async -> TakeoverContext? {
+        // 推送路径(CallKit 要更新锁屏)与前台路径(卡片要展示)会同时问同一个
+        // offer:共用在途请求,别在来电的关键路径上打两次网络。
+        if let inFlight = contextFetches[offer.offerId] { return await inFlight.value }
+        guard let client else { return nil }
+        let task = Task { () -> TakeoverContext? in
+            // 取不到就当作「对端没自报」:上下文是接听决策的加分项、不是接听的前提,
+            // 任何失败都不该挡住这通电话。
+            try? await client.takeoverContext(offerId: offer.offerId)
+        }
+        contextFetches[offer.offerId] = task
+        let context = await task.value
+        contextFetches.removeValue(forKey: offer.offerId)
+        // 只认当前这通来电的上下文,慢响应不许覆盖已经换了的来电。
+        if incomingOffer?.offerId == offer.offerId { incomingContext = context }
+        return context
     }
 
     func callKitDidRequestAnswer(_ offer: InboundOffer) {

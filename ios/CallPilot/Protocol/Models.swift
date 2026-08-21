@@ -41,6 +41,21 @@ struct InboundOffer: Equatable {
     }
 }
 
+/// WIL-137 来电者上下文:谁在打、自称是谁、什么事。
+/// 每一项都可能缺失——来电者什么都没说是常态,UI 有就显示、没有就退回通用文案。
+/// `claimedName` 是对端**自称**、从未核实:字段名保留这个语义,展示时必须标注,
+/// 把它呈现成已核实身份会把诈骗来电洗成可信来电。
+/// 不经 APNs(ADR-003/005),claim 前经瞬时 relay 按需取,云端不留存。
+struct TakeoverContext: Equatable {
+    let peerNumber: String?
+    let claimedName: String?
+    let purpose: String?
+    let updatedAtUnixMs: Int64
+
+    /// 一条可用信息都没有的上下文与「没有上下文」等价,UI 不必分别处理。
+    var isEmpty: Bool { peerNumber == nil && claimedName == nil && purpose == nil }
+}
+
 enum ApnsEnvironment: String, Equatable {
     case sandbox
     case production

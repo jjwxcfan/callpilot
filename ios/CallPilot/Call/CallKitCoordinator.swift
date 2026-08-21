@@ -11,6 +11,8 @@ protocol CallKitCoordinatorDelegate: AnyObject {
     func callKitDidUpdateToken(_ token: String, environment: ApnsEnvironment)
     func callKitDidInvalidateToken()
     func callKitDidReceiveOffer(_ offer: InboundOffer)
+    /// 取来电者上下文(WIL-137)。返回 nil = 对端还没自报或取不到,一律按「没有」处理。
+    func callKitFetchContext(for offer: InboundOffer) async -> TakeoverContext?
     func callKitDidRequestAnswer(_ offer: InboundOffer)
     func callKitDidRequestDecline(_ offer: InboundOffer)
     func callKitDidRequestHangup()
@@ -29,6 +31,7 @@ final class CallKitCoordinator: NSObject {
     private var calls = CallKitCallRegistry()
     private var pendingAnswers: [UUID: CXAnswerCallAction] = [:]
     private var expirationTasks: [UUID: Task<Void, Never>] = [:]
+    private var contextTasks: [UUID: Task<Void, Never>] = [:]
 
     init(apnsEnvironment: ApnsEnvironment = ApnsEnvironmentDetector.detect()) {
         self.apnsEnvironment = apnsEnvironment
@@ -107,6 +110,7 @@ final class CallKitCoordinator: NSObject {
         )
         for callUUID in stale {
             expirationTasks.removeValue(forKey: callUUID)?.cancel()
+            contextTasks.removeValue(forKey: callUUID)?.cancel()
             provider.reportCall(with: callUUID, endedAt: Date(), reason: .unanswered)
         }
         if !stale.isEmpty { CallKitAudioSessionBridge.prepareForStandaloneCall() }
@@ -142,12 +146,34 @@ final class CallKitCoordinator: NSObject {
                     )
                     self.delegate?.callKitDidReceiveOffer(offer)
                     self.scheduleExpiration(payload)
+                    self.refreshCallerDisplay(for: offer)
                 } else {
                     _ = self.calls.remove(callUUID: payload.callUUID)
                     if preparedAudio { CallKitAudioSessionBridge.prepareForStandaloneCall() }
                 }
                 completion.call()
             }
+        }
+    }
+
+    /// 上报 CallKit 之后再取上下文,并用 reportCall(with:updated:) 补上来电者名字。
+    /// 顺序是硬要求:身份不经 APNs(ADR-005),只能在上报后经 App 自己的 TLS 会话取,
+    /// 因此锁屏先显示通用文案、约一秒后替换成自称姓名/号码。绝不能为了等它而拖慢
+    /// 上报——push 回调必须同步返回,否则 iOS 判为未处理并终止进程。
+    private func refreshCallerDisplay(for offer: InboundOffer) {
+        guard let callUUID = offer.callUUID else { return }
+        contextTasks[callUUID]?.cancel()
+        contextTasks[callUUID] = Task { @MainActor [weak self] in
+            guard let context = await self?.delegate?.callKitFetchContext(for: offer),
+                  let self else { return }
+            self.contextTasks.removeValue(forKey: callUUID)
+            // 通话可能已被接听、拒绝或过期:只在仍响铃时改显示,避免给已结束的
+            // 通话推更新(CallKit 会忽略,但也没有意义)。
+            guard self.calls.phase(callUUID: callUUID) == .ringing,
+                  let callerName = TakeoverContextDisplay.callerName(context) else { return }
+            let update = CXCallUpdate()
+            update.localizedCallerName = callerName
+            self.provider.reportCall(with: callUUID, updated: update)
         }
     }
 
@@ -173,6 +199,7 @@ final class CallKitCoordinator: NSObject {
         let phase = calls.phase(callUUID: callUUID)
         guard let payload = calls.remove(callUUID: callUUID) else { return }
         expirationTasks.removeValue(forKey: callUUID)?.cancel()
+        contextTasks.removeValue(forKey: callUUID)?.cancel()
         pendingAnswers.removeValue(forKey: callUUID)?.fail()
         provider.reportCall(with: callUUID, endedAt: Date(), reason: reason)
         if phase == .ringing {
@@ -265,6 +292,8 @@ extension CallKitCoordinator: CXProviderDelegate {
             self.pendingAnswers.removeAll()
             self.expirationTasks.values.forEach { $0.cancel() }
             self.expirationTasks.removeAll()
+            self.contextTasks.values.forEach { $0.cancel() }
+            self.contextTasks.removeAll()
             _ = self.calls.removeAll()
             CallKitAudioSessionBridge.prepareForStandaloneCall()
             self.delegate?.callKitDidRequestHangup()
@@ -279,6 +308,7 @@ extension CallKitCoordinator: CXProviderDelegate {
                 return
             }
             self.expirationTasks.removeValue(forKey: action.callUUID)?.cancel()
+            self.contextTasks.removeValue(forKey: action.callUUID)?.cancel()
             self.pendingAnswers[action.callUUID] = action
             self.delegate?.callKitDidRequestAnswer(InboundOffer(
                 offerId: payload.offerId,
@@ -300,6 +330,7 @@ extension CallKitCoordinator: CXProviderDelegate {
                 return
             }
             self.expirationTasks.removeValue(forKey: action.callUUID)?.cancel()
+            self.contextTasks.removeValue(forKey: action.callUUID)?.cancel()
             self.pendingAnswers.removeValue(forKey: action.callUUID)?.fail()
             if phase == .active || phase == .answering {
                 self.delegate?.callKitDidRequestHangup()
