@@ -129,9 +129,9 @@ def test_tool_request_is_opaque_bounded_and_double_gated(monkeypatch) -> None:
     # 改为带数字边界的完整手机号模式:任何独立 11 位号都不得进 repr。
     assert re.search(r"(?<!\d)1[3-9]\d{9}(?!\d)", serialized) is None
     assert "快递" not in serialized
-    # 这里没有来电号码（未设 current_caller），故 context 为空；号码只在
-    # 已知时经 context 随 offer 走数据通道，见
-    # test_offer_carries_caller_number_as_context。机主偏好则永远不出会话。
+    # 这里没有来电号码（未设 current_caller），故上下文为空。号码在已知时
+    # 也只留在 Edge、由设备按需拉取（ADR-003：不上 Cloud），见
+    # test_takeover_context_snapshot_carries_caller_number；机主偏好永不出会话。
     assert service.session.takeover_state is TakeoverState.TAKEOVER_PREPARING
 
     repeated = registry.dispatch("request_owner_takeover", {})
@@ -316,8 +316,13 @@ def test_context_summary_backfills_name_and_purpose(monkeypatch) -> None:
 
 
 def test_context_summary_never_leaks_across_calls(monkeypatch) -> None:
-    """摘要在飞时换了一通电话：迟到的结果必须丢弃，绝不能覆盖到新通话上
-    （上一通的 PII 串进这一通是隐私事故）。"""
+    """摘要在飞时换了一通电话：迟到的结果必须丢弃，绝不能覆盖到**新通话**上
+    （上一通的来电者姓名串进这一通是隐私事故）。
+
+    断言落在「新 offer 的快照里没有上一通的姓名」——只断言旧 offerId 读不到
+    是不够的：跨通重置本身就会让那个断言成立，与 worker 里的 offer_id 守卫
+    无关（独立评审用变异实验证明过那种写法是永真的）。
+    """
     monkeypatch.setenv("INBOUND_TAKEOVER_ENABLED", "true")
     service = _service()
     _prepare_inbound(service)
@@ -327,7 +332,7 @@ def test_context_summary_never_leaks_across_calls(monkeypatch) -> None:
     released = threading.Event()
 
     def slow_summary(turns, **kwargs):
-        released.wait(2.0)
+        released.wait(3.0)
         return "Kevin", "约周六吃饭"
 
     monkeypatch.setattr(
@@ -338,12 +343,44 @@ def test_context_summary_never_leaks_across_calls(monkeypatch) -> None:
     old_offer = service.next_inbound_takeover_offer()
     assert old_offer is not None
 
-    # 摘要还没回来，新一通电话开始（快照按通重置）
+    # 上一通的摘要还堵在模型调用里，新一通电话已经开始并自己发了 offer
     session._initialize_takeover_context("inbound")
-    released.set()
-    time.sleep(0.3)
+    session.current_caller = "+16505550777"
+    session._live_transcripts = []
+    new_registry = session._build_tools("inbound")
+    assert new_registry.dispatch("request_owner_takeover", {})["success"] is True
+    new_offer = service.next_inbound_takeover_offer()
+    assert new_offer is not None and new_offer.offer_id != old_offer.offer_id
+
+    released.set()  # 上一通的摘要现在返回
+    time.sleep(0.4)
 
     assert service.takeover_context_snapshot(old_offer.offer_id) is None
+    fresh = service.takeover_context_snapshot(new_offer.offer_id)
+    assert fresh is not None
+    assert fresh["peerNumber"] == "+16505550777"
+    assert fresh["claimedName"] is None, "上一通的姓名不得串进新通话"
+    assert fresh["purpose"] is None
+
+
+def test_context_is_unreadable_after_call_ends(monkeypatch) -> None:
+    """通话结束即作废：offer 已 revoke，持有旧 offerId 的设备不该还能读到
+    号码与来意（此前只在下一通开始时才清，中间可能隔几小时）。"""
+    monkeypatch.setenv("INBOUND_TAKEOVER_ENABLED", "true")
+    service = _service()
+    _prepare_inbound(service)
+    session = service.session
+    session.current_caller = "+15105550123"
+    registry = session._build_tools("inbound")
+
+    assert registry.dispatch("request_owner_takeover", {})["success"] is True
+    offer = service.next_inbound_takeover_offer()
+    assert offer is not None
+    assert service.takeover_context_snapshot(offer.offer_id) is not None
+
+    session._end_takeover_context("CALL_ENDED")
+
+    assert service.takeover_context_snapshot(offer.offer_id) is None
 
 
 def test_context_summary_silent_when_model_finds_nothing(monkeypatch) -> None:

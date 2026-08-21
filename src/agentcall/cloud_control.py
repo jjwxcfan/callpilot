@@ -657,6 +657,7 @@ def _validate_data_request(value: dict[str, Any]) -> dict[str, Any]:
         "call_records.list",
         "call_records.get",
         "call_timeline.list",
+        _TAKEOVER_CONTEXT_RESOURCE,
     }:
         raise ValueError("invalid command")
     issued_at = value.get("issuedAtUnixMs")
@@ -675,7 +676,10 @@ def _validate_data_request(value: dict[str, Any]) -> dict[str, Any]:
     params = value.get("params")
     if not isinstance(params, dict):
         raise ValueError("invalid command")
-    if resource in {"messages.list", "call_records.list"}:
+    if resource == _TAKEOVER_CONTEXT_RESOURCE:
+        if set(params) != {"offerId"} or not _valid_id(params.get("offerId"), "offer"):
+            raise ValueError("invalid command")
+    elif resource in {"messages.list", "call_records.list"}:
         if set(params) != {"limit", "cursor"}:
             raise ValueError("invalid command")
         _validate_data_list_params(params)

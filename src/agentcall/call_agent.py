@@ -505,7 +505,8 @@ class CallSession:
         self._initialize_triage_context(direction, record)
         transcripts: list[tuple[str, str]] = []
         # 接管上下文摘要（WIL-137）在工具线程里跑，需要读本通转写；只读引用，
-        # 不改内容。会话结束时置空，避免跨通读到上一通的对话。
+        # 不改内容。每通在此重新赋值即隔离上一通；摘要发起时会同步拷贝一份
+        # 快照（见 _start_takeover_context_summary），worker 不持有本引用。
         self._live_transcripts = transcripts
 
         def mark(event_type: str, **fields) -> float:
@@ -3272,6 +3273,9 @@ class CallSession:
             except Full:
                 coordinator.rollback_precommit("offer_queue_full")
                 self._takeover_request = None
+                # offer 从未投递出去，对应的上下文也不该留着可读。
+                self._takeover_context = None
+                self._takeover_context_offer_id = None
                 return {
                     "success": False,
                     "code": "TAKEOVER_QUEUE_FULL",
@@ -3471,6 +3475,11 @@ class CallSession:
 
     def _end_takeover_context(self, reason: str) -> None:
         with self._takeover_lock:
+            # 通话结束即刻作废展示上下文——offer 已 revoke，持有旧 offerId 的
+            # 设备不该还能读到号码与来意；只靠下一通开始时重置，会让这段
+            # 数据一直可读到下通来电（可能几小时后）。清理在早退之前。
+            self._takeover_context = None
+            self._takeover_context_offer_id = None
             coordinator = self._takeover_coordinator
             request = self._takeover_request
             if coordinator is None:
