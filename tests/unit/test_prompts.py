@@ -587,6 +587,36 @@ def test_agent_language_reads_config(monkeypatch):
     assert prompts.agent_language() == "zh"
 
 
+def test_agent_language_defaults_to_english(monkeypatch):
+    """默认语言 en（WIL-148）：美国部署拨英文 IVR 是主场景，默认 zh 曾致
+    真机 611 全程中文、IVR ASR 听不懂。"""
+    from agentcall import prompts
+    monkeypatch.delenv("AGENT_LANGUAGE", raising=False)
+    assert prompts.agent_language() == "en"
+
+
+# ---- WIL-148：内心 OS 不进通话 / 按键先听完菜单 ----
+
+def test_prompts_forbid_spoken_inner_monologue():
+    """真机实锤（2026-08-24 611）：AI 把「好的，我先安静地」说进了通话。"""
+    zh = build_instructions("outbound", "李明", "数字分身", "查话费")
+    assert "决定等待或保持安静时直接不出声" in zh
+    en = build_instructions("outbound", "Alex", "assistant", "check balance", "en")
+    assert "simply produce no speech" in en
+
+
+def test_prompts_require_hearing_menu_before_keypress():
+    """真机实锤（2026-08-24 611）：菜单首句「Para español, marca nueve」
+    刚播完 AI 就按了 9，把自己按进西语客服。"""
+    zh = build_instructions("outbound", "李明", "数字分身", "查话费")
+    assert "听完当前这轮菜单再选最切题的项" in zh
+    en = build_instructions("outbound", "Alex", "assistant", "check balance", "en")
+    assert "hear the current round of the menu" in en
+    # 两个方向都要有（来电也可能被转进 IVR）
+    zh_in = build_instructions("inbound", "李明", "数字分身", "")
+    assert "听完当前这轮菜单再选最切题的项" in zh_in
+
+
 # ---- WIL-112：别把要问的事当清单背诵 / 身份只说一次 ----
 
 def test_inbound_prompt_has_no_unfilled_placeholders():

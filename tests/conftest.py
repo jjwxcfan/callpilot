@@ -21,6 +21,10 @@ def _isolate_side_effects(tmp_path, monkeypatch):
     monkeypatch.setenv("CALL_PLAYBOOKS_ENABLED", "false")
     monkeypatch.setenv("SUMMARY_ENABLED", "false")
     monkeypatch.setenv("DASHSCOPE_API_KEY", "test-dashscope-key")
+    # 通话语言钉住 zh：大量既有用例断言中文文案/中文链路行为，测的是「zh 模式
+    # 正确」而非「默认值是什么」。默认值本身（en，WIL-148）由
+    # test_agent_language_defaults_to_english 用 delenv 单独锁定。
+    monkeypatch.setenv("AGENT_LANGUAGE", "zh")
     from agentcall.rate_limit import reset_sms_rate_limit_state
 
     reset_sms_rate_limit_state()

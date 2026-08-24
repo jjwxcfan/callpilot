@@ -312,8 +312,11 @@ CONFIG_SPECS: tuple[ConfigSpec, ...] = (
     # 注：OpenAI 的 cedar/marin 可能不太吃风格指令（社区反馈，非官方结论）。
     ConfigSpec("VOICE_STYLE", "语音风格描述", "str", ""),
     # AI 通话语言：决定 AI 打/接电话说什么语言、通话摘要用什么语言写；
-    # 与前端 UI 语言（localStorage）相互独立。改动需重启会话。
-    ConfigSpec("AGENT_LANGUAGE", "AI 通话语言", "select", "zh",
+    # 与前端 UI 语言（localStorage)相互独立。改动需重启会话。
+    # 默认 en（WIL-148，2026-08-24 机主拍板）：部署在美国、拨英文 IVR 是主场景，
+    # 默认 zh 曾致真机 611 全程中文、IVR ASR 直接听不懂。升级注意：未显式配置
+    # AGENT_LANGUAGE 的存量部署行为会从中文变英文。
+    ConfigSpec("AGENT_LANGUAGE", "AI 通话语言", "select", "en",
                choices=("zh", "en"), requires_restart=True),
     # 默认留空 = 无预设事项（提示词走「无预设」优雅分支，不会硬塞元指令当主题）；
     # 外呼时通常在页面临时填具体主题。

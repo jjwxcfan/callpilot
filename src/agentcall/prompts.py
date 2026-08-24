@@ -48,7 +48,7 @@ def normalize_lang(lang: str | None) -> str:
 
 
 def agent_language() -> str:
-    """AI 通话语言：config ``AGENT_LANGUAGE``，默认 zh。"""
+    """AI 通话语言：config ``AGENT_LANGUAGE``，默认 en（WIL-148）。"""
     return normalize_lang(config.get_str("AGENT_LANGUAGE"))
 
 
@@ -288,6 +288,11 @@ def _build_zh(
         "查询最近收到的短信验证码(query_verification_code)。遇到需要按键的菜单，"
         "必须调用 send_dtmf 工具真正发送按键，不是只在话里说要按哪个键；"
         "调用前后不要口头宣布按键动作，发送后保持沉默，等待下一段菜单。"
+        "按键只为推进任务：听完当前这轮菜单再选最切题的项，与任务无关的"
+        "选项（比如切换菜单语言）不要按，哪怕它是最先播报的。"
+        "通话里只说对对方有意义的话：决定等待或保持安静时直接不出声——"
+        "「我先安静等着」「我接下来打算…」这类自我计划，以及本该事后转告机主的"
+        "说明，都不属于通话发言，绝不说进电话里。"
         "需要时主动调用其他对应工具，操作完成后用一句话口头确认结果。"
     )
 
@@ -563,7 +568,16 @@ def _build_en(
         "When a menu requires a key press, you must call send_dtmf to actually send "
         "the keypress, not merely say that you will press a key; do not announce the "
         "keypress before or after the tool call. After sending it, stay silent and "
-        "wait for the next menu prompt."
+        "wait for the next menu prompt. "
+        "Press keys only to advance your task: hear the current round of the menu "
+        "through, then pick the option that best serves the task; never press an "
+        "option irrelevant to it (such as switching the menu language), even if it "
+        "is announced first. "
+        "On the call, say only what is meaningful to the other party: when you "
+        "decide to wait or stay quiet, simply produce no speech — self-narration "
+        "like \"I'll wait quietly\" or \"next I plan to...\", and remarks meant as "
+        "a report to the owner, are not call speech and must never be spoken into "
+        "the line."
     )
 
     if direction == "outbound":
