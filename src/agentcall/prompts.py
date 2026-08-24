@@ -3,7 +3,7 @@
 从 call_agent.CallSession 拆出（code-review 2026-07 P1 #6）：
 提示词文本改动不再牵动会话线程/循环逻辑。
 
-多语言（2026-07）：AI 通话语言由 config ``AGENT_LANGUAGE`` 决定（zh/en，默认 zh），
+多语言（2026-07）：AI 通话语言由 config ``AGENT_LANGUAGE`` 决定（zh/en，默认 en，WIL-148），
 所有面向对方/开场白/系统提示均按该语言生成，面向国际用户。UI 语言（前端 localStorage）
 与之独立——一个决定 AI 说什么语言，一个决定界面显示什么语言。
 """
