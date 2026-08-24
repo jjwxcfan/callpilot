@@ -181,7 +181,11 @@ def missing_required_info(
 
 
 def missing_info_message(missing: list[dict[str, Any]], lang: str = "zh") -> str:
-    """拨前拦截的错误文案：列出缺失项的 label（purpose）与 key。"""
+    """必备信息缺口的提示文案：列出缺失项的 label（purpose）与 key。
+
+    措辞是提示而非拦截——拨前硬拦截已降级（2026-08-24：情报按号码绑定，
+    硬拦会误伤该热线的一切任务），采集职责在对话式建单。
+    """
     parts = []
     for entry in missing:
         label = _pick_lang(entry.get("label"), lang) or entry["key"]
@@ -189,8 +193,9 @@ def missing_info_message(missing: list[dict[str, Any]], lang: str = "zh") -> str
         parts.append(f"{label}（{purpose}，键 {entry['key']}）" if purpose else f"{label}（键 {entry['key']}）")
     listed = "；".join(parts)
     return (
-        f"该号码需要必备信息才能完成任务：{listed}。"
-        "请在预设任务的核身信息(task_package.verification)中补充后再拨。"
+        f"该号码的 IVR 可能需要必备信息：{listed}。"
+        "如需 AI 通过核身，可在预设任务的核身信息(task_package.verification)"
+        "中补充，或经「聊天建单」对话采集。"
     )
 
 
