@@ -1,0 +1,13 @@
+{
+  "generated_at": "2026-08-24 13:08:10",
+  "devices": [
+    {
+      "name": "Pixel 7",
+      "address": "0C:C4:13:37:1D:6F",
+      "class_of_device": "0x5A420C",
+      "connected": false,
+      "authenticated": true,
+      "remembered": true
+    }
+  ]
+}

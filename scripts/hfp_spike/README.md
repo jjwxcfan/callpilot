@@ -125,6 +125,27 @@ D:/Callpilot/.venv/Scripts/python.exe scripts/hfp_spike/probe_adb.py hangup
 已离线验证：`310410 → ('美国运营商', '611')`、`46000 → ('中国移动', '10086')`、
 未知 PLMN → `('未知', '')` fail-closed。
 
+## 真机实录（2026-08-24，Pixel 7 + Win11 26200 + MediaTek MT79xx 适配器）
+
+0.1 **通过**：`audio_test.json` 上行 peak 26836 / -22.7 dBFS、9.54s 无溢出、
+DTMF 注入无报错。踩出来的坑按顺序：
+
+1. **PortAudio 阻塞 API 在 WDM-KS 上不可用**——HFP 端点只以 WDM-KS 形态出现，
+   必须回调式（已改）。
+2. **端点存在 ≠ 能开流**——KS pin 要 SCO 起来才实例化，没在通话时 `start()` 报
+   `WdmSyncIoctl GLE=0x1`（已改成试开流重试）。
+3. **「连上一下就掉」**两个原因叠加：MediaTek 适配器 USB 省电（设备管理器里
+   取消「允许计算机关闭此设备」）+ 手机对 PC 的空闲链路本来就会被收掉——
+   解法是**通话中再连**：先拨 611，通话中去蓝牙设置点 PC 名，SCO 立即建立
+   并挂住链路。
+4. **音频路由要手动选**：通话界面音频列表里选 PC 名（不是「扬声器」！）；
+   列表里没有 PC = 蓝牙没连上或「通话」开关没开（手机蓝牙设置里该设备的齿轮）。
+5. **配对多台手机时端点会混**（iPhone 抢先匹配），用 `--keyword pixel` 锁定。
+6. **实测协商出 16kHz mSBC** 而非 8kHz CVSD → Phase 1 的 `ModemAudioBridge`
+   要按设备原生采样率开流再重采样到 8k（`MODEM_RATE` 写死 8000 不能直接用）。
+7. Windows 设置里的「移动设备」(Mobile devices/Phone Link) 走 Wi-Fi，与蓝牙
+   HFP 无关，连上它没有任何用。
+
 ## 决策树
 
 - 0.1 ✅ + 0.2 任一 ✅ → **走 Windows**，进 Phase 1
