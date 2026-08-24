@@ -63,6 +63,12 @@ class WinRtPhoneModem:
     """经 WinRT PhoneLine 把蓝牙配对的安卓手机当模组用（duck-type 契约）。"""
 
     POLL_INTERVAL_SECONDS = 0.5
+    # 通话接通后的轮询间隔（对齐 SerialModem CLCC 的 2s 节奏）。真机实测
+    # （2026-08-24，三通 611 对照）：WinRT 轮询会经蓝牙 ACL 链路问手机，
+    # ACL 与 SCO 音频共享 radio——0.5s 高频轮询把上行打出周期性空洞
+    # （中位 32-45ms、间隔约 1s；对照探针裸采集 0 空洞）。响铃/空闲期
+    # 保持 0.5s 保证来电响应，接通后降频让音频独占空口。
+    POLL_INTERVAL_IN_CALL_SECONDS = 2.0
     # 连续轮询失败达到阈值判定连接丢失（对齐 SerialModem 的 CLCC 失联思路）。
     _POLL_FAIL_THRESHOLD = 6
 
@@ -84,6 +90,10 @@ class WinRtPhoneModem:
 
         # 通话状态跟踪：call_id → 最近一次快照的 (status, number)。
         self._tracked: dict[str, tuple[int, str]] = {}
+        # PhoneCallInfo 按 call_id 缓存：号码/方向在通话生命周期内不变，
+        # 每轮重查会产生多余的蓝牙 ACL 往返、抢 SCO 音频时隙（见类注释）。
+        # 空号码不缓存（info 可能晚到，下一轮重试）。
+        self._info_cache: dict[str, str] = {}
         self._had_active_call = False
         self._ring_notified: set[str] = set()
         self._connected_notified: set[str] = set()
@@ -313,7 +323,13 @@ class WinRtPhoneModem:
                     # （对齐 SerialModem「读循环死→看门狗重连」的分工）。
                     self._set_connection(False)
                     return
-            self._poll_stop.wait(self._poll_interval)
+            self._poll_stop.wait(self._current_poll_interval())
+
+    def _current_poll_interval(self) -> float:
+        """接通期降频（ACL 轮询抢 SCO 时隙，见类注释）；其余时段保持灵敏。"""
+        if self.is_call_connected():
+            return self.POLL_INTERVAL_IN_CALL_SECONDS
+        return self._poll_interval
 
     def _snapshot_calls(self) -> dict[str, tuple[int, str, Any]]:
         """当前活跃通话快照：call_id → (status, number, call 对象)。"""
@@ -324,13 +340,21 @@ class WinRtPhoneModem:
         snapshot: dict[str, tuple[int, str, Any]] = {}
         for call in list(result.all_active_phone_calls or []):
             status = int(call.status)
-            number = ""
-            try:
-                info = call.get_phone_call_info()
-                number = str(info.phone_number or "")
-            except Exception:  # noqa: BLE001
-                pass
-            snapshot[str(call.call_id)] = (status, number, call)
+            call_id = str(call.call_id)
+            number = self._info_cache.get(call_id, "")
+            if not number:
+                try:
+                    info = call.get_phone_call_info()
+                    number = str(info.phone_number or "")
+                except Exception:  # noqa: BLE001
+                    pass
+                if number:
+                    self._info_cache[call_id] = number
+            snapshot[call_id] = (status, number, call)
+        # 结束的通话从缓存清掉，防止 call_id 复用时拿到陈旧号码。
+        self._info_cache = {
+            cid: num for cid, num in self._info_cache.items() if cid in snapshot
+        }
         return snapshot
 
     def _poll_once(self) -> None:

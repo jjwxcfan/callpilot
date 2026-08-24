@@ -256,3 +256,52 @@ def test_start_listener_idempotent(modem) -> None:
     assert m._poll_thread is first
     m.stop_listener()
     assert m._poll_thread is None
+
+
+def test_phone_call_info_queried_once_per_call(modem) -> None:
+    """info 按 call_id 缓存：每轮重查会产生蓝牙 ACL 往返、抢 SCO 音频时隙
+    （2026-08-24 真机实测上行周期性空洞的根因之一）。"""
+    m, line = modem
+    call = FakeCall("1", CALL_INCOMING, "+15105550100")
+    info_calls = {"n": 0}
+    original = call.get_phone_call_info
+
+    def counted() -> FakeCallInfo:
+        info_calls["n"] += 1
+        return original()
+
+    call.get_phone_call_info = counted  # type: ignore[method-assign]
+    line.calls = [call]
+    m._poll_once()
+    call.status = CALL_TALKING
+    m._poll_once()
+    m._poll_once()
+    assert info_calls["n"] == 1  # 三轮只查一次
+
+    # 通话结束后缓存清空，call_id 复用不会拿到陈旧号码
+    line.calls = []
+    m._poll_once()
+    assert m._info_cache == {}
+
+
+def test_empty_number_retried_until_available(modem) -> None:
+    m, line = modem
+    call = FakeCall("1", CALL_INCOMING, "")
+    line.calls = [call]
+    m._poll_once()
+    assert m._info_cache == {}  # 空号码不缓存
+    call._number = "+15105550100"
+    call.status = CALL_TALKING
+    m._poll_once()
+    assert m._info_cache == {"1": "+15105550100"}
+
+
+def test_poll_interval_slows_down_while_connected(modem) -> None:
+    m, line = modem
+    assert m._current_poll_interval() == m._poll_interval
+    line.calls = [FakeCall("1", CALL_TALKING, "+1111")]
+    m._poll_once()
+    assert m._current_poll_interval() == m.POLL_INTERVAL_IN_CALL_SECONDS
+    line.calls = []
+    m._poll_once()
+    assert m._current_poll_interval() == m._poll_interval
