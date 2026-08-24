@@ -145,10 +145,20 @@ def _pick(hits: list[dict], kind: str, prefer_api: str) -> dict | None:
     usable = [h for h in hits if h[key] > 0]
     if not usable:
         return None
-    for h in usable:
-        if prefer_api.lower() in h["hostapi"].lower():
-            return h
-    return usable[0]
+    # WDM-KS 垫底：能用（回调式），但限制多；WASAPI/MME 端点若在（通话中可能
+    # 出现）优先。
+    order = ("wasapi", "mme", "directsound", "wdm-ks")
+
+    def rank(h: dict) -> int:
+        api = h["hostapi"].lower()
+        if prefer_api.lower() in api:
+            return -1
+        for i, name in enumerate(order):
+            if name in api:
+                return i
+        return len(order)
+
+    return sorted(usable, key=rank)[0]
 
 
 def _refresh_devices() -> None:
@@ -205,38 +215,6 @@ def cmd_test(args: argparse.Namespace) -> int:
 
     keywords = tuple(k.lower() for k in (args.keyword or DEFAULT_KEYWORDS))
 
-    # 端点只在 SCO 起来（通话接通）时才可开流。轮询等待，让你先开脚本再拨号，
-    # 不用在通话中抢时间敲命令。
-    resolved = _resolve_endpoint(keywords, args.hostapi)
-    if resolved is None and args.wait > 0:
-        print("等待 HFP 端点就绪（最多 {:.0f}s）——现在去手机上拨 611。".format(args.wait))
-        deadline = time.monotonic() + args.wait
-        dots = 0
-        while time.monotonic() < deadline:
-            time.sleep(1.0)
-            _refresh_devices()
-            resolved = _resolve_endpoint(keywords, args.hostapi)
-            if resolved is not None:
-                print("\n端点就绪，开始采集。")
-                break
-            dots += 1
-            print("  ...{}s".format(dots), end="\r", flush=True)
-    if resolved is None:
-        print("\n!! 没找到可开流的 HFP 端点。")
-        print("   - 通话是否真的接通了？端点通常只在 SCO 起来时可用。")
-        print("   - 手机的音频是否路由到了 PC？通话界面里把音频输出选成本机。")
-        print("   - 先跑 `probe_audio.py list` 看设备名，必要时用 --keyword 覆盖。")
-        return 1
-    rx, tx, rate = resolved
-
-    block = int(rate * 0.02)  # 20ms，与 audio_bridge.MODEM_BLOCK_MS 一致
-    print("RX [{}] {}  api={}".format(rx["index"], rx["name"], rx["hostapi"]))
-    print("TX [{}] {}  api={}".format(tx["index"], tx["name"], tx["hostapi"]))
-    print("↑ 确认括号里是目标手机；配对多台手机时端点会混在一起，"
-          "不是就用 --keyword 指定（如 --keyword pixel）。")
-    print("采样率={} 块={} 采样 ({:.0f}ms)".format(rate, block, block / rate * 1000))
-    print("录 {}s；第 {}s 注入 DTMF {!r}\n".format(args.seconds, args.inject_at, args.dtmf))
-
     # 真机实测（2026-08-21）：HFP 端点可能只以 WDM-KS 形态出现，而 PortAudio 的
     # WDM-KS 后端不支持阻塞式 read/write（'Blocking API not supported yet',
     # PaErrorCode -9999）。回调式在全部 host API 下都可用，统一走回调 + 缓冲。
@@ -259,28 +237,84 @@ def cmd_test(args: argparse.Namespace) -> int:
         if len(chunk) < need:
             outdata[len(chunk):] = b"\x00" * (need - len(chunk))
 
-    in_stream = sd.RawInputStream(
-        samplerate=rate,
-        blocksize=block,
-        dtype="int16",
-        channels=1,
-        device=rx["index"],
-        callback=in_callback,
-    )
-    out_stream = sd.RawOutputStream(
-        samplerate=rate,
-        blocksize=block,
-        dtype="int16",
-        channels=1,
-        device=tx["index"],
-        callback=out_callback,
-    )
+    last_error: dict = {"exc": None}
+
+    def _try_start(resolved: tuple[dict, dict, int]):
+        """开并启动双向流；成功返回 (in_stream, out_stream)，失败返回 None。
+
+        端点存在 ≠ 能开流：手机一连蓝牙端点就在了，但 KS pin 要 SCO（通话
+        接通）后才实例化得出来——真机实测没在通话时 start() 报
+        'WdmSyncIoctl: DeviceIoControl GLE = 0x00000001'。失败就继续等。
+        """
+        rx, tx, rate = resolved
+        block = int(rate * 0.02)
+        streams = []
+        try:
+            ins = sd.RawInputStream(
+                samplerate=rate, blocksize=block, dtype="int16", channels=1,
+                device=rx["index"], callback=in_callback,
+            )
+            streams.append(ins)
+            outs = sd.RawOutputStream(
+                samplerate=rate, blocksize=block, dtype="int16", channels=1,
+                device=tx["index"], callback=out_callback,
+            )
+            streams.append(outs)
+            ins.start()
+            outs.start()
+            return ins, outs
+        except Exception as exc:
+            last_error["exc"] = exc
+            for s in streams:
+                try:
+                    s.abort()
+                    s.close()
+                except Exception:
+                    pass
+            return None
+
+    # 把「试开流」本身放进等待循环：先开脚本，再拨号，接通瞬间自动开始。
+    print("等待通话接通（最多 {:.0f}s）——现在去手机上拨 611。".format(args.wait))
+    deadline = time.monotonic() + max(args.wait, 1.0)
+    opened = None
+    resolved = None
+    waited = 0
+    while time.monotonic() < deadline:
+        resolved = _resolve_endpoint(keywords, args.hostapi)
+        if resolved is not None:
+            opened = _try_start(resolved)
+            if opened is not None:
+                break
+        time.sleep(1.0)
+        waited += 1
+        print("  ...{}s".format(waited), end="\r", flush=True)
+        # 注意：开流成功后绝不能再 _refresh_devices()（会把活流拆了）。
+        _refresh_devices()
+    if opened is None:
+        print("\n!! 等待超时，流没能启动。")
+        if resolved is not None:
+            print("   端点找到了（{}），但开流失败：{}".format(
+                resolved[0]["name"], last_error["exc"]))
+            print("   - 通话真的接通了吗？端点存在但 SCO 没起来就会这样。")
+            print("   - 手机通话界面里把音频输出切到这台电脑（蓝牙）。")
+        else:
+            print("   - 没找到 HFP 端点。先 `list` 看设备名，必要时 --keyword 覆盖。")
+            print("   - 检查手机蓝牙已连接、且「免提电话」服务勾选。")
+        return 1
+    in_stream, out_stream = opened
+    rx, tx, rate = resolved
+    block = int(rate * 0.02)  # 20ms，与 audio_bridge.MODEM_BLOCK_MS 一致
+
+    print("\n流已启动，采集中：")
+    print("RX [{}] {}  api={}".format(rx["index"], rx["name"], rx["hostapi"]))
+    print("TX [{}] {}  api={}".format(tx["index"], tx["name"], tx["hostapi"]))
+    print("↑ 确认括号里是目标手机；不是就 Ctrl-C 后用 --keyword 指定（如 --keyword pixel）。")
+    print("采样率={} 块={} 采样 ({:.0f}ms)".format(rate, block, block / rate * 1000))
+    print("录 {}s；第 {}s 注入 DTMF {!r}\n".format(args.seconds, args.inject_at, args.dtmf))
 
     tone = dtmf_tone(args.dtmf, rate) if args.dtmf else b""
     injected = False
     inject_mark = None
-    in_stream.start()
-    out_stream.start()
     t0 = time.monotonic()
     try:
         while time.monotonic() - t0 < args.seconds:
