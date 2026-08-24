@@ -24,6 +24,7 @@ from .agents.tools import REQUEST_OWNER_TAKEOVER_SPEC, ToolRegistry
 from .audio_bridge import (
     MODEM_RATE,
     FfmpegAudioBridge,
+    HfpAudioBridge,
     ModemAudioBridge,
     SerialPcmAudioBridge,
     apply_pcm_gain,
@@ -126,7 +127,9 @@ _OUTCOME_WINDOW_SECONDS = 8.0
 _OUTCOME_LATE_GRACE_SECONDS = 30.0
 
 
-AudioBridge = ModemAudioBridge | SerialPcmAudioBridge | FfmpegAudioBridge
+AudioBridge = (
+    ModemAudioBridge | SerialPcmAudioBridge | FfmpegAudioBridge | HfpAudioBridge
+)
 
 # Agent 说话结束后，再屏蔽上行这么久，吸收模组回采的尾音回声。
 # （仅作缺省值；每通会话开始时从 config.HALF_DUPLEX_HANGOVER_SECONDS 重新读取。）

@@ -192,8 +192,10 @@ def test_modem_defaults_follow_platforms(monkeypatch):
     _unset(monkeypatch, "MODEM_PORT", "MODEM_AUDIO_MODE")
     assert get_str("MODEM_PORT") == platforms.default_modem_port()
     assert get_str("MODEM_AUDIO_MODE") == platforms.default_audio_mode()
-    # 音频模式的三个可选值不因平台默认变化而缩水
-    assert get_spec("MODEM_AUDIO_MODE").choices == ("uac_ffmpeg", "uac", "nmea")
+    # 音频模式的可选值不因平台默认变化而缩水（hfp = android_bt 蓝牙话机，WIL-147）
+    assert get_spec("MODEM_AUDIO_MODE").choices == (
+        "uac_ffmpeg", "uac", "nmea", "hfp"
+    )
 
 
 def test_runtime_paths_default_to_project_cwd_or_env_override(tmp_path, monkeypatch):
