@@ -22,7 +22,7 @@ import logging
 import re
 from typing import Any
 
-from . import config
+from . import call_playbooks, config
 from .number_profiles import _normalize_task_package
 from .prompt_gen import (
     call_text_model,
@@ -145,6 +145,100 @@ _RETRY_REPLY = {
 }
 
 
+# 对话里可能承载电话号码的数字串（含 611 这类短码与 +1 前缀）。
+_NUMBER_TOKEN_RE = re.compile(r"\+?\d{3,15}")
+
+_PLAYBOOK_INTEL_HEADER = {
+    "zh": (
+        "呼叫情报库：对话中出现的号码有已知的 IVR 必备信息要求——\n{items}\n"
+        "以上是**完成任务的必备项**，不适用「核身信息绝不主动索要」的一般规则：\n"
+        "请在对话中自然地向机主逐项要到，填进 draft.task_package.verification "
+        "的对应键（键名必须与上面一致）。机主明确不给就作罢：对应键留缺，"
+        "并在 scenario 里注明缺失、提醒这通电话可能过不了核身。"
+    ),
+    "en": (
+        "Call playbook intel: a number mentioned in this conversation has "
+        "known IVR requirements —\n{items}\n"
+        "These are **required to complete the task**, so the usual "
+        "\"never proactively ask for verification\" rule does NOT apply: "
+        "naturally collect each item from the owner and file it under the "
+        "matching key in draft.task_package.verification (key names must "
+        "match exactly). If the owner declines, drop it: leave the key "
+        "absent and note in the scenario that the call may fail the "
+        "identity gate."
+    ),
+}
+
+
+def _playbook_intel(messages: list[dict[str, str]], lang: str) -> str:
+    """扫描对话中的号码，命中呼叫情报库则生成必备信息采集指引（无则空串）。
+
+    这是 call_playbooks 文档里预告的「P2 由建单/intake 消费」：拨前硬拦截
+    已降级为提示（按号码绑定的硬拦会误伤该热线的一切任务），必备信息的
+    采集职责落在这里——建单对话进行中就把 PIN/ZIP 之类要到手。
+    fail-open：情报库不可用/解析异常一律返回空串，绝不挡建单主链路。
+    """
+    try:
+        if not call_playbooks.playbooks_enabled():
+            return ""
+        # 情报库只加载一次，token 在内存里匹配（逐 token 调 lookup_playbook
+        # 会按 token 数重复读文件）。
+        playbooks = call_playbooks.list_playbooks()
+        if not playbooks:
+            return ""
+        zh = lang == "zh"
+        item_sep = "、" if zh else "; "
+        lines: list[str] = []
+        seen: set[str] = set()
+        for message in messages:
+            for token in _NUMBER_TOKEN_RE.findall(message.get("content", "")):
+                if token in seen:
+                    continue
+                seen.add(token)
+                playbook = next(
+                    (
+                        item for item in playbooks
+                        if isinstance(item.get("numbers"), list)
+                        and any(
+                            call_playbooks.same_dial_number(token, candidate)
+                            for candidate in item["numbers"]
+                        )
+                    ),
+                    None,
+                )
+                if playbook is None:
+                    continue
+                label = call_playbooks._pick_lang(playbook.get("label"), lang)
+                entries = call_playbooks._normalized_required_info(playbook)
+                if not entries:
+                    continue
+                items = item_sep.join(
+                    "{}（{}，键 {}）".format(
+                        call_playbooks._pick_lang(e.get("label"), lang) or e["key"],
+                        call_playbooks._pick_lang(e.get("purpose"), lang) or "-",
+                        e["key"],
+                    ) if zh else "{} ({}, key {})".format(
+                        call_playbooks._pick_lang(e.get("label"), lang) or e["key"],
+                        call_playbooks._pick_lang(e.get("purpose"), lang) or "-",
+                        e["key"],
+                    )
+                    for e in entries
+                )
+                lines.append(
+                    "- {}{}: {}".format(token, f"（{label}）" if label else "", items)
+                    if zh
+                    else "- {}{}: {}".format(
+                        token, f" ({label})" if label else "", items
+                    )
+                )
+        if not lines:
+            return ""
+        return _PLAYBOOK_INTEL_HEADER[lang].format(items="\n".join(lines))
+    except Exception:  # noqa: BLE001
+        logger.exception("呼叫情报库注入建单对话失败，忽略")
+        return ""
+
+
 def _sanitize_messages(raw: Any) -> list[dict[str, str]] | None:
     """校验前端发来的消息历史；非法返回 None（端点层报 400）。"""
     if not isinstance(raw, list) or not raw or len(raw) > _MAX_MESSAGES:
@@ -222,8 +316,12 @@ def intake_step(
             }
             for m in messages
         ]
+        # 情报库指引作为独立 system 消息追加：对话里一旦出现命中情报库的号码
+        # （多为模型自己提议的公开客服号），下一轮起模型就知道该热线要什么。
+        intel = _playbook_intel(messages, lang)
         chat = [
             {"role": "system", "content": _SYSTEM[lang].format(owner=owner)},
+            *([{"role": "system", "content": intel}] if intel else []),
             *history,
         ]
         text, error = call_text_model(

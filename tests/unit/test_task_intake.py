@@ -221,3 +221,81 @@ def test_human_entered_presets_keep_the_looser_rule():
     from agentcall.number_profiles import _DIAL_NUMBER_RE
 
     assert _DIAL_NUMBER_RE.fullmatch("*21*13800000000#")
+
+
+# ---------------------------------------------------------------------------
+# 呼叫情报库注入（WIL-129 P2）：建单对话中出现命中号码 → 必备信息采集指引
+# ---------------------------------------------------------------------------
+
+
+def _write_playbooks(playbooks):
+    import json
+    import os
+    from pathlib import Path
+
+    path = Path(os.environ["CALL_PLAYBOOKS_FILE"])
+    path.write_text(
+        json.dumps({"playbooks": playbooks}, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+_PLAYBOOK_611 = {
+    "id": "att_prepaid_611",
+    "numbers": ["611"],
+    "label": {"zh": "AT&T Prepaid 客服", "en": "AT&T Prepaid CS"},
+    "required_info": [
+        {
+            "key": "account_pin",
+            "label": {"zh": "四位账户 PIN", "en": "Four-digit account PIN"},
+            "purpose": {"zh": "转人工核身", "en": "identity gate"},
+        },
+        {
+            "key": "activation_zip",
+            "label": {"zh": "激活 ZIP", "en": "Activation ZIP"},
+            "purpose": {"zh": "核身第二道", "en": "second identity gate"},
+        },
+    ],
+}
+
+
+def test_playbook_intel_injected_when_number_mentioned(monkeypatch):
+    monkeypatch.setenv("CALL_PLAYBOOKS_ENABLED", "true")
+    _write_playbooks([_PLAYBOOK_611])
+    messages = [
+        {"role": "assistant", "content": "AT&T 客服是 611，直接打这个可以吗？"},
+        {"role": "user", "content": "可以"},
+    ]
+    intel = task_intake._playbook_intel(messages, "zh")
+    assert "account_pin" in intel and "四位账户 PIN" in intel
+    assert "activation_zip" in intel
+    assert "task_package.verification" in intel
+
+
+def test_playbook_intel_empty_without_hit_or_disabled(monkeypatch):
+    _write_playbooks([_PLAYBOOK_611])
+    messages = [{"role": "user", "content": "帮我打 611"}]
+    # conftest 默认 CALL_PLAYBOOKS_ENABLED=false
+    assert task_intake._playbook_intel(messages, "zh") == ""
+    monkeypatch.setenv("CALL_PLAYBOOKS_ENABLED", "true")
+    # 未命中任何情报号码
+    no_hit = [{"role": "user", "content": "帮我打 4085550100 订位子"}]
+    assert task_intake._playbook_intel(no_hit, "zh") == ""
+
+
+def test_playbook_intel_fail_open_on_bad_library(monkeypatch):
+    import os
+    from pathlib import Path
+
+    monkeypatch.setenv("CALL_PLAYBOOKS_ENABLED", "true")
+    Path(os.environ["CALL_PLAYBOOKS_FILE"]).write_text("not json", encoding="utf-8")
+    messages = [{"role": "user", "content": "打 611"}]
+    # 库坏了绝不挡建单主链路
+    assert task_intake._playbook_intel(messages, "zh") == ""
+
+
+def test_playbook_intel_en_uses_english_separators(monkeypatch):
+    monkeypatch.setenv("CALL_PLAYBOOKS_ENABLED", "true")
+    _write_playbooks([_PLAYBOOK_611])
+    messages = [{"role": "user", "content": "call 611 for me"}]
+    intel = task_intake._playbook_intel(messages, "en")
+    assert "account_pin" in intel and "、" not in intel

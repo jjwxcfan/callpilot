@@ -225,6 +225,30 @@ def main() -> None:
     store_path = data_dir / "messages.json"
     hub = EventHub(loop, store_path=store_path)
 
+    # android_bt（WIL-147）不是串口模组：SIM 在蓝牙配对的安卓手机里，控制走
+    # WinRT PhoneLine。经 CallAgentService 既有的 modem= 注入点接入（与
+    # AndroidSmsGatewayModem 同一先例），supervisor 的 connect 重试/看门狗
+    # 对它一体适用。音频模式若没配成 hfp 直接 fail-fast——uac/nmea 在这个
+    # 形态下必然无声，静默启动只会浪费一轮真机排障。
+    injected_modem = None
+    if config.get_str("MODEM_VENDOR") == "android_bt":
+        if not platforms.IS_WINDOWS:
+            logger.error(
+                "错误: MODEM_VENDOR=android_bt 仅支持 Windows"
+                "（依赖 WinRT PhoneLine 与系统蓝牙免提栈）"
+            )
+            sys.exit(2)
+        if config.get_str("MODEM_AUDIO_MODE").lower() != "hfp":
+            logger.error(
+                "错误: MODEM_VENDOR=android_bt 必须配 MODEM_AUDIO_MODE=hfp"
+                "（蓝牙免提音频端点），当前为 %s",
+                config.get_str("MODEM_AUDIO_MODE"),
+            )
+            sys.exit(2)
+        from agentcall.modem_winrt_phone import WinRtPhoneModem
+
+        injected_modem = WinRtPhoneModem()
+
     service = CallAgentService(
         modem_port=modem_port,
         audio_keyword=config.get_str("MODEM_AUDIO_KEYWORD"),
@@ -235,6 +259,7 @@ def main() -> None:
         pcm_baudrate=config.get_int("MODEM_PCM_BAUD"),
         tx_gain=config.get_float("MODEM_TX_GAIN"),
         hub=hub,
+        modem=injected_modem,
         vendor=config.get_str("MODEM_VENDOR"),
     )
 

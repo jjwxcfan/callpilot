@@ -1877,15 +1877,25 @@ def _drill_playbook() -> dict:
     }
 
 
-def test_dial_blocked_when_playbook_required_info_missing(monkeypatch):
+def test_dial_warns_but_proceeds_when_playbook_required_info_missing(monkeypatch):
+    """WIL-129 硬拦截已降级为提示（2026-08-24）：缺必备信息只提示、不阻断拨号。
+
+    背景：情报按号码绑定，硬拦会误伤该热线的一切任务——611 真机拨测被要求
+    提供账户 PIN 实锤。采集职责移到对话式建单（见 test_task_intake 的
+    playbook_intel 用例）。
+    """
     monkeypatch.setenv("CALL_PLAYBOOKS_ENABLED", "true")
     _write_playbook_env_file([_drill_playbook()])
     service = make_service(FakeModem())
     ok, err = service.dial("611")
-    assert ok is False
-    assert "四位账户 PIN" in err and "account_pin" in err
-    # 没进拨号：会话未激活
-    assert not service.session.is_active
+    assert ok is True and err is None
+    assert service.session.is_active
+    # 缺口本身仍能被检查器报出（供提示/事件流用）
+    gap = service._playbook_info_gap(
+        "611", task=None, preset_hint=None, preset_id=None
+    )
+    assert gap is not None and "四位账户 PIN" in gap and "account_pin" in gap
+    service.session.stop()
 
 
 def test_dial_allowed_when_verification_covers_required_info(monkeypatch):
@@ -1910,30 +1920,30 @@ def test_dial_allowed_when_verification_covers_required_info(monkeypatch):
         encoding="utf-8",
     )
     service = make_service(FakeModem())
-    blocked, message = service._reject_if_playbook_info_missing(
+    gap = service._playbook_info_gap(
         "611", task="查套餐", preset_hint=None, preset_id=None
     )
-    assert blocked is False and message is None
+    assert gap is None
 
 
 def test_dial_gate_bypassed_when_playbooks_disabled():
     # conftest 默认 CALL_PLAYBOOKS_ENABLED=false
     _write_playbook_env_file([_drill_playbook()])
     service = make_service(FakeModem())
-    blocked, message = service._reject_if_playbook_info_missing(
+    gap = service._playbook_info_gap(
         "611", task=None, preset_hint=None, preset_id=None
     )
-    assert blocked is False and message is None
+    assert gap is None
 
 
 def test_dial_gate_ignores_numbers_without_playbook(monkeypatch):
     monkeypatch.setenv("CALL_PLAYBOOKS_ENABLED", "true")
     _write_playbook_env_file([_drill_playbook()])
     service = make_service(FakeModem())
-    blocked, message = service._reject_if_playbook_info_missing(
+    gap = service._playbook_info_gap(
         "10086", task=None, preset_hint=None, preset_id=None
     )
-    assert blocked is False and message is None
+    assert gap is None
 
 
 def test_playbook_ivr_notes_injected_into_outbound_instructions(monkeypatch):

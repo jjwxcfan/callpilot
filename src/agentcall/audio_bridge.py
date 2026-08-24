@@ -10,6 +10,7 @@ import select
 import subprocess
 import threading
 import time
+from collections import deque
 from typing import Any, BinaryIO, Callable, Iterable, cast
 
 import numpy as np
@@ -835,13 +836,262 @@ class FfmpegAudioBridge:
         return apply_pcm_gain(pcm_8k, self.tx_gain)
 
 
+class HfpAudioBridge:
+    """蓝牙 HFP 免提音频端点桥（WIL-147：安卓手机当模组时的音频通路）。
+
+    Windows 自带蓝牙栈以免提角色连接手机后，会为通话音频建出一对
+    ``Hands-Free HF Audio`` 端点。真机实测（Pixel 7 + Win11 26200，
+    ``docs/fixtures/hfp_spike/RESULTS.md``）有三条与 ``ModemAudioBridge``
+    不同的硬约束，本类因此单独实现：
+
+    1. 端点常只以 WDM-KS 形态出现，而 PortAudio 的 WDM-KS 后端不支持
+       阻塞式 read/write（-9999 'Blocking API not supported yet'）——
+       必须回调式；
+    2. 端点存在 ≠ 能开流：KS pin 要 SCO（通话音频链路）建立后才实例化
+       得出来，通话接通前 start 报 WdmSyncIoctl GLE=0x1——``start()``
+       内置重试等待；
+    3. 协商采样率不定（实测 16kHz mSBC，CVSD 卡则 8kHz）——内部按端点
+       原生采样率开流，对外契约仍是 8kHz PCM（``MODEM_RATE``），出入口
+       重采样，调用方无感。
+    """
+
+    # SCO 等待：answer/dial 到音频链路建立的实测窗口在几秒内，留足余量。
+    SCO_WAIT_SECONDS = 20.0
+    _READ_TIMEOUT_SECONDS = 0.05
+    # 下行积压封顶（与 FfmpegAudioBridge 同款 60s）：SCO 短暂中断时 out_callback
+    # 停止消费而 Agent 持续写入，不封顶会无界增长、恢复后爆发式补播陈旧音频。
+    _MAX_TX_SECONDS = 60
+
+    def __init__(
+        self,
+        device_keyword: str,
+        tx_gain: float = 1.0,
+        sco_wait_seconds: float = SCO_WAIT_SECONDS,
+    ) -> None:
+        self.device_keyword = device_keyword
+        self.tx_gain = tx_gain
+        self.sco_wait_seconds = sco_wait_seconds
+        self.device_rate = MODEM_RATE  # start() 时按端点实际协商值更新
+        self._in_stream: Any = None
+        self._out_stream: Any = None
+        self._rx_chunks: deque[bytes] = deque()
+        self._rx_cond = threading.Condition()
+        self._tx_lock = threading.Lock()
+        self._tx_buffer = bytearray()  # 原生采样率域
+
+    # ---- 端点解析 ----
+
+    def _resolve_endpoints(self) -> tuple[int, int, int] | None:
+        """找成对可开流的免提端点，返回 (rx_index, tx_index, rate)。
+
+        host API 偏好 WASAPI > MME > DirectSound > WDM-KS（前者行为更规矩，
+        但真机常只有 WDM-KS——回调式在哪个下都能用）。
+        """
+        import sounddevice as sd
+
+        keyword = self.device_keyword.lower()
+        api_order = ("wasapi", "mme", "directsound", "wdm-ks")
+        apis = [str(a["name"]).lower() for a in sd.query_hostapis()]
+
+        def rank(dev: dict) -> int:
+            api = apis[int(dev["hostapi"])]
+            for i, name in enumerate(api_order):
+                if name in api:
+                    return i
+            return len(api_order)
+
+        ins, outs = [], []
+        for idx, dev in enumerate(sd.query_devices()):
+            name = str(dev.get("name", "")).lower()
+            if keyword not in name:
+                continue
+            entry = (rank(dev), idx, dev)
+            if int(dev.get("max_input_channels", 0)) > 0:
+                ins.append(entry)
+            if int(dev.get("max_output_channels", 0)) > 0:
+                outs.append(entry)
+        if not ins or not outs:
+            return None
+        _rank_i, rx_idx, rx_dev = min(ins)
+        _rank_o, tx_idx, _tx_dev = min(outs)
+        # 采样率：先信端点自报，再退常见的 8k(CVSD)/16k(mSBC)。
+        rates: list[int] = []
+        for r in (int(rx_dev.get("default_samplerate", 0)), MODEM_RATE, 16000):
+            if r and r not in rates:
+                rates.append(r)
+        for rate in rates:
+            try:
+                sd.check_input_settings(
+                    device=rx_idx, samplerate=rate, channels=1, dtype=MODEM_DTYPE
+                )
+                sd.check_output_settings(
+                    device=tx_idx, samplerate=rate, channels=1, dtype=MODEM_DTYPE
+                )
+                return rx_idx, tx_idx, rate
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+
+    # ---- 生命周期 ----
+
+    def start(self) -> None:
+        import sounddevice as sd
+
+        deadline = time.monotonic() + self.sco_wait_seconds
+        last_error: Exception | None = None
+        while True:
+            resolved = self._resolve_endpoints()
+            if resolved is not None:
+                rx_idx, tx_idx, rate = resolved
+                try:
+                    self._open_streams(rx_idx, tx_idx, rate)
+                    self.device_rate = rate
+                    logger.info(
+                        "HFP 音频流已启动 (%d Hz mono, 对外仍 %d Hz)",
+                        rate, MODEM_RATE,
+                    )
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "HFP 音频端点在 {:.0f}s 内未就绪（SCO 未建立？关键字 {!r}）"
+                    "；最后错误: {}".format(
+                        self.sco_wait_seconds, self.device_keyword, last_error
+                    )
+                )
+            time.sleep(0.5)
+            # sounddevice 缓存设备表，SCO 起来后新端点必须重枚举才可见。
+            try:
+                sd._terminate()
+                sd._initialize()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _open_streams(self, rx_idx: int, tx_idx: int, rate: int) -> None:
+        import sounddevice as sd
+
+        block = int(rate * MODEM_BLOCK_MS / 1000)
+
+        def in_callback(indata: Any, frames: int, time_info: Any, status: Any) -> None:
+            if status:
+                logger.debug("HFP 上行流状态: %s", status)
+            with self._rx_cond:
+                self._rx_chunks.append(bytes(indata))
+                self._rx_cond.notify()
+
+        def out_callback(outdata: Any, frames: int, time_info: Any, status: Any) -> None:
+            need = len(outdata)
+            with self._tx_lock:
+                chunk = bytes(self._tx_buffer[:need])
+                del self._tx_buffer[:need]
+            outdata[: len(chunk)] = chunk
+            if len(chunk) < need:
+                outdata[len(chunk):] = b"\x00" * (need - len(chunk))
+
+        streams: list[Any] = []
+        try:
+            in_stream = sd.RawInputStream(
+                samplerate=rate, blocksize=block, dtype=MODEM_DTYPE,
+                channels=MODEM_CHANNELS, device=rx_idx, callback=in_callback,
+            )
+            streams.append(in_stream)
+            out_stream = sd.RawOutputStream(
+                samplerate=rate, blocksize=block, dtype=MODEM_DTYPE,
+                channels=MODEM_CHANNELS, device=tx_idx, callback=out_callback,
+            )
+            streams.append(out_stream)
+            in_stream.start()
+            out_stream.start()
+        except Exception:
+            for s in streams:
+                try:
+                    s.abort()
+                    s.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            raise
+        self._in_stream = in_stream
+        self._out_stream = out_stream
+
+    def stop(self) -> None:
+        for stream in (self._in_stream, self._out_stream):
+            if stream is not None:
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        self._in_stream = None
+        self._out_stream = None
+        with self._rx_cond:
+            self._rx_chunks.clear()
+        with self._tx_lock:
+            self._tx_buffer.clear()
+
+    # ---- 数据面（对外 8kHz 契约）----
+
+    def read_modem_chunk(self) -> bytes:
+        with self._rx_cond:
+            if not self._rx_chunks:
+                self._rx_cond.wait(timeout=self._READ_TIMEOUT_SECONDS)
+            if not self._rx_chunks:
+                return b""
+            native = b"".join(self._rx_chunks)
+            self._rx_chunks.clear()
+        return resample_pcm(native, self.device_rate, MODEM_RATE)
+
+    def _to_8k_bytes(self, native_bytes: int) -> int:
+        return int(native_bytes * MODEM_RATE / self.device_rate)
+
+    def pending_output_bytes(self) -> int:
+        with self._tx_lock:
+            return self._to_8k_bytes(len(self._tx_buffer))
+
+    def discard_pending_output(self) -> int:
+        with self._tx_lock:
+            dropped = len(self._tx_buffer)
+            self._tx_buffer.clear()
+        return self._to_8k_bytes(dropped)
+
+    def write_modem_chunks(self, chunks: Iterable[bytes]) -> None:
+        payload = b"".join(chunk for chunk in chunks if chunk)
+        if not payload:
+            return
+        native = resample_pcm(payload, MODEM_RATE, self.device_rate)
+        dropped = 0
+        with self._tx_lock:
+            self._tx_buffer.extend(native)
+            max_bytes = self.device_rate * MODEM_CHANNELS * 2 * self._MAX_TX_SECONDS
+            overflow = len(self._tx_buffer) - max_bytes
+            if overflow > 0:
+                # PCM 是 int16；从队首丢偶数字节，不把后续样本切到半字边界。
+                dropped = overflow + overflow % 2
+                del self._tx_buffer[:dropped]
+        if dropped:
+            logger.warning(
+                "HFP 下行 PCM 积压超限（SCO 停滞？），丢弃最旧音频 %d 字节", dropped
+            )
+
+    @staticmethod
+    def modem_to_agent(pcm_8k: bytes, agent_rate: int) -> bytes:
+        return resample_pcm(pcm_8k, MODEM_RATE, agent_rate)
+
+    @staticmethod
+    def agent_to_modem(pcm_agent: bytes, agent_rate: int) -> bytes:
+        return resample_pcm(pcm_agent, agent_rate, MODEM_RATE)
+
+    def amplify_for_modem(self, pcm_8k: bytes) -> bytes:
+        return apply_pcm_gain(pcm_8k, self.tx_gain)
+
+
 def create_audio_bridge(
     mode: str,
     device_keyword: str,
     pcm_port: str | None,
     pcm_baudrate: int,
     tx_gain: float = 1.0,
-) -> "ModemAudioBridge | SerialPcmAudioBridge | FfmpegAudioBridge":
+) -> "ModemAudioBridge | SerialPcmAudioBridge | FfmpegAudioBridge | HfpAudioBridge":
     selected = mode.lower()
     if selected == "uac":
         return ModemAudioBridge(device_keyword)
@@ -851,4 +1101,8 @@ def create_audio_bridge(
         if not pcm_port:
             raise RuntimeError("NMEA PCM 模式需要配置 MODEM_PCM_PORT")
         return SerialPcmAudioBridge(pcm_port, pcm_baudrate, tx_gain=tx_gain)
-    raise ValueError("MODEM_AUDIO_MODE 只能是 uac、uac_ffmpeg（仅 macOS）或 nmea")
+    if selected == "hfp":
+        return HfpAudioBridge(device_keyword, tx_gain=tx_gain)
+    raise ValueError(
+        "MODEM_AUDIO_MODE 只能是 uac、uac_ffmpeg（仅 macOS）、nmea 或 hfp"
+    )

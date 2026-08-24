@@ -24,6 +24,7 @@ from .agents.tools import REQUEST_OWNER_TAKEOVER_SPEC, ToolRegistry
 from .audio_bridge import (
     MODEM_RATE,
     FfmpegAudioBridge,
+    HfpAudioBridge,
     ModemAudioBridge,
     SerialPcmAudioBridge,
     apply_pcm_gain,
@@ -126,7 +127,9 @@ _OUTCOME_WINDOW_SECONDS = 8.0
 _OUTCOME_LATE_GRACE_SECONDS = 30.0
 
 
-AudioBridge = ModemAudioBridge | SerialPcmAudioBridge | FfmpegAudioBridge
+AudioBridge = (
+    ModemAudioBridge | SerialPcmAudioBridge | FfmpegAudioBridge | HfpAudioBridge
+)
 
 # Agent 说话结束后，再屏蔽上行这么久，吸收模组回采的尾音回声。
 # （仅作缺省值；每通会话开始时从 config.HALF_DUPLEX_HANGOVER_SECONDS 重新读取。）
@@ -3857,11 +3860,17 @@ class CallAgentService:
         missing_credentials, message = self._reject_if_credentials_missing()
         if missing_credentials:
             return False, message
-        blocked, message = self._reject_if_playbook_info_missing(
+        # WIL-129 拨前硬拦截降级为提示（2026-08-24 机主拍板）：情报库按号码绑定，
+        # 硬拦会误伤该热线的**一切**任务（611 拨测实锤——一通验收电话也被要求
+        # 提供账户 PIN）。必备信息的采集职责移到对话式建单（task_intake 会把
+        # 情报库要求注入采集对话）；直接拨号只提示缺口、不阻断。
+        info_gap = self._playbook_info_gap(
             number, task=task, preset_hint=preset_hint, preset_id=preset_id
         )
-        if blocked:
-            return False, message
+        if info_gap:
+            logger.warning("呼叫情报提示（不阻断拨号）: %s", info_gap)
+            if self.hub is not None:
+                self.hub.publish({"type": "system", "text": f"提示：{info_gap}"})
         self._remember_outbound_task(task)
         with self._ring_lock:
             if self.session.is_active or self._remote_call_owner is not None:
@@ -3883,27 +3892,28 @@ class CallAgentService:
                 )
         return True, None
 
-    def _reject_if_playbook_info_missing(
+    def _playbook_info_gap(
         self,
         number: str,
         *,
         task: str | None,
         preset_hint: str | None,
         preset_id: str | None,
-    ) -> tuple[bool, str | None]:
-        """拨前硬拦截（WIL-129）：热线情报库要求的必备信息，预设里必须齐。
+    ) -> str | None:
+        """热线情报库要求的必备信息缺口（WIL-129，已降级为提示）。
 
         情报库存"要什么"（键定义），预设 task_package.verification 存"是什么"
-        （值）。命中情报且缺任一必备键即拒绝拨号——信息缺口应在拨号前暴露，
-        而不是在通话里白打一通（611 演练实锤）。库未命中/开关关闭时放行；
-        检查器自身异常也放行（挡住拨号主链路比漏检更糟）。
+        （值）。命中情报且缺任一必备键时返回提示文案；调用方只提示不阻断——
+        硬拦截会误伤该热线的一切任务（2026-08-24 611 拨测实锤），必备信息的
+        采集职责在对话式建单（task_intake）。库未命中/开关关闭返回 None；
+        检查器自身异常也返回 None（挡住拨号主链路比漏检更糟）。
         """
         try:
             if not call_playbooks.playbooks_enabled():
-                return False, None
+                return None
             playbook = call_playbooks.lookup_playbook(number)
             if playbook is None:
-                return False, None
+                return None
             lang = agent_language()
             profile = None
             if preset_id:
@@ -3916,11 +3926,11 @@ class CallAgentService:
                 playbook, package if isinstance(package, dict) else None
             )
             if not missing:
-                return False, None
-            return True, call_playbooks.missing_info_message(missing, lang)
+                return None
+            return call_playbooks.missing_info_message(missing, lang)
         except Exception:  # noqa: BLE001
             logger.exception("呼叫情报库拨前检查异常，放行")
-            return False, None
+            return None
 
     def hangup(self) -> tuple[bool, str | None]:
         """挂断进行中的通话（AI 与 IVR 互相不挂断时的人工兜底）。"""
