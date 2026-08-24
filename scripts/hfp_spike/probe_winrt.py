@@ -111,11 +111,18 @@ async def _enumerate_lines(calls) -> list[dict]:
     line = await calls.PhoneLine.from_id_async(default_id)
     if line is None:
         return [{"error": "PhoneLine.from_id_async 返回 None"}]
+    # PhoneLineTransport 枚举：0=Cellular, 1=VoipApp, 2=Bluetooth。
+    # winsdk 返回原始 int，必须解码——真机实测 transport=2 曾被字符串判据误判。
+    transport_raw = getattr(line, "transport", None)
+    transport_names = {0: "cellular", 1: "voip_app", 2: "bluetooth"}
     lines.append({
         "id": str(default_id),
         "display_name": getattr(line, "display_name", None),
         "number": getattr(line, "number", None),
-        "transport": str(getattr(line, "transport", None)),
+        "transport": transport_names.get(
+            int(transport_raw) if transport_raw is not None else -1,
+            str(transport_raw),
+        ),
         "can_dial": bool(getattr(line, "can_dial", False)),
         "voicemail_count": getattr(line, "voicemail_count", None),
     })
