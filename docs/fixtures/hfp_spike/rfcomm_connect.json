@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-24 13:18:26",
+  "generated_at": "2026-08-24 13:23:18",
   "ok": false,
-  "error": "connect 失败, WSAGetLastError=10049 (见 Winsock 错误码表)"
+  "error": "connect 失败, WSAGetLastError=10048 (见 Winsock 错误码表)"
 }

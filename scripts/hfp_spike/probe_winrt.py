@@ -154,50 +154,118 @@ def cmd_lines(args: argparse.Namespace) -> int:
     return 0 if bt_lines else 1
 
 
+async def _default_line(calls):
+    store = await calls.PhoneCallManager.request_store_async()
+    line_id = await store.get_default_line_async()
+    return await calls.PhoneLine.from_id_async(line_id)
+
+
+def _mask_number(number: str) -> str:
+    """落盘用打码：真实号码不入库（CLAUDE.md 硬约束），保尾 2 位供比对。"""
+    digits = [ch for ch in (number or "") if ch.isdigit()]
+    if len(digits) < 4:
+        return "***" if number else ""
+    return "***{}{} ({}位)".format(digits[-2], digits[-1], len(digits))
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
+    """轮询活跃通话，验证模组契约要用的每一环：
+
+    来电事件 + 对端号码（← on_ring/+CLIP）、状态流转（← CLCC 轮询）、
+    --answer 自动接听（← answer/ATA）、--end-after 自动挂断（← hangup）。
+    轮询而非事件订阅：WinRT 事件回调落在 MTA 线程且不能直接调 async 方法，
+    spike 里轮询更省事，正式实现（Phase 1）也正好对齐现有 CLCC 轮询模型。
+    """
     try:
         calls, _backend = _import_calls()
     except ImportError as exc:
         print(_IMPORT_HINT.format(err=exc))
         return 1
 
+    try:
+        line = asyncio.run(_default_line(calls))
+    except Exception as exc:
+        print("拿默认线路失败: {}: {}".format(type(exc).__name__, exc))
+        return 1
+    print("线路: {}（transport={}）".format(line.display_name, line.transport))
+    print("监听 {}s——现在用另一台手机拨这张卡。answer={} end_after={}s".format(
+        args.seconds, args.answer, args.end_after))
+
+    # 状态/方向名直接从枚举取，不手写映射（真机实测猜错过一轮）。
+    status_names = {m.value: m.name.lower() for m in calls.PhoneCallStatus}
+
     events: list[dict] = []
     t0 = time.monotonic()
+    last_snapshot: list[tuple] = []
+    answered_ids: set = set()
+    talking_since: dict = {}
 
-    def on_state(sender, evt) -> None:
-        entry = {
-            "at": round(time.monotonic() - t0, 2),
-            "is_call_active": bool(calls.PhoneCallManager.is_call_active),
-            "is_call_incoming": bool(
-                getattr(calls.PhoneCallManager, "is_call_incoming", False)
-            ),
-        }
-        events.append(entry)
-        print("[{at:7.2f}s] active={is_call_active} incoming={is_call_incoming}".format(**entry))
-
+    deadline = time.monotonic() + args.seconds
     try:
-        token = calls.PhoneCallManager.add_call_state_changed(on_state)
-    except Exception as exc:
-        print("订阅 call_state_changed 失败: {}: {}".format(type(exc).__name__, exc))
-        return 1
-
-    print("监听 {}s，期间拨打/接听试试。Ctrl-C 提前结束。".format(args.seconds))
-    try:
-        deadline = time.monotonic() + args.seconds
         while time.monotonic() < deadline:
-            time.sleep(0.2)
+            snapshot = []
+            # get_all_active_phone_calls 返回 PhoneCallsResult 包装，不可直接迭代。
+            result = line.get_all_active_phone_calls()
+            for call in list(result.all_active_phone_calls or []):
+                try:
+                    info = call.get_phone_call_info()
+                    number = info.phone_number
+                    direction = int(info.call_direction)
+                except Exception:
+                    number, direction = "?", -1
+                status_raw = int(call.status)
+                status = status_names.get(status_raw, str(status_raw))
+                snapshot.append((call.call_id, status, number, direction))
+
+                if status == "incoming" and args.answer and call.call_id not in answered_ids:
+                    answered_ids.add(call.call_id)
+                    try:
+                        call.accept_incoming()
+                        print("  → accept_incoming() 已调用")
+                    except Exception as exc:
+                        print("  → accept_incoming() 失败: {}".format(exc))
+                if status == "talking":
+                    talking_since.setdefault(call.call_id, time.monotonic())
+                    if (args.end_after
+                            and time.monotonic() - talking_since[call.call_id]
+                            >= args.end_after):
+                        try:
+                            call.end()
+                            print("  → end() 已调用")
+                            talking_since[call.call_id] = float("inf")
+                        except Exception as exc:
+                            print("  → end() 失败: {}".format(exc))
+
+            if snapshot != last_snapshot:
+                at = round(time.monotonic() - t0, 2)
+                if snapshot:
+                    for cid, status, number, direction in snapshot:
+                        # 终端显示全号（本地）；events 落盘打码（真实号码不入库）。
+                        entry = {"at": at, "call_id": cid, "status": status,
+                                 "number": _mask_number(number),
+                                 "direction": direction}
+                        events.append(entry)
+                        print("[{:7.2f}s] {:8s} number={!r} dir={}".format(
+                            at, status, number, direction))
+                else:
+                    events.append({"at": at, "status": "no-active-calls"})
+                    print("[{:7.2f}s] （无活跃通话）".format(at))
+                last_snapshot = snapshot
+            time.sleep(0.4)
     except KeyboardInterrupt:
         print("\n已停止。")
-    finally:
-        try:
-            calls.PhoneCallManager.remove_call_state_changed(token)
-        except Exception:
-            pass
 
+    ringing = [e for e in events
+               if e.get("status") in ("incoming", "talking", "ended")]
+    with_number = [e for e in ringing if e.get("number")]
     print("\n=== 判据 ===")
-    print("收到状态事件: {} ({} 次)".format("PASS" if events else "FAIL", len(events)))
+    print("观察到来电/通话     : {} ({} 条)".format(
+        "PASS" if ringing else "NO DATA", len(ringing)))
+    print("拿到对端号码        : {}".format(
+        "PASS " + repr(with_number[0]["number"]) if with_number
+        else "FAIL（PhoneCallInfo.phone_number 为空）"))
     _save("winrt_watch.json", {"events": events})
-    return 0 if events else 1
+    return 0 if ringing else 1
 
 
 def _save(name: str, data: dict) -> None:
@@ -224,8 +292,11 @@ def main() -> int:
     pln = sub.add_parser("lines", help="枚举 PhoneLine，看有没有蓝牙线路")
     pln.set_defaults(func=cmd_lines)
 
-    pw = sub.add_parser("watch", help="监听通话状态变化")
+    pw = sub.add_parser("watch", help="轮询活跃通话：来电号码 / 状态流转，可选自动接听挂断")
     pw.add_argument("--seconds", type=float, default=120.0)
+    pw.add_argument("--answer", action="store_true", help="响铃时自动 accept_incoming()")
+    pw.add_argument("--end-after", type=float, default=0.0,
+                    help="接通 N 秒后自动 end()（0=不挂）")
     pw.set_defaults(func=cmd_watch)
 
     args = p.parse_args()
