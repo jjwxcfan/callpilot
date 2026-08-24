@@ -232,8 +232,32 @@ def cmd_test(args: argparse.Namespace) -> int:
     block = int(rate * 0.02)  # 20ms，与 audio_bridge.MODEM_BLOCK_MS 一致
     print("RX [{}] {}  api={}".format(rx["index"], rx["name"], rx["hostapi"]))
     print("TX [{}] {}  api={}".format(tx["index"], tx["name"], tx["hostapi"]))
+    print("↑ 确认括号里是目标手机；配对多台手机时端点会混在一起，"
+          "不是就用 --keyword 指定（如 --keyword pixel）。")
     print("采样率={} 块={} 采样 ({:.0f}ms)".format(rate, block, block / rate * 1000))
     print("录 {}s；第 {}s 注入 DTMF {!r}\n".format(args.seconds, args.inject_at, args.dtmf))
+
+    # 真机实测（2026-08-21）：HFP 端点可能只以 WDM-KS 形态出现，而 PortAudio 的
+    # WDM-KS 后端不支持阻塞式 read/write（'Blocking API not supported yet',
+    # PaErrorCode -9999）。回调式在全部 host API 下都可用，统一走回调 + 缓冲。
+    captured: list[bytes] = []
+    stats = {"overflows": 0}
+    tx_lock = threading.Lock()
+    tx_pending = bytearray()  # 待送下行的 PCM；空则回调自动补静音
+
+    def in_callback(indata, frames, time_info, status) -> None:
+        if status:
+            stats["overflows"] += 1
+        captured.append(bytes(indata))
+
+    def out_callback(outdata, frames, time_info, status) -> None:
+        need = len(outdata)
+        with tx_lock:
+            chunk = bytes(tx_pending[:need])
+            del tx_pending[:need]
+        outdata[: len(chunk)] = chunk
+        if len(chunk) < need:
+            outdata[len(chunk):] = b"\x00" * (need - len(chunk))
 
     in_stream = sd.RawInputStream(
         samplerate=rate,
@@ -241,6 +265,7 @@ def cmd_test(args: argparse.Namespace) -> int:
         dtype="int16",
         channels=1,
         device=rx["index"],
+        callback=in_callback,
     )
     out_stream = sd.RawOutputStream(
         samplerate=rate,
@@ -248,55 +273,30 @@ def cmd_test(args: argparse.Namespace) -> int:
         dtype="int16",
         channels=1,
         device=tx["index"],
+        callback=out_callback,
     )
 
-    captured: list[bytes] = []
-    stop = threading.Event()
-    stats = {"overflows": 0}
-
-    def reader() -> None:
-        while not stop.is_set():
-            try:
-                data, over = in_stream.read(block)
-                if over:
-                    stats["overflows"] += 1
-                captured.append(bytes(data))
-            except Exception as exc:  # 端点掉线（SCO 断）会走到这
-                print("[reader] 读失败: {}".format(exc))
-                stop.set()
-                return
-
+    tone = dtmf_tone(args.dtmf, rate) if args.dtmf else b""
+    injected = False
+    inject_mark = None
     in_stream.start()
     out_stream.start()
     t0 = time.monotonic()
-    thread = threading.Thread(target=reader, daemon=True)
-    thread.start()
-
-    # 下行持续喂静音，到点把 DTMF 换进去——模拟真实 bridge 的连续送流。
-    tone = dtmf_tone(args.dtmf, rate) if args.dtmf else b""
-    silence = b"\x00\x00" * block
-    injected = False
-    inject_mark = None
     try:
         while time.monotonic() - t0 < args.seconds:
             elapsed = time.monotonic() - t0
             if not injected and elapsed >= args.inject_at and tone:
                 inject_mark = len(captured) * block
-                for off in range(0, len(tone), block * 2):
-                    out_stream.write(tone[off : off + block * 2])
+                with tx_lock:
+                    tx_pending.extend(tone)
                 injected = True
                 print(
                     "[{:.1f}s] 已注入 DTMF {!r} ({} 字节)".format(
                         elapsed, args.dtmf, len(tone)
                     )
                 )
-                continue
-            out_stream.write(silence)
-    except Exception as exc:
-        print("[writer] 写失败: {}".format(exc))
+            time.sleep(0.05)
     finally:
-        stop.set()
-        thread.join(timeout=2)
         for s in (in_stream, out_stream):
             try:
                 s.stop()
