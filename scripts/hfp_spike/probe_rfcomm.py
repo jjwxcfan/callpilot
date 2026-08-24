@@ -65,6 +65,10 @@ class GUID(ctypes.Structure):
 
 
 class SOCKADDR_BTH(ctypes.Structure):
+    # ws2bth.h 里该结构体是 pshpack1（紧凑布局，sizeof=30）。ctypes 默认按
+    # 自然对齐会把 btAddr 推到 offset 8（sizeof=40），Windows 按 offset 2 读
+    # 地址读到垃圾 → connect 报 WSAEADDRNOTAVAIL(10049)（真机实测）。
+    _pack_ = 1
     _fields_ = [
         ("addressFamily", ctypes.c_ushort),
         ("btAddr", ctypes.c_ulonglong),
