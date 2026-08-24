@@ -1,0 +1,33 @@
+{
+  "generated_at": "2026-08-24 13:31:04",
+  "events": [
+    {
+      "at": 0.0,
+      "call_id": "6",
+      "status": "ended",
+      "number": "***91 (11位)",
+      "direction": 1
+    },
+    {
+      "at": 9.64,
+      "call_id": "7",
+      "status": "incoming",
+      "number": "***91 (11位)",
+      "direction": 1
+    },
+    {
+      "at": 10.84,
+      "call_id": "7",
+      "status": "talking",
+      "number": "***91 (11位)",
+      "direction": 1
+    },
+    {
+      "at": 20.48,
+      "call_id": "7",
+      "status": "ended",
+      "number": "***91 (11位)",
+      "direction": 1
+    }
+  ]
+}

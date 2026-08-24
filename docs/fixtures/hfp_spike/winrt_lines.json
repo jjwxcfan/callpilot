@@ -1,0 +1,14 @@
+{
+  "generated_at": "2026-08-24 13:21:54",
+  "ok": true,
+  "lines": [
+    {
+      "id": "c97a1b2f-4c01-43d5-a8c1-4aeec1391889",
+      "display_name": "Pixel 7",
+      "number": null,
+      "transport": "bluetooth",
+      "can_dial": true,
+      "voicemail_count": null
+    }
+  ]
+}

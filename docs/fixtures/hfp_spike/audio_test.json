@@ -1,0 +1,30 @@
+{
+  "generated_at": "2026-08-24 13:14:57",
+  "rx_device": {
+    "index": 38,
+    "name": "Input (@System32\\drivers\\bthhfenum.sys,#4;%1 Hands-Free HF Audio%0\r\n;(Pixel 7))",
+    "hostapi": "Windows WDM-KS",
+    "max_input_channels": 1,
+    "max_output_channels": 0,
+    "default_samplerate": 16000.0
+  },
+  "tx_device": {
+    "index": 37,
+    "name": "Output (@System32\\drivers\\bthhfenum.sys,#4;%1 Hands-Free HF Audio%0\r\n;(Pixel 7))",
+    "hostapi": "Windows WDM-KS",
+    "max_input_channels": 0,
+    "max_output_channels": 1,
+    "default_samplerate": 16000.0
+  },
+  "samplerate": 16000,
+  "seconds_captured": 9.54,
+  "input_overflows": 0,
+  "uplink_peak": 26836.0,
+  "uplink_rms": 2391.1,
+  "uplink_dbfs": -22.7,
+  "dtmf_injected": true,
+  "dtmf_digit": "1",
+  "rms_before_inject": 0.3,
+  "rms_after_inject": 2866.1,
+  "wav": "D:\\Callpilot\\.claude\\worktrees\\linear-callpilot-integration-b43eb0\\docs\\fixtures\\hfp_spike\\uplink_capture.wav"
+}

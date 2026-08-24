@@ -1,0 +1,12 @@
+{
+  "generated_at": "2026-08-24 13:21:16",
+  "importable": true,
+  "backend": "winsdk",
+  "types_present": {
+    "PhoneCallManager": true,
+    "PhoneCallStore": true,
+    "PhoneLine": true,
+    "PhoneLineTransportDevice": true
+  },
+  "store_ok": true
+}
