@@ -181,27 +181,43 @@ def _playbook_intel(messages: list[dict[str, str]], lang: str) -> str:
     try:
         if not call_playbooks.playbooks_enabled():
             return ""
+        # 情报库只加载一次，token 在内存里匹配（逐 token 调 lookup_playbook
+        # 会按 token 数重复读文件）。
+        playbooks = call_playbooks.list_playbooks()
+        if not playbooks:
+            return ""
+        zh = lang == "zh"
+        item_sep = "、" if zh else "; "
         lines: list[str] = []
         seen: set[str] = set()
         for message in messages:
             for token in _NUMBER_TOKEN_RE.findall(message.get("content", "")):
-                number = token.lstrip("+")
-                if number in seen:
+                if token in seen:
                     continue
-                seen.add(number)
-                playbook = call_playbooks.lookup_playbook(number)
+                seen.add(token)
+                playbook = next(
+                    (
+                        item for item in playbooks
+                        if isinstance(item.get("numbers"), list)
+                        and any(
+                            call_playbooks.same_dial_number(token, candidate)
+                            for candidate in item["numbers"]
+                        )
+                    ),
+                    None,
+                )
                 if playbook is None:
                     continue
                 label = call_playbooks._pick_lang(playbook.get("label"), lang)
                 entries = call_playbooks._normalized_required_info(playbook)
                 if not entries:
                     continue
-                items = "、".join(
+                items = item_sep.join(
                     "{}（{}，键 {}）".format(
                         call_playbooks._pick_lang(e.get("label"), lang) or e["key"],
                         call_playbooks._pick_lang(e.get("purpose"), lang) or "-",
                         e["key"],
-                    ) if lang == "zh" else "{} ({}, key {})".format(
+                    ) if zh else "{} ({}, key {})".format(
                         call_playbooks._pick_lang(e.get("label"), lang) or e["key"],
                         call_playbooks._pick_lang(e.get("purpose"), lang) or "-",
                         e["key"],
@@ -210,7 +226,7 @@ def _playbook_intel(messages: list[dict[str, str]], lang: str) -> str:
                 )
                 lines.append(
                     "- {}{}: {}".format(token, f"（{label}）" if label else "", items)
-                    if lang == "zh"
+                    if zh
                     else "- {}{}: {}".format(
                         token, f" ({label})" if label else "", items
                     )

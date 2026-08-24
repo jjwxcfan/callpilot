@@ -858,6 +858,9 @@ class HfpAudioBridge:
     # SCO 等待：answer/dial 到音频链路建立的实测窗口在几秒内，留足余量。
     SCO_WAIT_SECONDS = 20.0
     _READ_TIMEOUT_SECONDS = 0.05
+    # 下行积压封顶（与 FfmpegAudioBridge 同款 60s）：SCO 短暂中断时 out_callback
+    # 停止消费而 Agent 持续写入，不封顶会无界增长、恢复后爆发式补播陈旧音频。
+    _MAX_TX_SECONDS = 60
 
     def __init__(
         self,
@@ -1056,8 +1059,19 @@ class HfpAudioBridge:
         if not payload:
             return
         native = resample_pcm(payload, MODEM_RATE, self.device_rate)
+        dropped = 0
         with self._tx_lock:
             self._tx_buffer.extend(native)
+            max_bytes = self.device_rate * MODEM_CHANNELS * 2 * self._MAX_TX_SECONDS
+            overflow = len(self._tx_buffer) - max_bytes
+            if overflow > 0:
+                # PCM 是 int16；从队首丢偶数字节，不把后续样本切到半字边界。
+                dropped = overflow + overflow % 2
+                del self._tx_buffer[:dropped]
+        if dropped:
+            logger.warning(
+                "HFP 下行 PCM 积压超限（SCO 停滞？），丢弃最旧音频 %d 字节", dropped
+            )
 
     @staticmethod
     def modem_to_agent(pcm_8k: bytes, agent_rate: int) -> bytes:

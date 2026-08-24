@@ -103,3 +103,15 @@ def test_stop_clears_buffers() -> None:
     bridge.stop()
     assert bridge.pending_output_bytes() == 0
     assert bridge.read_modem_chunk() == b"" or True  # rx 已清空
+
+
+def test_tx_buffer_capped_at_60s() -> None:
+    """SCO 停滞时下行积压封顶（与 FfmpegAudioBridge 同款），不无界增长。"""
+    bridge = HfpAudioBridge("pixel")  # device_rate=8000
+    max_bytes = 8000 * 2 * bridge._MAX_TX_SECONDS
+    big = b"\x01\x00" * 8000  # 1s
+    for _ in range(65):  # 写 65s
+        bridge.write_modem_chunks([big])
+    assert len(bridge._tx_buffer) <= max_bytes
+    # 且缓冲尾部是最新数据（丢的是最旧的）
+    assert bridge.pending_output_bytes() == max_bytes

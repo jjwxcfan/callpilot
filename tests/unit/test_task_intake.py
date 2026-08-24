@@ -291,3 +291,11 @@ def test_playbook_intel_fail_open_on_bad_library(monkeypatch):
     messages = [{"role": "user", "content": "打 611"}]
     # 库坏了绝不挡建单主链路
     assert task_intake._playbook_intel(messages, "zh") == ""
+
+
+def test_playbook_intel_en_uses_english_separators(monkeypatch):
+    monkeypatch.setenv("CALL_PLAYBOOKS_ENABLED", "true")
+    _write_playbooks([_PLAYBOOK_611])
+    messages = [{"role": "user", "content": "call 611 for me"}]
+    intel = task_intake._playbook_intel(messages, "en")
+    assert "account_pin" in intel and "、" not in intel
