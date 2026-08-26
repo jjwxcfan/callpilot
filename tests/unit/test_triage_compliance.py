@@ -375,6 +375,63 @@ def test_event_reaches_events_jsonl_on_disk(tmp_path, monkeypatch):
     assert hits[0]["status"] == "violation"
 
 
+# ---- 判官约束描述与受限提示词的防脱节（WIL-150）----
+#
+# 2026-08-26 真机 5 通：判官把**法定开场白本身**误报为越界 3 次（同一句话另一
+# 通又判合规）。根因是 WIL-144 把「问对方是谁、找机主什么事」并进了开场白，
+# 而判官的 RESTRICTION_SUMMARY 仍写「只应说固定开场白，并最多追问一个中性的
+# 短问题」——判官看到开场白连问两问，便判它超范围。源码注释「改 prompts.py
+# 要跟着改」没能防住，这里用测试把两处锁在一起：任何一侧的开场白契约变了，
+# 先到这个文件来对齐另一侧。
+
+
+def test_restriction_summary_sanctions_the_double_question_opening():
+    """约束描述必须写明：开场白本身就一并问「是谁 + 找什么事」，且属规定动作。
+
+    缺了这句，判官只能拿「最多一个短问题」去量开场白，误报就会回来。
+    """
+    from agentcall.triage_compliance import RESTRICTION_SUMMARY
+
+    assert "开场白" in RESTRICTION_SUMMARY
+    # 两问都要在开场白的描述里出现
+    assert "是谁" in RESTRICTION_SUMMARY and "什么事" in RESTRICTION_SUMMARY
+    # 并且被明确豁免——只是提到两问还不够，必须说清这不是越界
+    assert "非越界" in RESTRICTION_SUMMARY or "不是越界" in RESTRICTION_SUMMARY
+
+
+def test_restriction_summary_matches_runtime_restricted_prompt():
+    """受限提示词（zh/en）与判官约束描述对「开场白已含两问」的说法必须同在。
+
+    改 prompts.py 的受限段或开场白契约时，这个用例强制回到这里对齐判官侧；
+    反之亦然。只锁双方共同的契约要点，不锁措辞。
+    """
+    from agentcall.prompts import build_instructions
+    from agentcall.triage_compliance import RESTRICTION_SUMMARY
+
+    zh = build_instructions(
+        "inbound", "李明", "AI 助理", "", lang="zh", triage_pending=True
+    )
+    en = build_instructions(
+        "inbound", "Alex", "AI assistant", "", lang="en", triage_pending=True
+    )
+    # 运行时提示词声明「开场白已经问过两件事」
+    assert "开场白已经问过对方是谁、找" in zh
+    assert "The opening line already asked who is calling" in en
+    # 判官侧必须承认同一事实（豁免开场白的两问），否则会拿单问标准去量它
+    assert "是谁" in RESTRICTION_SUMMARY and "什么事" in RESTRICTION_SUMMARY
+
+
+def test_restriction_summary_keeps_all_prohibitions():
+    """禁止项对齐运行时受限提示词：回电/转告/替答应/自行决定/业务细节/无关话题。
+
+    修误报只该放宽「开场白豁免」这一处，禁止项一条都不能松。
+    """
+    from agentcall.triage_compliance import RESTRICTION_SUMMARY
+
+    for token in ("回电", "转告", "答应", "拒绝", "转接", "业务细节", "无关"):
+        assert token in RESTRICTION_SUMMARY, f"禁止项描述缺了: {token}"
+
+
 def test_no_keyword_table_in_module():
     """非枚举硬原则：本模块不得出现禁语/关键词清单。
 
