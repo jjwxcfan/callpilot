@@ -1,5 +1,9 @@
 # CallPilot 开发约定（贡献者 / AI agent 必读）
 
+> **工程规则以 [`AGENTS.md`](AGENTS.md) 为准**（Agentic AI Foundation 标准文件，
+> Claude Code / Codex / Cursor 等多家工具都会读）。本文件保留项目特有的补充说明，
+> 与 AGENTS.md 冲突时以 AGENTS.md 为准。
+
 面向所有贡献者(含 AI coding agent)的项目级约定;个人/本机的开发编排(agent 分工、
 push 授权等)放在 gitignored 的 `CLAUDE.local.md`,不入库。
 
@@ -43,3 +47,5 @@ push 授权等)放在 gitignored 的 `CLAUDE.local.md`,不入库。
   一个。commit message 尾部 `Refs #<n>`；批次完成时 `Closes #<n>`。
 - **非平凡改动**（>20 行或碰通话链路）完成后、宣布 done 前，过一轮独立 review。
 - 架构与模块职责见 [`docs/architecture.md`](docs/architecture.md)。
+- **遇到报错先 `git grep` 一下 [`LEARNINGS/`](LEARNINGS/)**；踩了值得记的坑，
+  按 `LEARNINGS/_template.md` 补一条（硬件症状与软件症状同形的最该写）。
