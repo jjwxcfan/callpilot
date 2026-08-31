@@ -50,3 +50,13 @@ ios/build/
 ios/**/xcuserdata/
 ios/*.ipa
 ios/Pods/
+
+# ---- 本机工作区里的「非本仓库」资产：既不入库，也别让 git add -A 扫进来 ----
+# 会话归档（数百 MB，含真实号码/IMEI/API key）——绝不入库，开源后无法收回。
+agentcall-sessions/
+# 前身代码库快照（自带 git 历史，属独立项目）。
+AgentAssistant/
+# 工具/编辑器的本地状态目录。
+.gstack/
+# 硬件评审稿的二进制导出件（.md 版本入库即可）。
+docs/*.docx
